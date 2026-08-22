@@ -27,7 +27,8 @@ const PRICING = [
   { m: 'opus', in: 5, out: 25 }, { m: 'sonnet', in: 3, out: 15 }, { m: 'haiku', in: 1, out: 5 },
 ];
 function costOf(a) {
-  const p = PRICING.find(x => (a.model || '').includes(x.m)) || { in: 5, out: 25 };
+  const p = PRICING.find(x => (a.model || '').includes(x.m));
+  if (!p) return 0; // unknown model (e.g. non-Claude via OTLP): no estimate rather than a wrong one
   return (a.inTokens / 1e6) * p.in + (a.cacheTokens / 1e6) * p.in * 0.1 + (a.outTokens / 1e6) * p.out;
 }
 
@@ -60,7 +61,7 @@ function newAgent(id, type) {
   return {
     id, name: null, type, task: '', model: null,
     firstTs: null, lastTs: null, events: 0, tools: {},
-    inTokens: 0, cacheTokens: 0, outTokens: 0, errors: 0, done: false, lastKind: null,
+    inTokens: 0, cacheTokens: 0, outTokens: 0, errors: 0, cost: 0, done: false, lastKind: null,
   };
 }
 
@@ -355,11 +356,116 @@ function readSession(sessionPath) {
   return result;
 }
 
+// ---------- OTLP/HTTP trace ingestion (OpenTelemetry) ----------
+// POST /v1/traces with OTLP-JSON (set OTEL_EXPORTER_OTLP_PROTOCOL=http/json and
+// OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4173 in any instrumented agent
+// framework). Spans using the gen_ai.* semantic conventions map onto the same
+// agent/event model as Claude Code transcripts, keyed "otel:<service.name>".
+const otelSessions = new Map(); // id -> {id,name,started,version,agents:Map,events:[]}
+
+function otelVal(v) {
+  if (v == null) return null;
+  if (v.stringValue !== undefined) return v.stringValue;
+  if (v.intValue !== undefined) return Number(v.intValue);
+  if (v.doubleValue !== undefined) return v.doubleValue;
+  if (v.boolValue !== undefined) return v.boolValue;
+  if (v.arrayValue) return (v.arrayValue.values || []).map(otelVal).join(', ');
+  return null;
+}
+function otelAttrs(list) {
+  const o = {};
+  for (const a of list || []) o[a.key] = otelVal(a.value);
+  return o;
+}
+
+function ingestTraces(body) {
+  let spans = 0;
+  for (const rs of body.resourceSpans || []) {
+    const res = otelAttrs(rs.resource && rs.resource.attributes);
+    const service = res['service.name'] || 'otel-agent';
+    const sid = 'otel:' + service;
+    if (!otelSessions.has(sid)) {
+      const s = { id: sid, name: service, started: Date.now(), version: 0, agents: new Map(), events: [] };
+      s.agents.set('main', { ...newAgent('main', 'main'), name: service });
+      otelSessions.set(sid, s);
+    }
+    const sess = otelSessions.get(sid);
+    sess.version++;
+    for (const ss of rs.scopeSpans || []) {
+      for (const span of ss.spans || []) {
+        spans++;
+        const at = otelAttrs(span.attributes);
+        const ts = span.startTimeUnixNano ? new Date(Number(span.startTimeUnixNano) / 1e6).toISOString() : null;
+        const endTs = span.endTimeUnixNano ? new Date(Number(span.endTimeUnixNano) / 1e6).toISOString() : null;
+        const agentName = at['gen_ai.agent.name'] || at['agent.name'] || at['crewai.agent.role'] || null;
+        const agentId = agentName ? 'sub:' + agentName : 'main';
+        if (!sess.agents.has(agentId)) sess.agents.set(agentId, { ...newAgent(agentId, 'subagent'), name: agentName });
+        const agent = sess.agents.get(agentId);
+        if (!agent.firstTs || (ts && ts < agent.firstTs)) agent.firstTs = ts;
+        if (!agent.lastTs || (endTs || ts) > agent.lastTs) agent.lastTs = endTs || ts;
+        agent.events++;
+        const model = at['gen_ai.request.model'] || at['gen_ai.response.model'];
+        if (model && !agent.model) agent.model = model;
+        const error = !!(span.status && span.status.code === 2);
+        if (error) agent.errors++;
+        const op = String(at['gen_ai.operation.name'] || span.name || '').toLowerCase();
+        if (model || /chat|completion|generate/.test(op)) {
+          agent.inTokens += Number(at['gen_ai.usage.input_tokens'] || at['gen_ai.usage.prompt_tokens'] || 0);
+          agent.outTokens += Number(at['gen_ai.usage.output_tokens'] || at['gen_ai.usage.completion_tokens'] || 0);
+          const prompt = at['gen_ai.prompt'] || at['gen_ai.input.messages'];
+          if (prompt) sess.events.push({ ts, agent: agentId, kind: 'user-text', text: clip(prompt, 240), full: clip(prompt, 2500) });
+          const completion = at['gen_ai.completion'] || at['gen_ai.output.messages'] || at['gen_ai.response.text'] || `${span.name} (${model || 'LLM'})`;
+          sess.events.push({ ts: endTs || ts, agent: agentId, kind: 'assistant-text', error, text: clip(completion, 240), full: clip(completion, 2500) });
+          agent.lastKind = 'assistant-text';
+          if (model) agent.tools[model] = (agent.tools[model] || 0) + 1;
+        } else {
+          const tool = at['gen_ai.tool.name'] || span.name || 'span';
+          agent.tools[tool] = (agent.tools[tool] || 0) + 1;
+          agent.lastKind = 'tool-call';
+          const args = at['gen_ai.tool.call.arguments'] || at['gen_ai.tool.description'] || '';
+          sess.events.push({ ts, agent: agentId, kind: 'tool-call', tool, error, endTs, text: clip(args, 240), full: clip(args, 2500) });
+        }
+        agent.cost = Math.round(costOf(agent) * 10000) / 10000;
+      }
+    }
+  }
+  return spans;
+}
+
+function otelResult(sess) {
+  const events = [...sess.events].sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+  events.forEach((e, i) => { e.seq = i; });
+  return { events, agents: [...sess.agents.values()] };
+}
+
+function otelList() {
+  return [...otelSessions.values()].map(s => ({
+    project: 'OTLP (live)', file: s.id, session: s.id, title: s.name + ' · OTLP',
+    size: s.events.length, mtime: s.started, agentCount: s.agents.size - 1,
+  }));
+}
+
+// Resolve either source: "otel:<service>" (in-memory) or a transcript path.
+function getResult(fileParam) {
+  if (fileParam.startsWith('otel:')) {
+    const sess = otelSessions.get(fileParam);
+    return sess ? otelResult(sess) : null;
+  }
+  const full = resolveSessionPath(fileParam);
+  if (!full || !fs.existsSync(full)) return null;
+  return readSession(full);
+}
+
+function readBody(req, cb) {
+  let b = '';
+  req.on('data', c => { b += c; if (b.length > 50e6) req.destroy(); });
+  req.on('end', () => cb(b));
+}
+
 function sessionSummary(meta) {
-  const full = resolveSessionPath(meta.file);
-  if (!full) return null;
   let r;
-  try { r = readSession(full); } catch { return null; }
+  try { r = getResult(meta.file); } catch { return null; }
+  if (!r) return null;
   const evs = r.events;
   const first = evs.find(e => e.ts), last = [...evs].reverse().find(e => e.ts);
   return {
@@ -376,11 +482,11 @@ function sessionSummary(meta) {
 
 // ---------- standalone replay export ----------
 
-function buildExport(sessionPath, title) {
+function buildExport(result, title) {
   const html = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
   const css = fs.readFileSync(path.join(PUBLIC_DIR, 'style.css'), 'utf8');
   const js = fs.readFileSync(path.join(PUBLIC_DIR, 'app.js'), 'utf8');
-  const data = { ...readSession(sessionPath), now: Date.now() };
+  const data = { ...result, now: Date.now() };
   const baked = `<script>window.__BAKED__=${JSON.stringify({ title: title || 'Session replay', data }).replace(/</g, '\\u003c')}</script>`;
   return html
     .replace('<link rel="stylesheet" href="/style.css">', `<style>\n${css}\n</style>`)
@@ -399,33 +505,48 @@ function json(res, obj, code = 200) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
-  if (url.pathname === '/api/sessions') return json(res, listSessions());
+  // OTLP/HTTP trace ingestion — any OpenTelemetry-instrumented agent can POST here
+  if (url.pathname === '/v1/traces' && req.method === 'POST') {
+    readBody(req, body => {
+      try {
+        const n = ingestTraces(JSON.parse(body));
+        json(res, { partialSuccess: {}, spansIngested: n });
+      } catch (e) {
+        json(res, { error: 'invalid OTLP-JSON: ' + e.message + ' (use OTEL_EXPORTER_OTLP_PROTOCOL=http/json)' }, 400);
+      }
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/sessions') return json(res, [...otelList(), ...listSessions()]);
 
   if (url.pathname === '/api/fleet') {
-    return json(res, listSessions().map(sessionSummary).filter(Boolean));
+    return json(res, [...otelList(), ...listSessions()].map(sessionSummary).filter(Boolean));
   }
 
   if (url.pathname === '/api/session') {
-    const full = resolveSessionPath(url.searchParams.get('file') || '');
-    if (!full || !fs.existsSync(full)) return json(res, { error: 'not found' }, 404);
-    return json(res, { ...readSession(full), now: Date.now() });
+    const r = getResult(url.searchParams.get('file') || '');
+    if (!r) return json(res, { error: 'not found' }, 404);
+    return json(res, { ...r, now: Date.now() });
   }
 
   if (url.pathname === '/api/export') {
-    const full = resolveSessionPath(url.searchParams.get('file') || '');
-    if (!full || !fs.existsSync(full)) { res.writeHead(404); res.end(); return; }
-    const name = (url.searchParams.get('title') || path.basename(full, '.jsonl')).replace(/[^\w.-]+/g, '-');
+    const fileParam = url.searchParams.get('file') || '';
+    const r = getResult(fileParam);
+    if (!r) { res.writeHead(404); res.end(); return; }
+    const name = (url.searchParams.get('title') || path.basename(fileParam, '.jsonl')).replace(/[^\w.-]+/g, '-');
     res.writeHead(200, {
       'Content-Type': 'text/html; charset=utf-8',
       'Content-Disposition': `attachment; filename="mission-control-replay-${name}.html"`,
     });
-    res.end(buildExport(full, url.searchParams.get('title')));
+    res.end(buildExport(r, url.searchParams.get('title')));
     return;
   }
 
   if (url.pathname === '/api/stream') {
-    const full = resolveSessionPath(url.searchParams.get('file') || '');
-    if (!full || !fs.existsSync(full)) { res.writeHead(404); res.end(); return; }
+    const fileParam = url.searchParams.get('file') || '';
+    const isOtel = fileParam.startsWith('otel:');
+    if (!getResult(fileParam)) { res.writeHead(404); res.end(); return; }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -434,11 +555,14 @@ const server = http.createServer((req, res) => {
     });
     let lastSig = null;
     const tick = () => {
-      const sig = sessionSignature(full);
+      const sig = isOtel
+        ? String(otelSessions.get(fileParam)?.version || 0)
+        : sessionSignature(resolveSessionPath(fileParam));
       if (sig !== lastSig) {
         lastSig = sig;
         try {
-          res.write('data: ' + JSON.stringify({ ...readSession(full), now: Date.now() }) + '\n\n');
+          const r = getResult(fileParam);
+          if (r) res.write('data: ' + JSON.stringify({ ...r, now: Date.now() }) + '\n\n');
         } catch { /* mid-write read; next tick catches up */ }
       } else {
         res.write(': keepalive\n\n');

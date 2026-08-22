@@ -42,6 +42,27 @@ Claude Code writes transcripts under `~/.claude/projects/<project-slug>/`:
 
 The server tails all of these (700 ms polling, whole-parse cached by a size signature over every file) and streams normalized events to the browser over Server-Sent Events. Subagents are matched to the `Agent`/`Task` calls that spawned them by the agent id embedded in the tool result, with timestamp-order pairing as a fallback; legacy inline `isSidechain` transcripts are also supported.
 
+## Beyond Claude Code: OpenTelemetry ingestion
+
+The server is also an OTLP/HTTP trace receiver. Any OpenTelemetry-instrumented agent framework (CrewAI, LangGraph, AutoGen, OpenLIT, custom SDK code) can stream spans to it, and the session appears live in the Fleet view alongside your Claude Code sessions — same board, timeline, playback, and cost analytics.
+
+Point your instrumentation at the dashboard with JSON protocol:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4173
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+```
+
+Spans are mapped via the `gen_ai.*` semantic conventions: `service.name` names the session, `gen_ai.agent.name` groups spans into agent cards, `gen_ai.request.model` + `gen_ai.usage.*` drive token and cost accounting, `gen_ai.tool.name` becomes tool-call events with true durations, and span error status shows as errors. Only OTLP-JSON is accepted (no protobuf — the server has zero dependencies).
+
+Try it with the bundled simulator while the dashboard is running:
+
+```bash
+node demo/simulate-crew.js
+```
+
+A three-agent "content-crew" (Researcher → Writer → Reviewer) streams in live over ~15 seconds.
+
 ## Notes
 
 - Each machine visualizes its own `~/.claude/projects` — run the server wherever the sessions run. Remote Control sessions work (they execute locally); cloud sessions don't (their transcripts never touch your disk).
