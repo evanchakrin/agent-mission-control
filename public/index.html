@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agent Mission Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Agent Mission Control</h1>
+  <select id="sessionSel"></select>
+  <div class="tabs">
+    <button id="viewBoard" class="on">Board</button>
+    <button id="viewTimeline">Timeline</button>
+  </div>
+  <div class="live-pill"><span class="dot" id="liveDot"></span><span id="liveLabel">connecting…</span></div>
+</header>
+<div id="statbar"></div>
+<main>
+  <div id="stage">
+    <div id="board">
+      <svg id="edges"></svg>
+      <div id="cards"></div>
+    </div>
+    <div id="timeline" style="display:none"></div>
+    <div id="empty">No agent activity yet in this session.</div>
+  </div>
+  <div id="feed">
+    <div class="feed-head">
+      <h3>Event Feed</h3>
+      <input id="filterText" type="text" placeholder="filter events…">
+      <div class="kind-toggles" id="kindToggles"></div>
+    </div>
+    <div id="events"></div>
+  </div>
+</main>
+<footer>
+  <button id="liveBtn" class="on">LIVE</button>
+  <button id="playBtn" title="replay">▶</button>
+  <select id="speed"><option value="1">1×</option><option value="4" selected>4×</option><option value="16">16×</option></select>
+  <input type="range" id="scrub" min="0" max="0" value="0">
+  <span id="scrubLabel">0 / 0</span>
+</footer>
+<div id="drawer">
+  <div class="d-head"><h4 id="d-title"></h4><button class="close" id="d-close">esc</button></div>
+  <div class="d-meta" id="d-meta"></div>
+  <pre id="d-body"></pre>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
