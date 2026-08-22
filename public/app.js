@@ -1,6 +1,8 @@
-// Agent Mission Control v2 — frontend
+// Agent Mission Control v2.0 — frontend
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+const BAKED = window.__BAKED__ || null; // standalone replay export mode
 
 const KINDS = ['user-text', 'user-queued', 'assistant-text', 'tool-call', 'tool-result', 'spawn', 'spawn-result'];
 const KIND_LABEL = { 'user-text': 'user', 'user-queued': 'queued', 'assistant-text': 'reply', 'tool-call': 'tool', 'tool-result': 'result', 'spawn': 'spawn', 'spawn-result': 'return' };
@@ -8,18 +10,18 @@ const KIND_COLOR = { 'user-text': '#f87171', 'user-queued': '#f87171', 'assistan
 
 const state = {
   data: { events: [], agents: [], now: 0 },
-  es: null, live: true, scrub: 0,
+  es: null, live: !BAKED, scrub: 0, file: null,
   playing: false, speed: 4, playTimer: null,
-  view: 'board',
+  view: BAKED ? 'board' : 'fleet',
   filterText: '', kindsOn: new Set(KINDS),
   hot: new Map(), lastSeq: -1,
 };
 
-// ---------- sessions ----------
+// ---------- sessions & fleet ----------
 async function loadSessions() {
   const sessions = await (await fetch('/api/sessions')).json();
   const sel = $('sessionSel');
-  sel.innerHTML = '';
+  sel.innerHTML = '<option value="">— select session —</option>';
   for (const s of sessions) {
     const opt = document.createElement('option');
     opt.value = s.file;
@@ -28,15 +30,46 @@ async function loadSessions() {
     opt.textContent = `${s.title || s.session.slice(0, 8)} — ${s.project.replace(/^[Cc]--Users-[^-]+-/, '')}${agents} (${when})`;
     sel.appendChild(opt);
   }
-  sel.onchange = () => connect(sel.value);
-  if (sessions.length) connect(sessions[0].file);
+  sel.onchange = () => { if (sel.value) openSession(sel.value); };
+}
+
+async function loadFleet() {
+  $('fleet').innerHTML = '<div class="fleet-loading">Scanning sessions…</div>';
+  const fleet = await (await fetch('/api/fleet')).json();
+  const totCost = fleet.reduce((n, s) => n + s.cost, 0);
+  const totAgents = fleet.reduce((n, s) => n + s.agents, 0);
+  $('fleet').innerHTML =
+    `<div class="fleet-head"><h2>Fleet — ${fleet.length} sessions · ${totAgents} agents · ~${fmtUsd(totCost)} total</h2></div>` +
+    `<div class="fleet-grid">` + fleet.map(s => `
+      <div class="fcard" data-file="${esc(s.file)}">
+        <h3>${esc(s.title || s.session.slice(0, 8))}</h3>
+        <div class="fproj">${esc(s.project.replace(/^[Cc]--Users-[^-]+-/, ''))}</div>
+        <div class="fstats">
+          <span><b>${s.agents}</b> agents</span><span><b>${s.events}</b> events</span>
+          <span><b>${s.toolCalls}</b> tools</span><span><b>${fmtDur(s.durationMs)}</b></span>
+          <span><b>${fmtTok(s.tokensIn)}</b> in</span><span><b>${fmtTok(s.tokensOut)}</b> out</span>
+          <span class="fcost"><b>~${fmtUsd(s.cost)}</b></span>
+          ${s.errors ? `<span class="ferr"><b>${s.errors}</b> errors</span>` : ''}
+        </div>
+        <div class="fdate">${new Date(s.mtime).toLocaleString()}</div>
+      </div>`).join('') + `</div>`;
+  $('fleet').querySelectorAll('.fcard').forEach(c => { c.onclick = () => openSession(c.dataset.file); });
+}
+
+function openSession(file) {
+  state.view = 'board';
+  setTabs();
+  $('sessionSel').value = file;
+  connect(file);
 }
 
 function connect(file) {
+  state.file = file;
   if (state.es) state.es.close();
   state.lastSeq = -1;
   state.hot.forEach(t => clearTimeout(t)); state.hot.clear();
   stopPlay();
+  state.live = true; $('liveBtn').classList.add('on');
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'connecting…';
   const es = new EventSource('/api/stream?file=' + encodeURIComponent(file));
   state.es = es;
@@ -85,6 +118,7 @@ function statusOf(s) {
 }
 
 const fmtTok = n => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n || 0);
+const fmtUsd = c => c >= 100 ? '$' + Math.round(c) : c >= 1 ? '$' + c.toFixed(2) : '$' + (c || 0).toFixed(3);
 const fmtDur = ms => {
   if (!ms || ms < 0) return '—';
   const s = Math.round(ms / 1000);
@@ -92,7 +126,21 @@ const fmtDur = ms => {
 };
 
 // ---------- render ----------
+function setTabs() {
+  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewBoard', 'board'], ['viewTimeline', 'timeline']]) {
+    $(btn).classList.toggle('on', state.view === v);
+  }
+  const inSession = state.view !== 'fleet';
+  document.querySelector('main').classList.toggle('no-feed', !inSession);
+  $('fleet').style.display = inSession ? 'none' : '';
+  $('feed').style.display = inSession ? '' : 'none';
+  document.querySelector('footer').style.display = inSession ? '' : 'none';
+  $('statbar').style.display = inSession ? '' : 'none';
+  if (!inSession) loadFleet();
+}
+
 function render() {
+  if (state.view === 'fleet') return;
   renderStatbar();
   if (state.view === 'board') renderBoard(); else renderTimeline();
   renderFeed();
@@ -104,8 +152,9 @@ function render() {
 function renderStatbar() {
   const a = state.data.agents;
   const evs = state.data.events;
-  const inT = a.reduce((n, x) => n + (x.inTokens || 0), 0);
+  const inT = a.reduce((n, x) => n + (x.inTokens || 0) + (x.cacheTokens || 0), 0);
   const outT = a.reduce((n, x) => n + (x.outTokens || 0), 0);
+  const cost = a.reduce((n, x) => n + (x.cost || 0), 0);
   const toolCalls = evs.filter(e => e.kind === 'tool-call' || e.kind === 'spawn').length;
   const errs = evs.filter(e => e.error).length;
   const first = evs.find(e => e.ts), last = [...evs].reverse().find(e => e.ts);
@@ -114,6 +163,7 @@ function renderStatbar() {
     `<span>agents <b>${a.length}</b></span><span>events <b>${evs.length}</b></span>` +
     `<span>tool calls <b>${toolCalls}</b></span><span>duration <b>${fmtDur(dur)}</b></span>` +
     `<span>tokens in <b>${fmtTok(inT)}</b> · out <b>${fmtTok(outT)}</b></span>` +
+    `<span>est. cost <b>~${fmtUsd(cost)}</b></span>` +
     (errs ? `<span style="color:var(--red)">errors <b style="color:var(--red)">${errs}</b></span>` : '');
 }
 
@@ -174,10 +224,11 @@ function renderBoard() {
     el.style.left = p.x + 'px'; el.style.top = p.y + 'px';
     const st = statusOf(a);
     const dur = a.firstTs && a.lastTs ? new Date(a.lastTs) - new Date(a.firstTs) : 0;
+    const costTag = a.cost >= 0.005 ? `<span>~<b>${fmtUsd(a.cost)}</b></span>` : '';
     if (compact && a.id !== 'main') {
       el.innerHTML =
         `<h2>🤖 <span class="nm">${esc(a.name || a.id)}</span> <span class="status ${st}">${st}</span></h2>` +
-        `<div class="meta"><span>ev <b>${a.events}</b></span><span>out <b>${fmtTok(a.outTokens)}</b></span><span><b>${fmtDur(dur)}</b></span>` +
+        `<div class="meta"><span>ev <b>${a.events}</b></span><span>out <b>${fmtTok(a.outTokens)}</b></span><span><b>${fmtDur(dur)}</b></span>${costTag}` +
         (a.errors ? `<span class="err">err <b>${a.errors}</b></span>` : '') + `</div>`;
     } else {
       const chips = Object.entries(a.tools).sort((x, y) => y[1] - x[1]).slice(0, 5)
@@ -185,7 +236,7 @@ function renderBoard() {
       el.innerHTML =
         `<h2>${a.id === 'main' ? '🛰️' : '🤖'} <span class="nm">${esc(a.name || a.id)}</span> <span class="status ${st}">${st}</span></h2>` +
         (a.task ? `<div class="task">${esc(a.task)}</div>` : '') +
-        `<div class="meta"><span>ev <b>${a.events}</b></span><span>out <b>${fmtTok(a.outTokens)}</b></span><span><b>${fmtDur(dur)}</b></span>` +
+        `<div class="meta"><span>ev <b>${a.events}</b></span><span>out <b>${fmtTok(a.outTokens)}</b></span><span><b>${fmtDur(dur)}</b></span>${costTag}` +
         (a.errors ? `<span class="err">err <b>${a.errors}</b></span>` : '') + `</div>` +
         sparkline(a.recent, a.firstTs || firstTs, a.lastTs || lastTs) +
         (chips ? `<div class="chips">${chips}</div>` : '');
@@ -236,9 +287,12 @@ function renderTimeline() {
     if (li === undefined) continue;
     const y = 26 + li * ROW + 8;
     const col = e.error ? '#f87171' : (KIND_COLOR[e.kind] || '#8a93a8');
-    g += `<rect class="tl-block" data-seq="${e.seq}" x="${x(e.ts).toFixed(1)}" y="${y}" width="5" height="${ROW - 16}" fill="${col}" opacity="${e.seq < state.scrub ? .95 : .25}"><title>${esc(KIND_LABEL[e.kind] || e.kind)}${e.tool ? ': ' + esc(e.tool) : ''}\n${esc((e.text || '').slice(0, 120))}</title></rect>`;
+    // true duration bar when the tool result timestamp is known; instant tick otherwise
+    const x0 = x(e.ts);
+    const w = e.endTs ? Math.max(4, x(e.endTs) - x0) : 5;
+    const durTip = e.endTs ? ` (${fmtDur(new Date(e.endTs) - new Date(e.ts))})` : '';
+    g += `<rect class="tl-block" data-seq="${e.seq}" x="${x0.toFixed(1)}" y="${y}" width="${w.toFixed(1)}" height="${ROW - 16}" fill="${col}" opacity="${e.seq < state.scrub ? (e.endTs ? .75 : .95) : .25}"><title>${esc(KIND_LABEL[e.kind] || e.kind)}${e.tool ? ': ' + esc(e.tool) : ''}${durTip}\n${esc((e.text || '').slice(0, 120))}</title></rect>`;
   }
-  // time axis + scrub cursor
   for (let i = 0; i <= 4; i++) {
     const tx = LABEL + plotW * i / 4;
     g += `<text class="tl-axis" x="${tx}" y="${H - 6}">${new Date(t0 + span * i / 4).toLocaleTimeString()}</text>`;
@@ -277,8 +331,9 @@ function openDrawer(seq) {
   const e = state.data.events.find(x => x.seq === seq);
   if (!e) return;
   const who = e.agent === 'main' ? 'Orchestrator' : (state.data.agents.find(a => a.id === e.agent)?.name || 'subagent');
+  const dur = e.endTs ? ` · took ${fmtDur(new Date(e.endTs) - new Date(e.ts))}` : '';
   $('d-title').textContent = `${KIND_LABEL[e.kind] || e.kind}${e.tool ? ' · ' + e.tool : ''}`;
-  $('d-meta').textContent = `${who} · ${e.ts ? new Date(e.ts).toLocaleString() : 'no timestamp'} · event #${e.seq}${e.error ? ' · ERROR' : ''}`;
+  $('d-meta').textContent = `${who} · ${e.ts ? new Date(e.ts).toLocaleString() : 'no timestamp'} · event #${e.seq}${dur}${e.error ? ' · ERROR' : ''}`;
   $('d-body').textContent = e.full || e.text || '(empty)';
   $('drawer').classList.add('open');
 }
@@ -313,12 +368,19 @@ $('playBtn').onclick = () => {
 $('speed').onchange = () => { state.speed = Number($('speed').value); };
 $('scrub').oninput = () => { stopPlay(); seek(Number($('scrub').value)); };
 $('liveBtn').onclick = () => {
+  if (BAKED) return;
   stopPlay();
   state.live = true; $('liveBtn').classList.add('on');
   state.scrub = state.data.events.length; render();
 };
-$('viewBoard').onclick = () => { state.view = 'board'; $('viewBoard').classList.add('on'); $('viewTimeline').classList.remove('on'); render(); };
-$('viewTimeline').onclick = () => { state.view = 'timeline'; $('viewTimeline').classList.add('on'); $('viewBoard').classList.remove('on'); render(); };
+$('viewFleet').onclick = () => { if (!BAKED) { state.view = 'fleet'; setTabs(); } };
+$('viewBoard').onclick = () => { if (state.data.events.length || state.file) { state.view = 'board'; setTabs(); render(); } };
+$('viewTimeline').onclick = () => { if (state.data.events.length || state.file) { state.view = 'timeline'; setTabs(); render(); } };
+$('exportBtn').onclick = () => {
+  if (!state.file) return;
+  const title = $('sessionSel').selectedOptions[0]?.textContent.split(' — ')[0] || '';
+  location.href = '/api/export?file=' + encodeURIComponent(state.file) + '&title=' + encodeURIComponent(title);
+};
 $('filterText').oninput = () => { state.filterText = $('filterText').value; renderFeed(); };
 
 const kt = $('kindToggles');
@@ -334,6 +396,21 @@ for (const k of KINDS) {
 }
 
 let resizeT = null;
-window.onresize = () => { clearTimeout(resizeT); resizeT = setTimeout(render, 120); };
+window.onresize = () => { clearTimeout(resizeT); resizeT = setTimeout(() => { if (state.view !== 'fleet') render(); }, 120); };
 
-loadSessions();
+// ---------- boot ----------
+if (BAKED) {
+  // standalone replay: no server, no live mode
+  state.data = BAKED.data;
+  state.scrub = state.data.events.length;
+  document.title = 'Replay — ' + BAKED.title;
+  $('sessionSel').style.display = 'none';
+  $('viewFleet').style.display = 'none';
+  $('exportBtn').style.display = 'none';
+  $('liveBtn').style.display = 'none';
+  $('liveDot').className = 'dot'; $('liveLabel').textContent = 'replay';
+  setTabs(); render();
+} else {
+  loadSessions();
+  setTabs();
+}

@@ -11,20 +11,23 @@
   <h1>Agent Mission Control</h1>
   <select id="sessionSel"></select>
   <div class="tabs">
-    <button id="viewBoard" class="on">Board</button>
+    <button id="viewFleet" class="on">⌂ Fleet</button>
+    <button id="viewBoard">Board</button>
     <button id="viewTimeline">Timeline</button>
   </div>
-  <div class="live-pill"><span class="dot" id="liveDot"></span><span id="liveLabel">connecting…</span></div>
+  <button id="exportBtn" title="download standalone replay">⇩ Export</button>
+  <div class="live-pill"><span class="dot" id="liveDot"></span><span id="liveLabel">&nbsp;</span></div>
 </header>
 <div id="statbar"></div>
 <main>
   <div id="stage">
-    <div id="board">
+    <div id="fleet"></div>
+    <div id="board" style="display:none">
       <svg id="edges"></svg>
       <div id="cards"></div>
     </div>
     <div id="timeline" style="display:none"></div>
-    <div id="empty">No agent activity yet in this session.</div>
+    <div id="empty" style="display:none">No agent activity yet in this session.</div>
   </div>
   <div id="feed">
     <div class="feed-head">

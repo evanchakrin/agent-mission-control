@@ -7,19 +7,27 @@ A live dashboard that visualizes Claude Code agent sessions — the orchestrator
 ## Quick start
 
 ```bash
-node server.js
+npx github:evanchakrin/agent-mission-control
 # → http://localhost:4173
 ```
 
-Requires Node 18+. Nothing to install — the server is plain Node core.
+Or clone and run directly — requires Node 18+, zero dependencies:
+
+```bash
+node server.js [--port 4173] [--dir /path/to/.claude/projects]
+```
 
 ## What it shows
 
-- **Board view** — a card per agent (orchestrator + every subagent) with live status (working / done / idle), current task, event count, output tokens, duration, error badges, tool-usage chips, and a 24-bucket activity sparkline. Edges from the orchestrator glow and run a pulse dot while an agent is active. Above 10 subagents it switches to a compact scrollable fleet grid, clustered by workflow run.
-- **Timeline view** — Gantt-style swimlanes, one per agent, with color-coded event blocks (errors in red), a time axis, and a scrub cursor. Click any block to seek.
+- **Fleet view** (home) — every session on the machine as a card: agent count, events, tool calls, duration, tokens in/out, estimated cost in dollars, and error count. Click through to any session.
+- **Board view** — a card per agent (orchestrator + every subagent) with live status (working / done / idle), current task, event count, output tokens, duration, estimated cost, error badges, tool-usage chips, and a 24-bucket activity sparkline. Edges from the orchestrator glow and run a pulse dot while an agent is active. Above 10 subagents it switches to a compact scrollable fleet grid, clustered by workflow run.
+- **Timeline view** — Gantt-style swimlanes, one per agent, with **true duration bars** (each tool call paired with its result timestamp), color-coded by kind (errors in red), a time axis, and a scrub cursor. Click any block to seek; hover for the call's duration.
+- **Replay export** — one click downloads a self-contained HTML file with the session data baked in: full board, timeline, playback, and inspector, no server needed. Send it to anyone.
 - **Event feed** — live-scrolling feed of every message, tool call, result, and spawn, with free-text filtering and per-kind toggles. Click an event for a full-text inspector drawer.
 - **Playback** — replay any session like a video at 1×/4×/16×, or hit LIVE to tail it in real time.
-- **Stat bar** — session-wide agents, events, tool calls, duration, tokens in/out, and error count.
+- **Stat bar** — session-wide agents, events, tool calls, duration, tokens in/out, estimated cost, and error count.
+
+Cost estimates use published Claude API rates per model (cache reads billed at 0.1× input) and are approximate — cache writes and some surcharges aren't in the transcripts.
 
 ## How it works
 

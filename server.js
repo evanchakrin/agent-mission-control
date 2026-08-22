@@ -1,23 +1,35 @@
-// Agent Mission Control v2 — live dashboard over Claude Code session transcripts.
-// Zero dependencies: node server.js  →  http://localhost:4173
+#!/usr/bin/env node
+// Agent Mission Control v2.0 — live dashboard over Claude Code session transcripts.
+// Zero dependencies: node server.js [--port 4173] [--dir <projects dir>]
 //
 // Data sources per session:
 //   <projects>/<slug>/<sessionId>.jsonl                     main (orchestrator) transcript
-//   <projects>/<slug>/<sessionId>/subagents/agent-*.jsonl   one transcript per spawned subagent
+//   <projects>/<slug>/<sessionId>/subagents/**/agent-*.jsonl  subagent + workflow agent transcripts
+//   <projects>/<slug>/<sessionId>/workflows/wf_*.json       workflow metadata (names)
 //   legacy: isSidechain:true lines inside the main file     older-style inline subagents
-//
-// Subagent identity: the Agent tool's result text embeds "agentId: <id>" and the
-// subagent transcript is named agent-<id>.jsonl — so spawn calls are matched to
-// transcripts exactly, with timestamp-order pairing only as a fallback.
 'use strict';
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 4173;
-const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+function argValue(flag) {
+  const i = process.argv.indexOf(flag);
+  return i > -1 ? process.argv[i + 1] : null;
+}
+const PORT = Number(argValue('--port') || process.env.PORT || 4173);
+const PROJECTS_DIR = argValue('--dir') || process.env.CLAUDE_PROJECTS_DIR || path.join(os.homedir(), '.claude', 'projects');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// $/MTok, matched by substring of the model id; cache reads bill at 0.1x input.
+const PRICING = [
+  { m: 'fable', in: 10, out: 50 }, { m: 'mythos', in: 10, out: 50 },
+  { m: 'opus', in: 5, out: 25 }, { m: 'sonnet', in: 3, out: 15 }, { m: 'haiku', in: 1, out: 5 },
+];
+function costOf(a) {
+  const p = PRICING.find(x => (a.model || '').includes(x.m)) || { in: 5, out: 25 };
+  return (a.inTokens / 1e6) * p.in + (a.cacheTokens / 1e6) * p.in * 0.1 + (a.outTokens / 1e6) * p.out;
+}
 
 // ---------- helpers ----------
 
@@ -48,7 +60,7 @@ function newAgent(id, type) {
   return {
     id, name: null, type, task: '', model: null,
     firstTs: null, lastTs: null, events: 0, tools: {},
-    inTokens: 0, outTokens: 0, errors: 0, done: false, lastKind: null,
+    inTokens: 0, cacheTokens: 0, outTokens: 0, errors: 0, done: false, lastKind: null,
   };
 }
 
@@ -56,7 +68,7 @@ function newAgent(id, type) {
 
 // Extract normalized events from one user/assistant line into ctx.
 function processLine(o, agentId, ctx) {
-  const { agents, events, spawnCalls } = ctx;
+  const { agents, events, spawnCalls, pending } = ctx;
   const ts = o.timestamp || null;
   if (!agents.has(agentId)) agents.set(agentId, newAgent(agentId, agentId === 'main' ? 'main' : 'subagent'));
   const agent = agents.get(agentId);
@@ -69,7 +81,8 @@ function processLine(o, agentId, ctx) {
 
   if (o.type === 'assistant') {
     const usage = msg.usage || {};
-    agent.inTokens += (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0);
+    agent.inTokens += usage.input_tokens || 0;
+    agent.cacheTokens += usage.cache_read_input_tokens || 0;
     agent.outTokens += usage.output_tokens || 0;
     if (msg.model && !agent.model) agent.model = msg.model;
 
@@ -89,10 +102,12 @@ function processLine(o, agentId, ctx) {
           }
           agent.tools[b.name] = (agent.tools[b.name] || 0) + 1;
           agent.lastKind = 'tool-call';
-          events.push({
+          const evt = {
             ts, agent: agentId, kind: isSpawn ? 'spawn' : 'tool-call',
             tool: b.name, toolUseId: b.id, text: clip(summary, 240), full: clip(summary, 2500),
-          });
+          };
+          events.push(evt);
+          if (b.id) pending.set(b.id, evt); // paired with its tool_result for duration
         }
       }
     }
@@ -107,6 +122,8 @@ function processLine(o, agentId, ctx) {
             const m = /agentId:\s*([a-z0-9]+)/i.exec(rtext);
             if (m) spawn.agentId = m[1];
           }
+          const start = pending.get(b.tool_use_id);
+          if (start && !start.endTs && ts) start.endTs = ts;
           if (b.is_error) agent.errors++;
           events.push({
             ts, agent: agentId, kind: spawn ? 'spawn-result' : 'tool-result',
@@ -123,9 +140,9 @@ function processLine(o, agentId, ctx) {
 }
 
 // mainLines: JSONL lines of the orchestrator transcript.
-// subFiles: [{id, lines}] — one per subagents/agent-*.jsonl file.
+// subFiles: [{id, lines, group}] — one per subagents/**/agent-*.jsonl file.
 function normalize(mainLines, subFiles, wfNames = new Map()) {
-  const ctx = { agents: new Map(), events: [], spawnCalls: [] };
+  const ctx = { agents: new Map(), events: [], spawnCalls: [], pending: new Map() };
   ctx.agents.set('main', { ...newAgent('main', 'main'), name: 'Orchestrator' });
 
   // --- main file (with legacy inline-sidechain grouping) ---
@@ -214,6 +231,8 @@ function normalize(mainLines, subFiles, wfNames = new Map()) {
     a.task = sp ? sp.prompt : '';
     a.done = (sp && sp.resolved) || a.lastKind === 'assistant-text';
   });
+
+  for (const a of ctx.agents.values()) a.cost = Math.round(costOf(a) * 10000) / 10000;
 
   // one global timeline, then tag spawn events with the agent they created
   ctx.events.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
@@ -318,7 +337,7 @@ function sessionSignature(sessionPath) {
 }
 
 // Parse cache: whole-file reparse only when the signature changes; every open
-// SSE client and the REST endpoint share the same parsed result.
+// SSE client, the REST endpoints, and the fleet view share the parsed result.
 const cache = new Map(); // sessionPath -> {sig, result}
 function readSession(sessionPath) {
   const sig = sessionSignature(sessionPath);
@@ -336,6 +355,38 @@ function readSession(sessionPath) {
   return result;
 }
 
+function sessionSummary(meta) {
+  const full = resolveSessionPath(meta.file);
+  if (!full) return null;
+  let r;
+  try { r = readSession(full); } catch { return null; }
+  const evs = r.events;
+  const first = evs.find(e => e.ts), last = [...evs].reverse().find(e => e.ts);
+  return {
+    file: meta.file, project: meta.project, session: meta.session, title: meta.title, mtime: meta.mtime,
+    agents: r.agents.length, events: evs.length,
+    toolCalls: evs.filter(e => e.kind === 'tool-call' || e.kind === 'spawn').length,
+    errors: evs.filter(e => e.error).length,
+    durationMs: first && last ? new Date(last.ts) - new Date(first.ts) : 0,
+    tokensIn: r.agents.reduce((n, a) => n + a.inTokens + a.cacheTokens, 0),
+    tokensOut: r.agents.reduce((n, a) => n + a.outTokens, 0),
+    cost: Math.round(r.agents.reduce((n, a) => n + (a.cost || 0), 0) * 100) / 100,
+  };
+}
+
+// ---------- standalone replay export ----------
+
+function buildExport(sessionPath, title) {
+  const html = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+  const css = fs.readFileSync(path.join(PUBLIC_DIR, 'style.css'), 'utf8');
+  const js = fs.readFileSync(path.join(PUBLIC_DIR, 'app.js'), 'utf8');
+  const data = { ...readSession(sessionPath), now: Date.now() };
+  const baked = `<script>window.__BAKED__=${JSON.stringify({ title: title || 'Session replay', data }).replace(/</g, '\\u003c')}</script>`;
+  return html
+    .replace('<link rel="stylesheet" href="/style.css">', `<style>\n${css}\n</style>`)
+    .replace('<script src="/app.js"></script>', `${baked}\n<script>\n${js}\n</script>`);
+}
+
 // ---------- http server ----------
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
@@ -350,10 +401,26 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/api/sessions') return json(res, listSessions());
 
+  if (url.pathname === '/api/fleet') {
+    return json(res, listSessions().map(sessionSummary).filter(Boolean));
+  }
+
   if (url.pathname === '/api/session') {
     const full = resolveSessionPath(url.searchParams.get('file') || '');
     if (!full || !fs.existsSync(full)) return json(res, { error: 'not found' }, 404);
     return json(res, { ...readSession(full), now: Date.now() });
+  }
+
+  if (url.pathname === '/api/export') {
+    const full = resolveSessionPath(url.searchParams.get('file') || '');
+    if (!full || !fs.existsSync(full)) { res.writeHead(404); res.end(); return; }
+    const name = (url.searchParams.get('title') || path.basename(full, '.jsonl')).replace(/[^\w.-]+/g, '-');
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Disposition': `attachment; filename="mission-control-replay-${name}.html"`,
+    });
+    res.end(buildExport(full, url.searchParams.get('title')));
+    return;
   }
 
   if (url.pathname === '/api/stream') {
