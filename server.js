@@ -885,6 +885,44 @@ function knownStableKey(k) {
   return false;
 }
 
+// ---------- brain center (local memories, hooks, agent configs) ----------
+// Read/write the agent "brains" on THIS machine only: Claude global memory,
+// per-project memory stores, hook settings, Codex AGENTS.md/config. Same
+// loopback+origin+CSRF gating as metadata — these files steer your agents,
+// so they are never exposed to the LAN and never editable remotely.
+const BRAIN_MAX = 512 * 1024;
+function brainInventory() {
+  const home = os.homedir();
+  const items = [];
+  const add = (category, p, name) => {
+    try {
+      const st = fs.statSync(p);
+      if (st.isFile() && st.size <= BRAIN_MAX) items.push({ id: enc(p), category, path: p, name: name || path.basename(p), size: st.size, mtime: st.mtimeMs });
+    } catch { /* absent */ }
+  };
+  add('Claude · global', path.join(home, '.claude', 'CLAUDE.md'), 'CLAUDE.md (global memory)');
+  add('Claude · hooks & settings', path.join(home, '.claude', 'settings.json'), 'settings.json (hooks, permissions)');
+  add('Claude · hooks & settings', path.join(home, '.claude', 'settings.local.json'), 'settings.local.json');
+  try {
+    for (const proj of fs.readdirSync(PROJECTS_DIR)) {
+      const memDir = path.join(PROJECTS_DIR, proj, 'memory');
+      try {
+        for (const f of fs.readdirSync(memDir)) {
+          if (f.endsWith('.md')) add('Claude · project memory (' + proj.replace(/^[Cc]--Users-[^-]+-/, '').slice(0, 30) + ')', path.join(memDir, f));
+        }
+      } catch { /* no memory dir */ }
+    }
+  } catch { /* ignore */ }
+  add('Codex', path.join(home, '.codex', 'AGENTS.md'), 'AGENTS.md (Codex global instructions)');
+  add('Codex', path.join(home, '.codex', 'config.toml'), 'config.toml');
+  return items;
+}
+function brainResolve(id) {
+  // an id is only valid if it names a file the inventory would list right now
+  const p = decodeURIComponent(id || '');
+  return brainInventory().find(i => i.path === p) || null;
+}
+
 // gate applied to EVERY /api/meta* route (reads included — note is free text)
 function metaGate(req, res) {
   const ra = req.socket.remoteAddress || '';
@@ -1068,6 +1106,37 @@ const server = http.createServer((req, res) => {
       updateCache.data = { current: APP_VERSION, latest: v, updateAvailable: !!v && semverGt(v, APP_VERSION) };
       json(res, updateCache.data);
     }).catch(() => json(res, { current: APP_VERSION, latest: null, updateAvailable: false }));
+  }
+
+  // ---- brain center (loopback + origin + CSRF gated; local files only) ----
+  if (url.pathname === '/api/brain' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    return json(res, { items: brainInventory(), csrf: META_CSRF });
+  }
+  if (url.pathname === '/api/brain/file' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    const item = brainResolve(url.searchParams.get('id'));
+    if (!item) return json(res, { error: 'unknown file' }, 404);
+    try { return json(res, { ...item, content: fs.readFileSync(item.path, 'utf8') }); }
+    catch (e) { return json(res, { error: e.message }, 500); }
+  }
+  if (url.pathname === '/api/brain/file' && req.method === 'POST') {
+    if (!writeGate(req, res)) return;
+    return readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        const item = brainResolve(b.id);
+        if (!item) throw new Error('unknown file');
+        if (typeof b.content !== 'string' || Buffer.byteLength(b.content) > BRAIN_MAX) throw new Error('bad content');
+        const st = fs.statSync(item.path);
+        if (b.baseMtime && Math.abs(st.mtimeMs - b.baseMtime) > 1) { const e = new Error('file changed on disk — reload before saving'); e.status409 = true; throw e; }
+        fs.copyFileSync(item.path, item.path + '.mc-backup'); // one-deep undo
+        const tmp = item.path + '.mc-tmp';
+        fs.writeFileSync(tmp, b.content);
+        fs.renameSync(tmp, item.path);
+        json(res, { ok: true, mtime: fs.statSync(item.path).mtimeMs });
+      } catch (e) { metaErr(res, e); }
+    });
   }
 
   // ---- session/project metadata (loopback + origin + CSRF gated) ----

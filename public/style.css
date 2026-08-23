@@ -327,6 +327,22 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .pb-card-head { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; background: var(--panel2); font-size: 13px; }
 .pb-preview { padding: 10px 12px; font-size: 10.5px; color: var(--dim); font-family: Consolas, monospace; white-space: pre-wrap; max-height: 170px; overflow: hidden; }
 
+/* brain view */
+#brain { position: absolute; inset: 0; display: grid; grid-template-columns: 330px 1fr; }
+.brain-side { border-right: 1px solid var(--line); overflow-y: auto; padding: 18px 12px; background: var(--panel); }
+.brain-cat { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); padding: 12px 8px 5px; }
+.brain-item { padding: 7px 10px; border-radius: 7px; cursor: pointer; display: flex; flex-direction: column; gap: 2px; }
+.brain-item:hover { background: var(--panel2); }
+.brain-item.on { background: var(--panel2); box-shadow: inset 2px 0 0 var(--accent); }
+.bi-name { font-size: 12.5px; font-weight: 600; }
+.bi-meta { font-size: 10px; color: var(--dim); }
+.brain-main { display: flex; flex-direction: column; min-width: 0; }
+.brain-bar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.brain-bar .mini-btn { margin-left: auto; }
+.brain-bar .mini-btn:disabled { opacity: .5; cursor: default; }
+#brainEditor { flex: 1; background: var(--bg); color: var(--text); border: none; outline: none; resize: none; padding: 16px 18px; font-family: Consolas, monospace; font-size: 12.5px; line-height: 1.55; }
+.brain-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 8px; color: var(--text); font-size: 14px; text-align: center; padding: 30px; }
+
 /* usage view */
 #usage { position: absolute; inset: 0; overflow: auto; padding: 22px; }
 .usage-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
