@@ -89,6 +89,11 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .ftable tr[data-file] { cursor: pointer; }
 .ftable tr[data-file]:hover td { background: var(--panel2); }
 .ftable .fcost { color: var(--accent); } .ftable .ferr { color: var(--red); } .ftable .tdate { color: var(--dim); }
+.ftable .tact { text-align: right; white-space: nowrap; width: 1%; }
+.ftable .row-arch, .ftable .row-menu { background: var(--panel2); border: 1px solid var(--line); color: var(--dim); border-radius: 5px; height: 22px; min-width: 24px; cursor: pointer; font-size: 12px; padding: 0 5px; margin-left: 3px; }
+.ftable .row-arch:hover { color: var(--amber); border-color: var(--amber); }
+.ftable .row-menu:hover { color: var(--accent); border-color: var(--accent); }
+.ftable tr.row-archived td { opacity: .5; }
 
 /* machines */
 #machines { position: absolute; inset: 0; overflow-y: auto; padding: 22px; }

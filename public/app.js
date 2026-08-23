@@ -287,10 +287,10 @@ function renderTable() {
     fleetControls(rows.length, (fleetCache || []).length, totAgents, totCost) +
     `<div class="table-wrap"><table class="ftable"><thead><tr>` +
     cols.map(c => `<th data-k="${c.k}" class="${c.num ? 'num' : ''} ${col === c.k ? 'sorted' : ''}">${c.label}${col === c.k ? (dir < 0 ? ' ▼' : ' ▲') : ''}</th>`).join('') +
-    `</tr></thead><tbody>` +
+    `<th class="tact"></th></tr></thead><tbody>` +
     rows.map(s => {
-      const c = kindColor(s.kind);
-      return `<tr data-file="${esc(s.file)}">
+      const c = kindColor(s.kind); const m = metaOf(s);
+      return `<tr data-file="${esc(s.file)}"${m.archived ? ' class="row-archived"' : ''}>
         <td class="tsess">${esc(s.title || s.session.slice(0, 8))}</td>
         <td><span class="kind-badge" style="background:${c}22;color:${c}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span></td>
         <td>${esc(s.machine || '')}</td>
@@ -298,10 +298,18 @@ function renderTable() {
         <td class="num">${fmtDur(s.durationMs)}</td><td class="num">${fmtTok(s.tokensOut)}</td>
         <td class="num fcost">~${fmtUsd(s.cost)}</td><td class="num ${s.errors ? 'ferr' : ''}">${s.errors || ''}</td>
         <td class="num tdate"><span class="ago ${agoClass(s.mtime)}">${fmtAgo(s.mtime)}</span></td>
+        <td class="tact">${s.stableKey ? `<button class="row-arch" data-sk="${esc(s.stableKey)}" title="${m.archived ? 'unarchive' : 'archive'}">${m.archived ? '⤴' : '🗄'}</button><button class="row-menu" title="organize">⋯</button>` : ''}</td>
       </tr>`;
     }).join('') + `</tbody></table></div>`;
-  $('tableView').querySelectorAll('th').forEach(th => { th.onclick = () => { const k = th.dataset.k; tableSort = { col: k, dir: tableSort.col === k ? -tableSort.dir : (cols.find(c => c.k === k).num ? -1 : 1) }; renderTable(); }; });
-  $('tableView').querySelectorAll('tr[data-file]').forEach(tr => { tr.onclick = () => openSession(tr.dataset.file); });
+  $('tableView').querySelectorAll('th[data-k]').forEach(th => { th.onclick = () => { const k = th.dataset.k; tableSort = { col: k, dir: tableSort.col === k ? -tableSort.dir : (cols.find(c => c.k === k).num ? -1 : 1) }; renderTable(); }; });
+  $('tableView').querySelectorAll('tr[data-file]').forEach(tr => {
+    const s = rows.find(x => x.file === tr.dataset.file);
+    tr.onclick = () => openSession(tr.dataset.file);
+    const arch = tr.querySelector('.row-arch');
+    if (arch && s) arch.onclick = e => { e.stopPropagation(); setSessionMeta(s.stableKey, { archived: !metaOf(s).archived }); };
+    const menu = tr.querySelector('.row-menu');
+    if (menu && s) menu.onclick = e => showCardMenu(e, s);
+  });
   wireFleetControls(renderTable);
 }
 
