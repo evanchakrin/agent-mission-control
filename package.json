@@ -1,7 +1,7 @@
 {
   "name": "@thepleasureman/agent-mission-control",
   "publishConfig": { "access": "public" },
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "Live dashboard visualizing Claude Code agent sessions — orchestrator, subagents, and workflow fleets from JSONL transcripts",
   "bin": {
     "agent-mission-control": "./server.js"

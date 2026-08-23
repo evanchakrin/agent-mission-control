@@ -63,6 +63,28 @@ node demo/simulate-crew.js
 
 A three-agent "content-crew" (Researcher → Writer → Reviewer) streams in live over ~15 seconds.
 
+## Multi-machine: relay mode
+
+Run one dashboard (the hub). Every other machine relays its sessions to it:
+
+```bash
+# hub (your main PC) — start with a shared secret
+node server.js --token <secret>
+
+# every other machine — no UI, just forwards its local sessions to the hub
+npx github:evanchakrin/agent-mission-control --relay http://<hub-ip>:4173 --token <secret> --name office-pc
+```
+
+Relayed sessions appear in the hub's Fleet labeled `⇄ <machine>`. The token guards both `/v1/relay` and `/v1/traces`; open TCP port 4173 on the hub's firewall for remote machines.
+
+## Install as a background service (Windows)
+
+```bash
+npx github:evanchakrin/agent-mission-control --install [--token <secret>] [--relay <hub> ...]
+```
+
+Copies itself to LocalAppData, starts hidden now and at every login, and (hub mode) drops an "Agent Mission Control" shortcut on the Desktop. No admin needed. Remove with `--uninstall`.
+
 ## Notes
 
 - Each machine visualizes its own `~/.claude/projects` — run the server wherever the sessions run. Remote Control sessions work (they execute locally); cloud sessions don't (their transcripts never touch your disk).

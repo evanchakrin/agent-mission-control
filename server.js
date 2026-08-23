@@ -20,6 +20,8 @@ function argValue(flag) {
 const PORT = Number(argValue('--port') || process.env.PORT || 4173);
 const PROJECTS_DIR = argValue('--dir') || process.env.CLAUDE_PROJECTS_DIR || path.join(os.homedir(), '.claude', 'projects');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const TOKEN = argValue('--token') || process.env.MISSION_CONTROL_TOKEN || null;
+const RELAY_TO = argValue('--relay') || null; // relay mode: forward local sessions to a hub instead of serving a UI
 
 // $/MTok, matched by substring of the model id; cache reads bill at 0.1x input.
 const PRICING = [
@@ -445,11 +447,40 @@ function otelList() {
   }));
 }
 
-// Resolve either source: "otel:<service>" (in-memory) or a transcript path.
+// ---------- relay (hub side) ----------
+// Remote machines run `--relay http://hub:4173 --token <secret>`: they tail
+// their own transcripts and POST parsed sessions here. Stored in memory,
+// keyed "relay:<machine>:<file>", and shown in the fleet like local sessions.
+const relaySessions = new Map(); // id -> {id, meta, version, result}
+
+function ingestRelay(body) {
+  const id = 'relay:' + body.machine + ':' + body.file;
+  const prev = relaySessions.get(id);
+  relaySessions.set(id, {
+    id, machine: body.machine, meta: body.meta || {},
+    version: (prev ? prev.version : 0) + 1, result: body.result,
+  });
+  return id;
+}
+
+function relayList() {
+  return [...relaySessions.values()].map(s => ({
+    project: '⇄ ' + s.machine, file: s.id, session: s.id,
+    title: (s.meta.title || s.id) + ' · ' + s.machine,
+    size: s.result.events.length, mtime: s.meta.mtime || Date.now(), agentCount: s.result.agents.length - 1,
+  }));
+}
+
+// Resolve any source: "otel:<service>" / "relay:<machine>:<file>" (in-memory)
+// or a local transcript path.
 function getResult(fileParam) {
   if (fileParam.startsWith('otel:')) {
     const sess = otelSessions.get(fileParam);
     return sess ? otelResult(sess) : null;
+  }
+  if (fileParam.startsWith('relay:')) {
+    const sess = relaySessions.get(fileParam);
+    return sess ? sess.result : null;
   }
   const full = resolveSessionPath(fileParam);
   if (!full || !fs.existsSync(full)) return null;
@@ -505,8 +536,11 @@ function json(res, obj, code = 200) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
+  const authorized = !TOKEN || req.headers['x-relay-token'] === TOKEN;
+
   // OTLP/HTTP trace ingestion — any OpenTelemetry-instrumented agent can POST here
   if (url.pathname === '/v1/traces' && req.method === 'POST') {
+    if (!authorized) return json(res, { error: 'bad or missing x-relay-token' }, 401);
     readBody(req, body => {
       try {
         const n = ingestTraces(JSON.parse(body));
@@ -518,10 +552,25 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (url.pathname === '/api/sessions') return json(res, [...otelList(), ...listSessions()]);
+  // Relay ingestion — remote machines POST their parsed sessions here
+  if (url.pathname === '/v1/relay' && req.method === 'POST') {
+    if (!authorized) return json(res, { error: 'bad or missing x-relay-token' }, 401);
+    readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        if (!b.machine || !b.file || !b.result) throw new Error('need machine, file, result');
+        json(res, { ok: true, id: ingestRelay(b) });
+      } catch (e) {
+        json(res, { error: e.message }, 400);
+      }
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/sessions') return json(res, [...relayList(), ...otelList(), ...listSessions()]);
 
   if (url.pathname === '/api/fleet') {
-    return json(res, [...otelList(), ...listSessions()].map(sessionSummary).filter(Boolean));
+    return json(res, [...relayList(), ...otelList(), ...listSessions()].map(sessionSummary).filter(Boolean));
   }
 
   if (url.pathname === '/api/session') {
@@ -557,7 +606,9 @@ const server = http.createServer((req, res) => {
     const tick = () => {
       const sig = isOtel
         ? String(otelSessions.get(fileParam)?.version || 0)
-        : sessionSignature(resolveSessionPath(fileParam));
+        : fileParam.startsWith('relay:')
+          ? String(relaySessions.get(fileParam)?.version || 0)
+          : sessionSignature(resolveSessionPath(fileParam));
       if (sig !== lastSig) {
         lastSig = sig;
         try {
@@ -586,7 +637,102 @@ const server = http.createServer((req, res) => {
   res.writeHead(404); res.end('not found');
 });
 
-server.listen(PORT, () => {
-  console.log(`Agent Mission Control → http://localhost:${PORT}`);
+// ---------- relay (client side) ----------
+// `--relay http://hub:4173 [--token secret] [--name machine-name]`
+// No UI here: every few seconds, any local session whose files changed is
+// parsed and POSTed to the hub, where it appears in the fleet.
+async function runRelay(hub, machineName) {
+  const sent = new Map(); // file -> last signature
+  console.log(`Relaying local sessions → ${hub}/v1/relay as "${machineName}"`);
   console.log(`Watching transcripts in ${PROJECTS_DIR}`);
-});
+  const tick = async () => {
+    for (const meta of listSessions()) {
+      const full = resolveSessionPath(meta.file);
+      if (!full) continue;
+      const sig = sessionSignature(full);
+      if (sent.get(meta.file) === sig) continue;
+      try {
+        const r = await fetch(hub + '/v1/relay', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
+          body: JSON.stringify({ machine: machineName, file: meta.file, meta, result: readSession(full) }),
+        });
+        if (r.ok) { sent.set(meta.file, sig); console.log(`sent ${meta.title || meta.session} (${sig.length > 40 ? sig.slice(0, 40) + '…' : sig})`); }
+        else console.error(`hub rejected ${meta.file}: ${r.status} ${await r.text()}`);
+      } catch (e) {
+        console.error(`hub unreachable: ${e.message} — retrying`);
+        return; // try again next tick without marking anything sent
+      }
+    }
+  };
+  await tick();
+  setInterval(tick, 5000);
+}
+
+// ---------- install as an always-on background service (Windows) ----------
+// `--install [--relay hub --token x ...]` copies the app to LocalAppData,
+// registers a hidden launcher in the Startup folder (runs at every login),
+// starts it now, and drops a desktop shortcut to the dashboard. No admin,
+// no terminal afterwards. `--uninstall` removes all of it.
+function installPaths() {
+  return {
+    dest: path.join(process.env.LOCALAPPDATA, 'AgentMissionControl'),
+    startupVbs: path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'AgentMissionControl.vbs'),
+    desktopUrl: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.url'),
+  };
+}
+
+function installWindows() {
+  if (process.platform !== 'win32') {
+    console.log('--install is Windows-only for now. On Mac/Linux, add "node server.js" to launchd/systemd.');
+    process.exit(1);
+  }
+  const { dest, startupVbs, desktopUrl } = installPaths();
+  fs.mkdirSync(dest, { recursive: true });
+  fs.copyFileSync(__filename, path.join(dest, 'server.js'));
+  fs.cpSync(path.join(__dirname, 'public'), path.join(dest, 'public'), { recursive: true });
+
+  const extra = [];
+  for (const f of ['--relay', '--token', '--name', '--port', '--dir']) {
+    const v = argValue(f);
+    if (v) extra.push(f, v);
+  }
+  const inner = ['node', `"${path.join(dest, 'server.js')}"`, ...extra.map(x => x.startsWith('--') ? x : `"${x}"`)].join(' ');
+  const vbs = `CreateObject("Wscript.Shell").Run "${inner.replace(/"/g, '""')}", 0\r\n`;
+  fs.writeFileSync(path.join(dest, 'start.vbs'), vbs);
+  fs.writeFileSync(startupVbs, vbs);
+
+  if (!RELAY_TO) {
+    try {
+      fs.writeFileSync(desktopUrl, `[InternetShortcut]\r\nURL=http://localhost:${PORT}\r\n`);
+    } catch { /* no Desktop dir */ }
+  }
+
+  require('child_process').spawn('wscript', [path.join(dest, 'start.vbs')], { detached: true, stdio: 'ignore' }).unref();
+  console.log(`Installed. Runs now and at every login (${RELAY_TO ? 'relay → ' + RELAY_TO : 'dashboard at http://localhost:' + PORT}).`);
+  if (!RELAY_TO) console.log('Desktop shortcut created: "Agent Mission Control".');
+  console.log('Remove any time with: --uninstall');
+  process.exit(0);
+}
+
+function uninstallWindows() {
+  const { dest, startupVbs, desktopUrl } = installPaths();
+  for (const p of [startupVbs, desktopUrl]) { try { fs.unlinkSync(p); } catch { /* absent */ } }
+  try { fs.rmSync(dest, { recursive: true, force: true }); } catch { /* absent */ }
+  console.log('Uninstalled (a running instance keeps going until logoff/reboot or you end node.exe in Task Manager).');
+  process.exit(0);
+}
+
+if (process.argv.includes('--install')) {
+  installWindows();
+} else if (process.argv.includes('--uninstall')) {
+  uninstallWindows();
+} else if (RELAY_TO) {
+  runRelay(RELAY_TO.replace(/\/$/, ''), argValue('--name') || os.hostname());
+} else {
+  server.listen(PORT, () => {
+    console.log(`Agent Mission Control → http://localhost:${PORT}`);
+    console.log(`Watching transcripts in ${PROJECTS_DIR}`);
+    if (TOKEN) console.log('Relay/OTLP ingestion requires x-relay-token');
+  });
+}
