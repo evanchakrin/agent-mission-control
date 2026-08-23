@@ -695,8 +695,128 @@ function renderFlows() {
       </div>
     </div>`;
   $('flowsRefresh').onclick = () => { flowsCache = null; loadFlows(); };
-  $('flows').querySelectorAll('.fc-eg, .rt-row').forEach(el => el.onclick = () => { if (el.dataset.file) openSession(el.dataset.file); });
+  // outliers & examples open straight into the readable Story view
+  $('flows').querySelectorAll('.fc-eg, .rt-row').forEach(el => el.onclick = () => { if (el.dataset.file) { openSession(el.dataset.file); state.view = 'story'; setTabs(); render(); } });
   $('flows').querySelectorAll('.fc-arch').forEach(b => b.onclick = e => { e.stopPropagation(); setSessionMeta(b.dataset.sk, { archived: true }).then(() => { flowsCache = null; loadFlows(); }); });
+}
+
+// ---------- PLAYBOOK STUDIO (mine the fleet, generate reusable plays) ----------
+// Generation only — the studio designs plays from YOUR fleet's track record;
+// you paste them to an agent yourself. It never executes anything.
+async function loadPlaybooks() {
+  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  if (!flowsCache) { $('playbooks').innerHTML = '<div class="fleet-loading">Studying your fleet’s track record…</div>'; await loadFlows.fetchOnly(); }
+  renderPlaybooks();
+}
+loadFlows.fetchOnly = async function () {
+  // study the whole track record, archived included — history is the teacher
+  const picks = (fleetCache || []).slice(0, 60);
+  const results = [];
+  for (const chunk of [picks.slice(0, 20), picks.slice(20, 40), picks.slice(40, 60)]) {
+    const part = await Promise.all(chunk.map(s =>
+      fetch('/api/session?file=' + encodeURIComponent(s.file)).then(r => r.json()).then(d => ({ s, d })).catch(() => null)));
+    results.push(...part.filter(Boolean));
+  }
+  flowsCache = results;
+};
+
+function mineFleet() {
+  const data = flowsCache || [];
+  const norm = n => String(n || '').replace(/\s*#\d+$/, '').replace(/[0-9a-f-]{12,}/g, '·').slice(0, 30);
+  const roles = new Map();
+  const sessions = [];
+  for (const { s, d } of data) {
+    const main = d.agents.find(a => a.id === 'main');
+    const subCost = d.agents.filter(a => a.id !== 'main').reduce((n, a) => n + (a.cost || 0), 0);
+    const mainCost = main ? (main.cost || 0) : 0;
+    sessions.push({ s, agents: d.agents.length, errors: d.events.filter(e => e.error).length, mainCost, subCost, roles: d.agents.filter(a => a.id !== 'main').map(a => norm(a.name)) });
+    for (const a of d.agents) {
+      if (a.id === 'main') continue;
+      const key = norm(a.name || 'subagent');
+      const r = roles.get(key) || { n: 0, clean: 0, cost: 0, byMachine: {}, example: null };
+      r.n++; if (!a.errors) r.clean++; r.cost += a.cost || 0;
+      const m = s.machine || 'local';
+      r.byMachine[m] = r.byMachine[m] || { n: 0, clean: 0 };
+      r.byMachine[m].n++; if (!a.errors) r.byMachine[m].clean++;
+      if (!r.example || s.mtime > r.example.mtime) r.example = s;
+      roles.set(key, r);
+    }
+  }
+  // insights (rule-based, plain-language)
+  const insights = [];
+  for (const [name, r] of roles) {
+    if (r.n >= 3 && r.clean / r.n < 0.7) insights.push({ sev: 'bad', icon: '🛠', text: `"${name}" fails ${Math.round((1 - r.clean / r.n) * 100)}% of the time (${r.n} runs). Its prompt or task definition needs work — open a failed run and read what goes wrong.`, file: r.example?.file });
+    const machines = Object.entries(r.byMachine).filter(([, v]) => v.n >= 2);
+    if (machines.length >= 2) {
+      const rates = machines.map(([m, v]) => ({ m, rate: v.clean / v.n }));
+      rates.sort((a, b) => b.rate - a.rate);
+      if (rates[0].rate - rates[rates.length - 1].rate > 0.3) insights.push({ sev: 'warn', icon: '🖥', text: `"${name}" succeeds ${Math.round(rates[0].rate * 100)}% on ${rates[0].m} but only ${Math.round(rates[rates.length - 1].rate * 100)}% on ${rates[rates.length - 1].m} — the environment matters for this role.`, file: r.example?.file });
+    }
+  }
+  for (const x of sessions.filter(x => x.mainCost + x.subCost > 20)) {
+    const share = x.mainCost / (x.mainCost + x.subCost);
+    if (share > 0.6 && x.agents > 5) insights.push({ sev: 'warn', icon: '💸', text: `"${(x.s.title || '').slice(0, 40)}" spent ${Math.round(share * 100)}% of ~${fmtUsd(x.mainCost + x.subCost)} in the orchestrator itself despite having ${x.agents} agents — more delegation would likely be cheaper.`, file: x.s.file });
+  }
+  const cleanRoles = [...roles.entries()].filter(([, r]) => r.n >= 3 && r.clean / r.n >= 0.85).sort((a, b) => b[1].n - a[1].n);
+  if (cleanRoles.length >= 2) insights.push({ sev: 'good', icon: '🏆', text: `Your most reliable roles: ${cleanRoles.slice(0, 3).map(([n]) => `"${n}"`).join(', ')} — proven building blocks for new playbooks below.` });
+  return { roles, sessions, insights, cleanRoles };
+}
+
+function buildPlaybook(kind, mined) {
+  const { cleanRoles } = mined;
+  const roster = cleanRoles.slice(0, kind === 'review' ? 4 : 6).map(([n, r]) => ({ name: n, success: Math.round(r.clean / r.n * 100), avgCost: r.cost / r.n }));
+  const budget = Math.max(5, Math.ceil(roster.reduce((n, r) => n + r.avgCost, 0) * 1.5));
+  const lines = [];
+  lines.push(`# Playbook: ${kind === 'review' ? 'Adversarial review pass' : 'Parallel build team'} (generated from your fleet's track record)`);
+  lines.push('');
+  lines.push(`Paste this to a Claude Code session. Fill in the GOAL.`);
+  lines.push('');
+  lines.push(`GOAL: <describe what you want built/reviewed>`);
+  lines.push('');
+  lines.push(`Please orchestrate this with a team of subagents, using roles this fleet has proven:`);
+  for (const r of roster) lines.push(`- ${r.name} (historical success ${r.success}%${r.avgCost > 0.01 ? `, avg ~${fmtUsd(r.avgCost)}/run` : ''})`);
+  lines.push('');
+  if (kind === 'review') {
+    lines.push(`Pattern: have each reviewer attack the work independently through a different lens, then a final agent merges confirmed findings. Don't let reviewers see each other's output before verdicts.`);
+  } else {
+    lines.push(`Pattern: split the goal into independent workstreams, one agent per stream, working in parallel; one integrator agent merges results and runs a final consistency check.`);
+  }
+  lines.push(`Keep total spend under ~$${budget} (1.5× your historical average for this team size). Report per-agent results before merging.`);
+  return lines.join('\n');
+}
+
+function renderPlaybooks() {
+  const mined = mineFleet();
+  const { insights } = mined;
+  const sevOrder = { bad: 0, warn: 1, good: 2 };
+  insights.sort((a, b) => sevOrder[a.sev] - sevOrder[b.sev]);
+  $('playbooks').innerHTML =
+    `<div class="fleet-head"><h2>Playbook Studio <span class="qi" title="Studies your fleet's real track record — which roles succeed, where money leaks, which patterns run clean — and turns it into insights and ready-to-paste orchestration playbooks. It only generates text; nothing runs from here.">ⓘ</span></h2><button id="pbRefresh" class="mini-btn">↻ re-study</button></div>
+    <div class="flows-grid">
+      <div class="flows-panel">
+        <h3>What your fleet is telling you</h3>
+        <div class="dim" style="margin-bottom:10px">Findings from ${(flowsCache || []).length} recent sessions. Click one to open the session behind it — the Story tab shows you the actual conversation.</div>
+        ${insights.slice(0, 12).map(i => `
+          <div class="pb-insight pb-${i.sev}" ${i.file ? `data-file="${esc(i.file)}"` : ''}>
+            <span class="pb-icon">${i.icon}</span><span class="pb-text">${esc(i.text)}</span>
+          </div>`).join('') || '<div class="dim">Not enough history yet — run more agent sessions and come back.</div>'}
+      </div>
+      <div class="flows-panel">
+        <h3>Ready-to-paste playbooks</h3>
+        <div class="dim" style="margin-bottom:10px">Orchestration prompts built from YOUR proven roles and real costs. Copy one, paste it to any Claude Code session, fill in the goal.</div>
+        ${['build', 'review'].map(k => `
+          <div class="pb-card">
+            <div class="pb-card-head"><b>${k === 'build' ? '🔨 Parallel build team' : '⚔️ Adversarial review pass'}</b><button class="mini-btn pb-copy" data-kind="${k}">📋 copy</button></div>
+            <pre class="pb-preview">${esc(buildPlaybook(k, mined).split('\n').slice(0, 9).join('\n'))}\n…</pre>
+          </div>`).join('')}
+        <div class="dim" style="margin-top:6px">Budgets are 1.5× your historical average for the roster — a guardrail, not a guess.</div>
+      </div>
+    </div>`;
+  $('pbRefresh').onclick = () => { flowsCache = null; loadPlaybooks(); };
+  $('playbooks').querySelectorAll('.pb-insight[data-file]').forEach(el => el.onclick = () => { openSession(el.dataset.file); state.view = 'story'; setTabs(); render(); });
+  $('playbooks').querySelectorAll('.pb-copy').forEach(b => b.onclick = () => {
+    navigator.clipboard.writeText(buildPlaybook(b.dataset.kind, mined)).then(() => { b.textContent = '✓ copied'; setTimeout(() => { b.textContent = '📋 copy'; }, 1500); });
+  });
 }
 
 // ---------- MACHINES view ----------
@@ -946,15 +1066,15 @@ const fmtAgo = t => {
 const agoClass = t => { const h = (Date.now() - t) / 3.6e6; return h < 6 ? 'ago-fresh' : h < 72 ? 'ago-recent' : 'ago-stale'; };
 
 // ---------- render ----------
-const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'constellation', 'machines'];
+const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'playbooks', 'constellation', 'machines'];
 function setTabs() {
-  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
+  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewPlaybooks', 'playbooks'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewStory', 'story'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
     const el = $(btn); if (el) el.classList.toggle('on', state.view === v);
   }
   const overview = OVERVIEW.includes(state.view);
   document.querySelector('main').classList.toggle('no-feed', overview);
   $('empty').style.display = 'none'; // only board/timeline turn it back on
-  for (const id of ['fleet', 'tableView', 'projects', 'usage', 'flows', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
+  for (const id of ['fleet', 'tableView', 'projects', 'usage', 'flows', 'playbooks', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
   if (overview) for (const p of SESSION_PANES) $(p).style.display = 'none';
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
@@ -965,6 +1085,7 @@ function setTabs() {
   else if (state.view === 'projects') loadProjects();
   else if (state.view === 'usage') loadUsage();
   else if (state.view === 'flows') loadFlows();
+  else if (state.view === 'playbooks') loadPlaybooks();
   else if (state.view === 'constellation') loadConstellation();
   else if (state.view === 'machines') loadMachines();
 }
@@ -976,6 +1097,7 @@ function render() {
   else if (state.view === 'waterfall') renderWaterfall();
   else if (state.view === 'lanes') renderLanes();
   else if (state.view === 'costflow') renderCostFlow();
+  else if (state.view === 'story') renderStory();
   else renderTimeline();
   renderFeed();
   $('scrub').max = state.data.events.length;
@@ -1016,7 +1138,7 @@ function sparkline(recentTs, firstTs, lastTs) {
   return '<div class="spark">' + buckets.map(b => `<i style="height:${Math.round(b / max * 100)}%"></i>`).join('') + '</div>';
 }
 
-const SESSION_PANES = ['board', 'timeline', 'waterfall', 'lanes', 'costflow'];
+const SESSION_PANES = ['board', 'timeline', 'waterfall', 'lanes', 'costflow', 'story'];
 function showPane(id) { for (const p of SESSION_PANES) $(p).style.display = p === id ? '' : 'none'; }
 
 function renderBoard() {
@@ -1239,6 +1361,64 @@ function renderLanes() {
   if (state.live) $('lanes').querySelectorAll('.lane-cards').forEach(el => { el.scrollLeft = el.scrollWidth; });
 }
 
+// ---------- STORY view (the session as a readable chat log) ----------
+// The thing you actually STUDY: user prompts and assistant replies in full,
+// with the tool storms between them collapsed into expandable activity strips.
+const storyExpanded = new Set();
+function renderStory() {
+  showPane('story');
+  const evs = state.data.events.slice(0, state.scrub);
+  if (!evs.length) { $('story').innerHTML = '<div class="fleet-loading">Pick a session to read its story.</div>'; return; }
+  const agentName = id => id === 'main' ? 'Orchestrator' : (state.data.agents.find(a => a.id === id)?.name || 'agent');
+  // group into: prompt / reply / activity-burst blocks (main-agent narrative;
+  // subagent chatter is folded into the bursts)
+  const blocks = [];
+  let burst = null;
+  const flushBurst = () => { if (burst && burst.evs.length) blocks.push(burst); burst = null; };
+  for (const e of evs) {
+    const isMainText = e.agent === 'main' && (e.kind === 'user-text' || e.kind === 'user-queued' || e.kind === 'assistant-text');
+    if (isMainText) {
+      flushBurst();
+      blocks.push({ type: e.kind === 'assistant-text' ? 'reply' : 'prompt', e });
+    } else {
+      if (!burst) burst = { type: 'burst', evs: [], errors: 0, spawns: new Set(), tools: {} };
+      burst.evs.push(e);
+      if (e.error) burst.errors++;
+      if (e.kind === 'spawn' && e.spawnedAgent) burst.spawns.add(e.spawnedAgent);
+      if (e.tool) { const t = e.tool.replace(/^mcp__[^_]+__/, ''); burst.tools[t] = (burst.tools[t] || 0) + 1; }
+      if (e.agent !== 'main' && e.kind === 'assistant-text') burst.subReplies = (burst.subReplies || 0) + 1;
+    }
+  }
+  flushBurst();
+  const shown = blocks.slice(-400);
+  $('story').innerHTML = `<div class="story-inner">` + (blocks.length > 400 ? `<div class="dim" style="text-align:center;padding:8px">… ${blocks.length - 400} earlier moments (drag the scrubber back to walk further into the past)</div>` : '') +
+    shown.map((b, i) => {
+      if (b.type === 'prompt') return `<div class="st-msg st-user" data-seq="${b.e.seq}"><div class="st-who">You · ${b.e.ts ? new Date(b.e.ts).toLocaleString() : ''}</div><div class="st-txt">${esc(b.e.full || b.e.text || '')}</div></div>`;
+      if (b.type === 'reply') return `<div class="st-msg st-ai" data-seq="${b.e.seq}"><div class="st-who">${esc(agentName(b.e.agent))}</div><div class="st-txt">${esc(b.e.full || b.e.text || '')}</div></div>`;
+      // activity burst
+      const key = 'b' + (b.evs[0]?.seq ?? i);
+      const open = storyExpanded.has(key);
+      const topTools = Object.entries(b.tools).sort((x, y) => y[1] - x[1]).slice(0, 4).map(([t, n]) => `${t}×${n}`).join(' · ');
+      const spawnNote = b.spawns.size ? `🚀 ${b.spawns.size} agent${b.spawns.size > 1 ? 's' : ''} spawned` : '';
+      return `<div class="st-burst ${b.errors ? 'has-err' : ''}" data-key="${key}">
+        <div class="st-burst-head">⚙ ${b.evs.length} actions${topTools ? ' — ' + esc(topTools) : ''}${spawnNote ? ' — ' + spawnNote : ''}${b.errors ? ` — <b class="ferr">${b.errors} error${b.errors > 1 ? 's' : ''}</b>` : ''} <span class="st-tog">${open ? 'collapse ▴' : 'expand ▾'}</span></div>
+        ${open ? `<div class="st-burst-body">${b.evs.slice(0, 120).map(e => `
+          <div class="st-act ${e.error ? 'err' : ''}" data-seq="${e.seq}">
+            <span class="st-act-who">${esc(agentName(e.agent).slice(0, 20))}</span>
+            <span class="st-act-what">${EV_ICON[e.kind] || '•'} ${e.tool ? esc(e.tool.replace(/^mcp__[^_]+__/, '')) : (KIND_LABEL[e.kind] || e.kind)}</span>
+            <span class="st-act-txt">${esc((e.text || '').slice(0, 90))}</span>
+          </div>`).join('')}${b.evs.length > 120 ? `<div class="dim" style="padding:4px 10px">… ${b.evs.length - 120} more (use Waterfall for everything)</div>` : ''}</div>` : ''}
+      </div>`;
+    }).join('') + `</div>`;
+  $('story').querySelectorAll('.st-burst-head').forEach(h => h.onclick = () => {
+    const key = h.parentElement.dataset.key;
+    if (storyExpanded.has(key)) storyExpanded.delete(key); else storyExpanded.add(key);
+    renderStory();
+  });
+  $('story').querySelectorAll('.st-act, .st-msg').forEach(el => el.ondblclick = () => openDrawer(Number(el.dataset.seq)));
+  if (state.live && !renderStory.scrolledOnce) { $('story').scrollTop = $('story').scrollHeight; renderStory.scrolledOnce = true; }
+}
+
 // ---------- COST FLOW view (Sankey: where this session's money went) ----------
 function renderCostFlow() {
   showPane('costflow');
@@ -1397,11 +1577,13 @@ $('viewTable').onclick = () => { if (!BAKED) { state.view = 'table'; setTabs(); 
 $('viewProjects').onclick = () => { if (!BAKED) { state.view = 'projects'; setTabs(); } };
 $('viewUsage').onclick = () => { if (!BAKED) { state.view = 'usage'; setTabs(); } };
 $('viewFlows').onclick = () => { if (!BAKED) { state.view = 'flows'; setTabs(); } };
+$('viewPlaybooks').onclick = () => { if (!BAKED) { state.view = 'playbooks'; setTabs(); } };
 $('viewConstellation').onclick = () => { if (!BAKED) { state.view = 'constellation'; setTabs(); } };
 $('viewMachines').onclick = () => { if (!BAKED) { state.view = 'machines'; setTabs(); } };
 $('viewBoard').onclick = () => { state.view = 'board'; setTabs(); render(); };
 $('viewWaterfall').onclick = () => { state.view = 'waterfall'; setTabs(); render(); };
 $('viewLanes').onclick = () => { state.view = 'lanes'; setTabs(); render(); };
+$('viewStory').onclick = () => { state.view = 'story'; setTabs(); render(); };
 $('viewCost').onclick = () => { state.view = 'costflow'; setTabs(); render(); };
 $('viewTimeline').onclick = () => { state.view = 'timeline'; setTabs(); render(); };
 $('exportBtn').onclick = () => {
@@ -1433,7 +1615,7 @@ if (BAKED) {
   state.scrub = state.data.events.length;
   document.title = 'Replay — ' + BAKED.title;
   $('spicker').style.display = 'none';
-  for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewUsage', 'viewFlows', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
+  for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewUsage', 'viewFlows', 'viewPlaybooks', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
   $('exportBtn').style.display = 'none';
   $('liveBtn').style.display = 'none';
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'replay';
