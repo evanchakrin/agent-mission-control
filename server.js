@@ -684,6 +684,138 @@ function agentKindOf(file) {
   return 'claude';
 }
 
+// ---------- session/project metadata (durable, loopback-only) ----------
+// User-owned organization (projects, tags, archive, pin, note) kept parallel to
+// the read-only parse layer. Stored at ~/.claude/mission-control/state.json.
+// Bound to a stableKey that survives relay re-sends and hub restarts, NEVER the
+// volatile source-prefixed file id. Mutations are loopback + origin + CSRF gated.
+const crypto = require('crypto');
+const STATE_DIR = path.join(os.homedir(), '.claude', 'mission-control');
+const STATE_FILE = path.join(STATE_DIR, 'state.json');
+const META_CSRF = crypto.randomUUID();
+const LIM = { note: 2000, tagsPerSession: 24, projects: 200, tags: 200, sessions: 5000, bulk: 500, name: 120 };
+let metaState = null;   // { v, metaVersion, machineId, projects, tags, savedFilters, sessions }
+let metaReadOnly = false;
+
+function defaultState() {
+  return { v: 1, metaVersion: 0, machineId: crypto.randomUUID(), projects: [], tags: [], savedFilters: [], sessions: {} };
+}
+function loadState() {
+  try { fs.mkdirSync(STATE_DIR, { recursive: true }); } catch { /* ignore */ }
+  // clean stale temp files from a crashed write
+  try { for (const f of fs.readdirSync(STATE_DIR)) if (/\.tmp$/.test(f)) fs.unlinkSync(path.join(STATE_DIR, f)); } catch { /* ignore */ }
+  if (!fs.existsSync(STATE_FILE)) { metaState = defaultState(); try { saveStateRaw(metaState); } catch { /* ignore */ } return; }
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (!s || typeof s !== 'object' || !s.sessions) throw new Error('shape');
+    s.machineId = s.machineId || crypto.randomUUID();
+    metaState = { ...defaultState(), ...s };
+  } catch (e) {
+    // never overwrite a corrupt file with an empty doc — preserve + go read-only
+    try { fs.renameSync(STATE_FILE, path.join(STATE_DIR, `state.corrupt-${Date.now()}.json`)); } catch { /* ignore */ }
+    console.error('mission-control: state.json unreadable — entering read-only metadata mode.', e.message);
+    metaState = defaultState(); metaReadOnly = true;
+  }
+}
+function saveStateRaw(next) {
+  const tmp = path.join(STATE_DIR, `state.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+  const fd = fs.openSync(tmp, 'w');
+  try { fs.writeSync(fd, JSON.stringify(next)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  let lastErr;
+  for (let i = 0; i < 5; i++) {
+    try { fs.renameSync(tmp, STATE_FILE); return; } catch (e) { lastErr = e; } // rare Windows EPERM/EBUSY: retry immediately
+  }
+  try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+  throw lastErr;
+}
+// clone → mutate/validate on the clone → durable write → swap live state
+function commit(mutator) {
+  if (metaReadOnly) { const e = new Error('metadata is read-only (corrupt state recovered)'); e.code = 503; throw e; }
+  const next = JSON.parse(JSON.stringify(metaState));
+  mutator(next);                       // may throw (400) — live state untouched
+  if (Object.keys(next.sessions).length > LIM.sessions) {
+    const entries = Object.entries(next.sessions).sort((a, b) => (a[1].updatedAt || 0) - (b[1].updatedAt || 0));
+    for (const [k] of entries.slice(0, entries.length - LIM.sessions)) delete next.sessions[k];
+  }
+  next.metaVersion = (metaState.metaVersion || 0) + 1;
+  saveStateRaw(next);                  // may throw (500)
+  metaState = next;
+  return metaState.metaVersion;
+}
+
+const enc = encodeURIComponent;
+// Stable, source-independent key for a listing item. L: hub-local, R: relayed.
+function stableKeyForItem(it) {
+  const f = it.file || '';
+  if (f.startsWith('relay:')) {
+    const parts = f.split(':');
+    const machine = parts[1] || '';
+    const kind = agentKindOf(parts.slice(2).join(':'));
+    let native = String(it.session || '');
+    if (native.startsWith('codex:')) native = native.slice(6);
+    if (native.startsWith('otel:')) native = native.slice(5);
+    native = native.replace(/^.*[\\/]/, '').replace(/\.jsonl$/, '');
+    if (!machine || !native) return null;
+    return `R:${enc(machine)}:${kind}:${enc(native)}`;
+  }
+  const mid = metaState ? metaState.machineId : 'local';
+  if (f.startsWith('codex:')) return `L:${enc(mid)}:codex:${enc(f.slice(6))}`;
+  if (f.startsWith('otel:')) return `L:${enc(mid)}:otel:${enc(f.slice(5))}`;
+  const native = String(it.session || '').replace(/\.jsonl$/, '');
+  if (!native) return null;
+  return `L:${enc(mid)}:claude:${enc(native)}`;
+}
+const STABLEKEY_RE = /^[LR]:[^:]+:(claude|codex|otel):.+$/;
+
+function clean(s, max) { return String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, max); }
+function knownStableKey(k) {
+  if (!STABLEKEY_RE.test(k)) return false;
+  for (const it of [...relayList(), ...otelList(), ...listSessions(), ...codexList()]) if (stableKeyForItem(it) === k) return true;
+  return false;
+}
+
+// gate applied to EVERY /api/meta* route (reads included — note is free text)
+function metaGate(req, res) {
+  const ra = req.socket.remoteAddress || '';
+  if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(ra)) { json(res, { error: 'loopback only' }, 403); return false; }
+  const host = (req.headers.host || '').toLowerCase();
+  if (!/^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host)) { json(res, { error: 'bad host' }, 421); return false; }
+  const sfs = req.headers['sec-fetch-site'];
+  if (sfs && !['same-origin', 'none'].includes(sfs)) { json(res, { error: 'cross-site' }, 403); return false; }
+  const origin = req.headers.origin;
+  if (origin && origin !== 'http://' + host) { json(res, { error: 'bad origin' }, 403); return false; }
+  return true;
+}
+function writeGate(req, res) {
+  if (!metaGate(req, res)) return false;
+  if ((req.headers['content-type'] || '').indexOf('application/json') !== 0) { json(res, { error: 'json only' }, 415); return false; }
+  if (req.headers['x-mc-csrf'] !== META_CSRF) { json(res, { error: 'bad csrf' }, 403); return false; }
+  return true;
+}
+function metaErr(res, e) { json(res, { error: e.message }, e.code || (e.status409 ? 409 : 400)); }
+
+function applySessionPatch(next, key, patch) {
+  if (!knownStableKey(key)) { const e = new Error('unknown session'); throw e; }
+  const cur = next.sessions[key] || { tags: [] };
+  if ('projectId' in patch) {
+    if (patch.projectId !== null && !next.projects.some(p => p.id === patch.projectId)) throw new Error('no such project');
+    cur.projectId = patch.projectId;
+  }
+  if ('archived' in patch) cur.archived = !!patch.archived;
+  if ('pinned' in patch) cur.pinned = !!patch.pinned;
+  if ('note' in patch) cur.note = clean(patch.note, LIM.note);
+  if ('tags' in patch) {
+    if (!Array.isArray(patch.tags)) throw new Error('tags must be array');
+    const valid = patch.tags.filter(t => next.tags.some(x => x.id === t)).slice(0, LIM.tagsPerSession);
+    cur.tags = [...new Set(valid)];
+  }
+  cur.tags = cur.tags || [];
+  cur.updatedAt = metaClock();
+  next.sessions[key] = cur;
+}
+// monotonic-ish clock without Date.now() at module top (allowed inside handlers)
+function metaClock() { return Date.now(); }
+
 function relayList() {
   return [...relaySessions.values()].map(s => {
     let title = s.meta.title;
@@ -692,7 +824,7 @@ function relayList() {
       title = firstUser ? clip(firstUser.text.replace(/\s+/g, ' ').trim(), 70) : s.id.split(':').pop().slice(0, 12);
     }
     return {
-      project: '⇄ ' + s.machine, file: s.id, session: s.id,
+      project: '⇄ ' + s.machine, file: s.id, session: s.meta.session || s.id, machine: s.machine,
       title: title + ' · ' + s.machine,
       size: s.result.events.length, mtime: s.meta.mtime || Date.now(), agentCount: s.result.agents.length - 1,
     };
@@ -731,7 +863,7 @@ function sessionSummary(meta) {
   const machine = meta.file.startsWith('relay:') ? meta.file.split(':')[1] : os.hostname();
   return {
     file: meta.file, project: meta.project, session: meta.session, title: meta.title, mtime: meta.mtime,
-    kind: agentKindOf(meta.file), machine,
+    kind: agentKindOf(meta.file), machine, stableKey: stableKeyForItem(meta),
     agents: r.agents.length, events: evs.length,
     toolCalls: evs.filter(e => e.kind === 'tool-call' || e.kind === 'spawn').length,
     errors: evs.filter(e => e.error).length,
@@ -804,9 +936,86 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/api/machines') return json(res, machineList());
 
+  // ---- session/project metadata (loopback + origin + CSRF gated) ----
+  if (url.pathname === '/api/meta' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    return json(res, { ...metaState, csrf: META_CSRF, readOnly: metaReadOnly });
+  }
+  if (url.pathname === '/api/meta/session' && req.method === 'POST') {
+    if (!writeGate(req, res)) return;
+    return readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        if (typeof b.stableKey !== 'string' || typeof b.patch !== 'object') throw new Error('need stableKey, patch');
+        const v = commit(next => applySessionPatch(next, b.stableKey, b.patch));
+        json(res, { ok: true, session: metaState.sessions[b.stableKey], metaVersion: v });
+      } catch (e) { metaErr(res, e); }
+    });
+  }
+  if (url.pathname === '/api/meta/bulk' && req.method === 'POST') {
+    if (!writeGate(req, res)) return;
+    return readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        if (!Array.isArray(b.stableKeys) || typeof b.patch !== 'object') throw new Error('need stableKeys, patch');
+        if (b.stableKeys.length > LIM.bulk) throw new Error('too many keys');
+        const v = commit(next => { for (const k of b.stableKeys) applySessionPatch(next, k, b.patch); });
+        json(res, { ok: true, count: b.stableKeys.length, metaVersion: v });
+      } catch (e) { metaErr(res, e); }
+    });
+  }
+  if (url.pathname === '/api/meta/project' && req.method === 'POST') {
+    if (!writeGate(req, res)) return;
+    return readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        const v = commit(next => {
+          if (b.baseVersion != null && b.baseVersion !== metaState.metaVersion) { const e = new Error('stale — refetch'); e.status409 = true; throw e; }
+          if (b.op === 'create') {
+            if (next.projects.length >= LIM.projects) throw new Error('too many projects');
+            next.projects.push({ id: 'p_' + crypto.randomBytes(4).toString('hex'), name: clean(b.name, LIM.name) || 'Project', color: /^#[0-9a-f]{6}$/i.test(b.color || '') ? b.color : '#818cf8', order: next.projects.length, createdAt: metaClock() });
+          } else if (b.op === 'update') {
+            const p = next.projects.find(x => x.id === b.id); if (!p) throw new Error('no such project');
+            if (b.name != null) p.name = clean(b.name, LIM.name);
+            if (/^#[0-9a-f]{6}$/i.test(b.color || '')) p.color = b.color;
+            if (typeof b.order === 'number') p.order = b.order;
+          } else if (b.op === 'delete') {
+            next.projects = next.projects.filter(x => x.id !== b.id);
+            for (const k of Object.keys(next.sessions)) if (next.sessions[k].projectId === b.id) next.sessions[k].projectId = null;
+          } else throw new Error('bad op');
+        });
+        json(res, { ok: true, projects: metaState.projects, metaVersion: v });
+      } catch (e) { metaErr(res, e); }
+    });
+  }
+  if (url.pathname === '/api/meta/tag' && req.method === 'POST') {
+    if (!writeGate(req, res)) return;
+    return readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        const v = commit(next => {
+          if (b.baseVersion != null && b.baseVersion !== metaState.metaVersion) { const e = new Error('stale — refetch'); e.status409 = true; throw e; }
+          if (b.op === 'create') {
+            if (next.tags.length >= LIM.tags) throw new Error('too many tags');
+            next.tags.push({ id: 't_' + crypto.randomBytes(4).toString('hex'), name: clean(b.name, LIM.name) || 'tag', color: /^#[0-9a-f]{6}$/i.test(b.color || '') ? b.color : '#f59e0b' });
+          } else if (b.op === 'update') {
+            const t = next.tags.find(x => x.id === b.id); if (!t) throw new Error('no such tag');
+            if (b.name != null) t.name = clean(b.name, LIM.name);
+            if (/^#[0-9a-f]{6}$/i.test(b.color || '')) t.color = b.color;
+          } else if (b.op === 'delete') {
+            next.tags = next.tags.filter(x => x.id !== b.id);
+            for (const k of Object.keys(next.sessions)) next.sessions[k].tags = (next.sessions[k].tags || []).filter(t => t !== b.id);
+          } else throw new Error('bad op');
+        });
+        json(res, { ok: true, tags: metaState.tags, metaVersion: v });
+      } catch (e) { metaErr(res, e); }
+    });
+  }
+
   if (url.pathname === '/api/sessions' || url.pathname === '/api/fleet') {
     const all = [...relayList(), ...otelList(), ...listSessions(), ...codexList()].sort((a, b) => b.mtime - a.mtime);
-    return json(res, url.pathname === '/api/fleet' ? all.map(sessionSummary).filter(Boolean) : all);
+    if (url.pathname === '/api/fleet') return json(res, all.map(sessionSummary).filter(Boolean));
+    return json(res, all.map(it => ({ ...it, kind: agentKindOf(it.file), machine: it.machine || (it.file.startsWith('relay:') ? it.file.split(':')[1] : os.hostname()), stableKey: stableKeyForItem(it) })));
   }
 
   if (url.pathname === '/api/session') {
@@ -847,14 +1056,15 @@ const server = http.createServer((req, res) => {
           : fileParam.startsWith('codex:')
             ? codexSignature(fileParam.slice(6))
             : sessionSignature(resolveSessionPath(fileParam));
+      const mv = metaState ? metaState.metaVersion : 0;
       if (sig !== lastSig) {
         lastSig = sig;
         try {
           const r = getResult(fileParam);
-          if (r) res.write('data: ' + JSON.stringify({ ...r, now: Date.now() }) + '\n\n');
+          if (r) res.write('data: ' + JSON.stringify({ ...r, now: Date.now(), metaVersion: mv }) + '\n\n');
         } catch { /* mid-write read; next tick catches up */ }
       } else {
-        res.write(': keepalive\n\n');
+        res.write(`: keepalive mv=${mv}\n\n`); // cheap metaVersion heartbeat for cross-tab freshness
       }
     };
     tick();
@@ -994,9 +1204,11 @@ if (process.argv.includes('--install')) {
 } else if (RELAY_TO) {
   runRelay(RELAY_TO.replace(/\/$/, ''), argValue('--name') || os.hostname());
 } else {
+  loadState();
   server.listen(PORT, () => {
     console.log(`Agent Mission Control → http://localhost:${PORT}`);
     console.log(`Watching transcripts in ${PROJECTS_DIR}`);
+    console.log(`Session metadata: ${STATE_FILE}${metaReadOnly ? ' (READ-ONLY: recovered from corrupt state)' : ''}`);
     if (TOKEN) console.log('Relay/OTLP ingestion requires x-relay-token');
   });
 }

@@ -41,6 +41,42 @@ async function loadSessions() {
   sel.onchange = () => { if (sel.value) openSession(sel.value); };
 }
 
+// ---------- session/project metadata ----------
+let metaMap = {};        // stableKey -> {projectId, archived, pinned, tags, note}
+let metaProjects = [];
+let metaTags = [];
+let metaCsrf = null;
+let metaVersion = -1;
+let metaReadOnly = false;
+async function loadMeta() {
+  try {
+    const m = await (await fetch('/api/meta')).json();
+    metaMap = m.sessions || {}; metaProjects = m.projects || []; metaTags = m.tags || [];
+    metaCsrf = m.csrf; metaVersion = m.metaVersion; metaReadOnly = !!m.readOnly;
+  } catch { /* first load may race boot */ }
+}
+function metaOf(s) { return (s && s.stableKey && metaMap[s.stableKey]) || {}; }
+function projectById(id) { return metaProjects.find(p => p.id === id); }
+async function metaPost(path, body) {
+  if (metaReadOnly) { alert('Metadata is read-only (recovered from a corrupt state file).'); return null; }
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf },
+    body: JSON.stringify({ baseVersion: metaVersion, ...body }),
+  });
+  if (r.status === 409) { await loadMeta(); return metaPost(path, body); } // stale → refetch + retry once
+  if (!r.ok) { console.warn('meta write failed', path, r.status); return null; }
+  await loadMeta();
+  refreshOverview();
+  return r.json().catch(() => ({}));
+}
+function refreshOverview() {
+  if (state.view === 'fleet') renderFleet();
+  else if (state.view === 'table') renderTable();
+  else if (state.view === 'projects') renderProjects();
+}
+async function setSessionMeta(stableKey, patch) { if (stableKey) return metaPost('/api/meta/session', { stableKey, patch }); }
+
 // ---------- notifications ----------
 // A background poll of /api/fleet detects newly-errored sessions and runs that
 // finished (were active, now idle > N min). Fires desktop notifications + a bell.
@@ -115,10 +151,13 @@ function renderFleet() {
     fleetControls(shown.length, fleet.length, totAgents, totCost) +
     `<div class="fleet-grid">` + shown.map(s => {
       const col = kindColor(s.kind);
+      const m = metaOf(s);
       return `
-      <div class="fcard" data-file="${esc(s.file)}" style="border-left:3px solid ${col}">
+      <div class="fcard${m.archived ? ' is-archived' : ''}" data-file="${esc(s.file)}" data-sk="${esc(s.stableKey || '')}" draggable="true" style="border-left:3px solid ${col}">
+        ${s.stableKey ? '<button class="fcard-menu" title="organize">⋯</button>' : ''}
         <h3>${esc(s.title || s.session.slice(0, 8))}</h3>
         <div class="fproj"><span class="kind-badge" style="background:${col}22;color:${col}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span> ${esc(s.machine || '')} · ${esc(s.project.replace(/^[Cc⇄]+\s?[·]?\s?/, '').replace(/^[Cc]--Users-[^-]+-/, ''))}</div>
+        ${cardBadges(s) ? `<div class="fbadges">${cardBadges(s)}</div>` : ''}
         <div class="fstats">
           <span><b>${s.agents}</b> agents</span><span><b>${s.events}</b> events</span>
           <span><b>${s.toolCalls}</b> tools</span><span><b>${fmtDur(s.durationMs)}</b></span>
@@ -129,26 +168,42 @@ function renderFleet() {
         <div class="fdate">${new Date(s.mtime).toLocaleString()} · ${esc(String(s.session).replace(/^.*[\\:]/, '').slice(0, 8))}</div>
       </div>`;
     }).join('') + `</div>`;
-  $('fleet').querySelectorAll('.fcard').forEach(c => { c.onclick = () => openSession(c.dataset.file); });
+  $('fleet').querySelectorAll('.fcard').forEach(c => {
+    const s = shown.find(x => x.file === c.dataset.file);
+    c.onclick = () => openSession(c.dataset.file);
+    const menu = c.querySelector('.fcard-menu');
+    if (menu && s) menu.onclick = e => showCardMenu(e, s);
+    if (s && s.stableKey) c.ondragstart = e => e.dataTransfer.setData('text/plain', s.stableKey);
+  });
   wireFleetControls(renderFleet);
 }
 
 // ---------- shared fleet filtering (used by grid + table) ----------
-let fleetKind = 'all', fleetMachine = 'all';
+let fleetKind = 'all', fleetMachine = 'all', fleetArchived = 'hide', fleetProject = 'all';
 function filteredFleet() {
   const q = fleetFilter.toLowerCase();
-  return (fleetCache || []).filter(s =>
-    (fleetKind === 'all' || s.kind === fleetKind) &&
-    (fleetMachine === 'all' || s.machine === fleetMachine) &&
-    (!q || ((s.title || '') + ' ' + s.project + ' ' + s.machine + ' ' + s.session).toLowerCase().includes(q)));
+  return (fleetCache || []).filter(s => {
+    const m = metaOf(s);
+    if (fleetArchived === 'hide' && m.archived) return false;
+    if (fleetArchived === 'only' && !m.archived) return false;
+    if (fleetProject === 'unassigned' && m.projectId) return false;
+    if (fleetProject !== 'all' && fleetProject !== 'unassigned' && m.projectId !== fleetProject) return false;
+    if (fleetKind !== 'all' && s.kind !== fleetKind) return false;
+    if (fleetMachine !== 'all' && s.machine !== fleetMachine) return false;
+    if (q && !((s.title || '') + ' ' + s.project + ' ' + s.machine + ' ' + s.session + ' ' + (m.note || '')).toLowerCase().includes(q)) return false;
+    return true;
+  }).sort((a, b) => (metaOf(b).pinned ? 1 : 0) - (metaOf(a).pinned ? 1 : 0)); // pinned first
 }
 function fleetControls(shownN, totalN, agents, cost) {
   const machinesInFleet = [...new Set((fleetCache || []).map(s => s.machine).filter(Boolean))];
   const kinds = ['all', 'claude', 'codex', 'otel'];
+  const arch = [['hide', 'Active'], ['only', 'Archived'], ['all', 'All']];
   return `<div class="fleet-head">
     <h2>${shownN}${shownN !== totalN ? '/' + totalN : ''} sessions · ${agents} agents · ~${fmtUsd(cost)}</h2>
-    <input id="fleetSearch" type="text" placeholder="search… title, machine, project" value="${esc(fleetFilter)}">
+    <input id="fleetSearch" type="text" placeholder="search… title, machine, note" value="${esc(fleetFilter)}">
     <div class="seg" id="kindSeg">${kinds.map(k => `<button data-k="${k}" class="${fleetKind === k ? 'on' : ''}" ${k !== 'all' ? `style="--c:${kindColor(k)}"` : ''}>${k === 'all' ? 'All' : AGENT_KIND[k].label}</button>`).join('')}</div>
+    <div class="seg" id="archSeg">${arch.map(([v, l]) => `<button data-a="${v}" class="${fleetArchived === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+    <select id="projSel"><option value="all">all projects</option><option value="unassigned" ${fleetProject === 'unassigned' ? 'selected' : ''}>unassigned</option>${metaProjects.map(p => `<option value="${esc(p.id)}" ${fleetProject === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>
     <select id="machineSel"><option value="all">all machines</option>${machinesInFleet.map(m => `<option value="${esc(m)}" ${fleetMachine === m ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select>
   </div>`;
 }
@@ -156,8 +211,46 @@ function wireFleetControls(rerender) {
   const search = $('fleetSearch');
   if (search) search.oninput = () => { fleetFilter = search.value; const p = search.selectionStart; rerender(); const s2 = $('fleetSearch'); if (s2) { s2.focus(); s2.setSelectionRange(p, p); } };
   $('kindSeg')?.querySelectorAll('button').forEach(b => { b.onclick = () => { fleetKind = b.dataset.k; rerender(); }; });
-  const ms = $('machineSel');
-  if (ms) ms.onchange = () => { fleetMachine = ms.value; rerender(); };
+  $('archSeg')?.querySelectorAll('button').forEach(b => { b.onclick = () => { fleetArchived = b.dataset.a; rerender(); }; });
+  const ps = $('projSel'); if (ps) ps.onchange = () => { fleetProject = ps.value; rerender(); };
+  const ms = $('machineSel'); if (ms) ms.onchange = () => { fleetMachine = ms.value; rerender(); };
+}
+
+// ---------- card edit menu popover ----------
+let openPopover = null;
+function closePopover() { if (openPopover) { openPopover.remove(); openPopover = null; } }
+document.addEventListener('click', closePopover);
+function showCardMenu(ev, s) {
+  ev.stopPropagation(); closePopover();
+  const m = metaOf(s);
+  const pop = document.createElement('div');
+  pop.className = 'card-pop';
+  pop.onclick = e => e.stopPropagation();
+  const projOpts = metaProjects.map(p => `<button data-proj="${esc(p.id)}"><span class="pdot" style="background:${p.color}"></span>${esc(p.name)}${m.projectId === p.id ? ' ✓' : ''}</button>`).join('');
+  pop.innerHTML = `
+    <div class="pop-sec">Project</div>
+    ${projOpts || '<div class="pop-empty">no projects yet</div>'}
+    <button data-proj="">— none —</button>
+    <div class="pop-div"></div>
+    <button data-act="pin">${m.pinned ? '★ Unpin' : '☆ Pin'}</button>
+    <button data-act="archive">${m.archived ? '⌃ Unarchive' : '⌄ Archive'}</button>
+    <button data-act="note">✎ ${m.note ? 'Edit note' : 'Add note'}</button>`;
+  document.body.appendChild(pop);
+  const r = ev.currentTarget.getBoundingClientRect();
+  pop.style.left = Math.min(r.left, window.innerWidth - 220) + 'px';
+  pop.style.top = (r.bottom + 4) + 'px';
+  openPopover = pop;
+  pop.querySelectorAll('[data-proj]').forEach(b => b.onclick = () => { closePopover(); setSessionMeta(s.stableKey, { projectId: b.dataset.proj || null }); });
+  pop.querySelector('[data-act="pin"]').onclick = () => { closePopover(); setSessionMeta(s.stableKey, { pinned: !m.pinned }); };
+  pop.querySelector('[data-act="archive"]').onclick = () => { closePopover(); setSessionMeta(s.stableKey, { archived: !m.archived }); };
+  pop.querySelector('[data-act="note"]').onclick = () => { closePopover(); const n = prompt('Note for this session:', m.note || ''); if (n !== null) setSessionMeta(s.stableKey, { note: n }); };
+}
+function cardBadges(s) {
+  const m = metaOf(s); const p = projectById(m.projectId);
+  return (m.pinned ? '<span class="mini-badge pin">★</span>' : '') +
+    (p ? `<span class="mini-badge" style="background:${p.color}22;color:${p.color}">${esc(p.name)}</span>` : '') +
+    (m.archived ? '<span class="mini-badge arch">archived</span>' : '') +
+    (m.note ? `<span class="mini-badge note" title="${esc(m.note)}">✎</span>` : '');
 }
 
 // ---------- TABLE view ----------
@@ -209,6 +302,62 @@ function renderTable() {
   $('tableView').querySelectorAll('tr[data-file]').forEach(tr => { tr.onclick = () => openSession(tr.dataset.file); });
   wireFleetControls(renderTable);
 }
+
+// ---------- PROJECTS view (drag sessions into colored columns) ----------
+async function loadProjects() {
+  await loadMeta();
+  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  renderProjects();
+}
+function renderProjects() {
+  const sessions = (fleetCache || []).filter(s => !metaOf(s).archived);
+  const cols = [
+    ...metaProjects.map(p => ({ id: p.id, name: p.name, color: p.color, sessions: sessions.filter(s => metaOf(s).projectId === p.id) })),
+    { id: null, name: 'Unassigned', color: '#8a93a8', sessions: sessions.filter(s => !metaOf(s).projectId) },
+  ];
+  $('projects').innerHTML =
+    `<div class="fleet-head"><h2>Projects — ${metaProjects.length}</h2>
+      <button id="newProjBtn" class="mini-btn">+ New project</button>
+      ${metaReadOnly ? '<span class="ro-warn">metadata read-only (corrupt state recovered)</span>' : ''}</div>` +
+    `<div class="proj-board">` + cols.map(c => `
+      <div class="proj-col" data-proj="${esc(c.id || '')}" style="--pc:${c.color}">
+        <div class="proj-col-head"><span class="pdot" style="background:${c.color}"></span><span class="pcn">${esc(c.name)}</span><span class="pcc">${c.sessions.length}</span>
+          ${c.id ? `<button class="proj-edit" data-proj="${esc(c.id)}" title="edit">⋯</button>` : ''}</div>
+        <div class="proj-drop">${c.sessions.map(s => `
+          <div class="pchip" draggable="true" data-sk="${esc(s.stableKey || '')}" data-file="${esc(s.file)}" style="border-left:3px solid ${kindColor(s.kind)}">
+            <div class="pchip-t">${esc(s.title || s.session.slice(0, 8))}</div>
+            <div class="pchip-m">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label} · ${esc(s.machine || '')} · ~${fmtUsd(s.cost)}</div>
+          </div>`).join('') || '<div class="proj-empty">drop sessions here</div>'}</div>
+      </div>`).join('') + `</div>`;
+  // wire drag + drop
+  $('projects').querySelectorAll('.pchip').forEach(ch => {
+    ch.ondragstart = e => { e.dataTransfer.setData('text/plain', ch.dataset.sk); e.stopPropagation(); };
+    ch.onclick = () => openSession(ch.dataset.file);
+  });
+  $('projects').querySelectorAll('.proj-col').forEach(col => {
+    col.ondragover = e => { e.preventDefault(); col.classList.add('drag-over'); };
+    col.ondragleave = () => col.classList.remove('drag-over');
+    col.ondrop = e => {
+      e.preventDefault(); col.classList.remove('drag-over');
+      const sk = e.dataTransfer.getData('text/plain');
+      if (sk) setSessionMeta(sk, { projectId: col.dataset.proj || null });
+    };
+  });
+  $('newProjBtn').onclick = async () => {
+    const name = prompt('New project name:'); if (!name) return;
+    const color = PROJ_COLORS[metaProjects.length % PROJ_COLORS.length];
+    await metaPost('/api/meta/project', { op: 'create', name, color });
+  };
+  $('projects').querySelectorAll('.proj-edit').forEach(b => b.onclick = async (e) => {
+    e.stopPropagation();
+    const p = projectById(b.dataset.proj); if (!p) return;
+    const name = prompt('Rename project (blank = delete):', p.name);
+    if (name === null) return;
+    if (name === '') { if (confirm(`Delete "${p.name}"? Its ${(fleetCache || []).filter(s => metaOf(s).projectId === p.id).length} sessions become unassigned.`)) await metaPost('/api/meta/project', { op: 'delete', id: p.id }); return; }
+    await metaPost('/api/meta/project', { op: 'update', id: p.id, name });
+  });
+}
+const PROJ_COLORS = ['#fb7185', '#60a5fa', '#c084fc', '#34d399', '#fbbf24', '#f472b6', '#22d3ee', '#a3e635'];
 
 // ---------- MACHINES view ----------
 async function loadMachines() {
@@ -355,6 +504,7 @@ function connect(file) {
   state.es = es;
   es.onmessage = m => {
     const next = JSON.parse(m.data);
+    if (typeof next.metaVersion === 'number' && next.metaVersion !== metaVersion) loadMeta(); // cross-tab freshness
     const fresh = next.events.filter(e => e.seq > state.lastSeq);
     state.lastSeq = next.events.length ? next.events[next.events.length - 1].seq : state.lastSeq;
     state.data = next;
@@ -406,14 +556,14 @@ const fmtDur = ms => {
 };
 
 // ---------- render ----------
-const OVERVIEW = ['fleet', 'table', 'constellation', 'machines'];
+const OVERVIEW = ['fleet', 'table', 'projects', 'constellation', 'machines'];
 function setTabs() {
-  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewTimeline', 'timeline']]) {
+  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewTimeline', 'timeline']]) {
     const el = $(btn); if (el) el.classList.toggle('on', state.view === v);
   }
   const overview = OVERVIEW.includes(state.view);
   document.querySelector('main').classList.toggle('no-feed', overview);
-  for (const id of ['fleet', 'tableView', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
+  for (const id of ['fleet', 'tableView', 'projects', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
   if (overview) { $('board').style.display = 'none'; $('timeline').style.display = 'none'; $('empty').style.display = 'none'; }
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
@@ -421,6 +571,7 @@ function setTabs() {
   stopConstellation();
   if (state.view === 'fleet') loadFleet();
   else if (state.view === 'table') loadTable();
+  else if (state.view === 'projects') loadProjects();
   else if (state.view === 'constellation') loadConstellation();
   else if (state.view === 'machines') loadMachines();
 }
@@ -661,6 +812,7 @@ $('liveBtn').onclick = () => {
 };
 $('viewFleet').onclick = () => { if (!BAKED) { state.view = 'fleet'; setTabs(); } };
 $('viewTable').onclick = () => { if (!BAKED) { state.view = 'table'; setTabs(); } };
+$('viewProjects').onclick = () => { if (!BAKED) { state.view = 'projects'; setTabs(); } };
 $('viewConstellation').onclick = () => { if (!BAKED) { state.view = 'constellation'; setTabs(); } };
 $('viewMachines').onclick = () => { if (!BAKED) { state.view = 'machines'; setTabs(); } };
 $('viewBoard').onclick = () => { if (state.data.events.length || state.file) { state.view = 'board'; setTabs(); render(); } };
@@ -694,13 +846,13 @@ if (BAKED) {
   state.scrub = state.data.events.length;
   document.title = 'Replay — ' + BAKED.title;
   $('sessionSel').style.display = 'none';
-  for (const id of ['viewFleet', 'viewTable', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
+  for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
   $('exportBtn').style.display = 'none';
   $('liveBtn').style.display = 'none';
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'replay';
   setTabs(); render();
 } else {
   loadSessions();
-  setTabs();
+  loadMeta().then(() => setTabs());
   startNotifications();
 }

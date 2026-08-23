@@ -104,6 +104,45 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .mstats { display: flex; gap: 14px; font-size: 12px; color: var(--dim); } .mstats b { color: var(--text); } .mstats .fcost b { color: var(--accent); }
 .mkinds { display: flex; gap: 12px; margin-top: 8px; font-size: 11px; } .mkind { font-weight: 600; }
 
+/* card edit menu + badges */
+.fcard { position: relative; }
+.fcard-menu { position: absolute; top: 8px; right: 8px; background: var(--panel2); border: 1px solid var(--line); color: var(--dim); border-radius: 6px; width: 24px; height: 22px; cursor: pointer; font-size: 13px; line-height: 1; opacity: 0; transition: opacity .15s; }
+.fcard:hover .fcard-menu { opacity: 1; }
+.fcard-menu:hover { color: var(--accent); border-color: var(--accent); }
+.fcard.is-archived { opacity: .55; }
+.fbadges { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 2px; }
+.mini-badge { font-size: 9.5px; padding: 1px 6px; border-radius: 7px; font-weight: 600; background: var(--panel2); color: var(--dim); }
+.mini-badge.pin { background: rgba(251,191,36,.18); color: var(--amber); }
+.mini-badge.arch { background: rgba(138,147,168,.18); }
+.mini-badge.note { cursor: help; }
+.card-pop { position: fixed; z-index: 60; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; box-shadow: 0 12px 40px rgba(0,0,0,.55); padding: 5px; min-width: 190px; max-height: 60vh; overflow-y: auto; }
+.card-pop button { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left; background: none; border: none; color: var(--text); font-size: 12px; padding: 6px 9px; border-radius: 6px; cursor: pointer; }
+.card-pop button:hover { background: var(--panel2); }
+.card-pop .pop-sec { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); padding: 6px 9px 3px; }
+.card-pop .pop-empty { font-size: 11px; color: var(--dim); padding: 4px 9px; }
+.card-pop .pop-div { height: 1px; background: var(--line); margin: 4px 0; }
+.pdot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+
+/* projects view */
+#projects { position: absolute; inset: 0; overflow: auto; padding: 22px; }
+.mini-btn { background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 7px; padding: 6px 12px; cursor: pointer; font-size: 12px; }
+.mini-btn:hover { border-color: var(--accent); color: var(--accent); }
+.ro-warn { font-size: 11px; color: var(--amber); }
+.proj-board { display: flex; gap: 14px; align-items: flex-start; overflow-x: auto; padding-bottom: 10px; }
+.proj-col { flex: 0 0 300px; background: var(--panel); border: 1px solid var(--line); border-top: 3px solid var(--pc); border-radius: 10px; min-height: 120px; }
+.proj-col.drag-over { border-color: var(--accent); box-shadow: 0 0 16px rgba(94,234,212,.25); }
+.proj-col-head { display: flex; align-items: center; gap: 8px; padding: 11px 13px; font-size: 13px; font-weight: 600; border-bottom: 1px solid var(--line); }
+.proj-col-head .pcn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-col-head .pcc { margin-left: auto; font-size: 11px; color: var(--dim); background: var(--panel2); border-radius: 9px; padding: 1px 8px; }
+.proj-edit { background: none; border: none; color: var(--dim); cursor: pointer; font-size: 14px; padding: 0 2px; }
+.proj-edit:hover { color: var(--accent); }
+.proj-drop { padding: 8px; display: flex; flex-direction: column; gap: 7px; min-height: 60px; }
+.pchip { background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; cursor: grab; }
+.pchip:hover { border-color: var(--accent); }
+.pchip-t { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pchip-m { font-size: 10px; color: var(--dim); margin-top: 2px; }
+.proj-empty { font-size: 11px; color: var(--dim); text-align: center; padding: 16px 8px; border: 1px dashed var(--line); border-radius: 7px; }
+
 /* constellation */
 #constellation { position: absolute; inset: 0; overflow: hidden; }
 #constCanvas { display: block; }

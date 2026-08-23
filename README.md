@@ -42,6 +42,14 @@ Claude Code writes transcripts under `~/.claude/projects/<project-slug>/`:
 
 The server tails all of these (700 ms polling, whole-parse cached by a size signature over every file) and streams normalized events to the browser over Server-Sent Events. Subagents are matched to the `Agent`/`Task` calls that spawned them by the agent id embedded in the tool result, with timestamp-order pairing as a fallback; legacy inline `isSidechain` transcripts are also supported.
 
+## Organizing sessions (projects, archive, pin, notes)
+
+Every session card has a `⋯` menu: assign it to a **project**, **pin** it, **archive** it, or attach a **note**. The **Projects** view is a drag-and-drop board — drag sessions between colored project columns; create, rename, recolor, or delete projects. Fleet and Table gain an **Active / Archived / All** toggle and a **project** filter; pinned sessions sort first.
+
+This metadata is **local and durable** — stored at `~/.claude/mission-control/state.json`, written atomically, and bound to a stable per-session key so it survives relay re-sends and hub restarts (it never rides on the volatile session file id). Organizing a session never triggers a reparse or touches the read-only transcript layer.
+
+**Security:** all `/api/meta*` routes (reads and writes) are gated to loopback only, plus a same-origin check and a per-boot CSRF token on writes — a web page you visit cannot reach in and mutate your data, and a remote relay (even with the shared token) can POST session content but cannot touch your projects/archive. Metadata mutation is never exposed on the LAN.
+
 ## Command center views
 
 The overview has four lenses, all color-coded by agent type (Claude coral, Codex blue, OTLP violet):
