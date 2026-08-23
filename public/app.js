@@ -177,7 +177,7 @@ function renderFleet() {
     if (arch && s) arch.onclick = e => { e.stopPropagation(); setSessionMeta(s.stableKey, { archived: !metaOf(s).archived }); };
     if (s && s.stableKey) c.ondragstart = e => e.dataTransfer.setData('text/plain', s.stableKey);
   });
-  wireFleetControls(renderFleet);
+  wireFleetControls(renderFleet, $('fleet'));
 }
 
 // ---------- shared fleet filtering (used by grid + table) ----------
@@ -209,13 +209,18 @@ function fleetControls(shownN, totalN, agents, cost) {
     <select id="machineSel"><option value="all">all machines</option>${machinesInFleet.map(m => `<option value="${esc(m)}" ${fleetMachine === m ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select>
   </div>`;
 }
-function wireFleetControls(rerender) {
-  const search = $('fleetSearch');
-  if (search) search.oninput = () => { fleetFilter = search.value; const p = search.selectionStart; rerender(); const s2 = $('fleetSearch'); if (s2) { s2.focus(); s2.setSelectionRange(p, p); } };
-  $('kindSeg')?.querySelectorAll('button').forEach(b => { b.onclick = () => { fleetKind = b.dataset.k; rerender(); }; });
-  $('archSeg')?.querySelectorAll('button').forEach(b => { b.onclick = () => { fleetArchived = b.dataset.a; rerender(); }; });
-  const ps = $('projSel'); if (ps) ps.onchange = () => { fleetProject = ps.value; rerender(); };
-  const ms = $('machineSel'); if (ms) ms.onchange = () => { fleetMachine = ms.value; rerender(); };
+function wireFleetControls(rerender, root) {
+  // scope to the view that just rendered — Fleet and Table both emit these
+  // controls, and unscoped getElementById always found Fleet's hidden copy,
+  // leaving Table's filter bar dead
+  root = root || $('fleet');
+  const q = sel => root.querySelector(sel);
+  const search = q('#fleetSearch');
+  if (search) search.oninput = () => { fleetFilter = search.value; const p = search.selectionStart; rerender(); const s2 = q('#fleetSearch') || root.querySelector('#fleetSearch'); if (s2) { s2.focus(); s2.setSelectionRange(p, p); } };
+  q('#kindSeg')?.querySelectorAll('button').forEach(b => { b.onclick = () => { fleetKind = b.dataset.k; rerender(); }; });
+  q('#archSeg')?.querySelectorAll('button').forEach(b => { b.onclick = () => { fleetArchived = b.dataset.a; rerender(); }; });
+  const ps = q('#projSel'); if (ps) ps.onchange = () => { fleetProject = ps.value; rerender(); };
+  const ms = q('#machineSel'); if (ms) ms.onchange = () => { fleetMachine = ms.value; rerender(); };
 }
 
 // ---------- card edit menu popover ----------
@@ -310,7 +315,7 @@ function renderTable() {
     const menu = tr.querySelector('.row-menu');
     if (menu && s) menu.onclick = e => showCardMenu(e, s);
   });
-  wireFleetControls(renderTable);
+  wireFleetControls(renderTable, $('tableView'));
 }
 
 // ---------- PROJECTS view (drag sessions into colored columns) ----------
