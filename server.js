@@ -891,6 +891,24 @@ function knownStableKey(k) {
   return false;
 }
 
+// ---------- audit log (immutable record of every state-changing action) ----------
+// Anything that mutates on-disk state (config writes today; launches/approvals
+// once a control tier exists) appends here; nothing bypasses it. Read-only over
+// HTTP, gated like all mutation-adjacent routes.
+const AUDIT_FILE = path.join(STATE_DIR, 'audit.jsonl');
+function appendAudit(entry) {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.appendFileSync(AUDIT_FILE, JSON.stringify({ at: Date.now(), ...entry }) + '\n');
+  } catch (e) { console.error('audit append failed:', e.message); }
+}
+function readAudit(limit = 400) {
+  try {
+    const lines = fs.readFileSync(AUDIT_FILE, 'utf8').trim().split('\n').filter(Boolean);
+    return lines.slice(-limit).map(safeParse).filter(Boolean).reverse();
+  } catch { return []; }
+}
+
 // ---------- brain center (local memories, hooks, agent configs) ----------
 // Read/write the agent "brains" on THIS machine only: Claude global memory,
 // per-project memory stores, hook settings, Codex AGENTS.md/config. Same
@@ -1114,6 +1132,12 @@ const server = http.createServer((req, res) => {
     }).catch(() => json(res, { current: APP_VERSION, latest: null, updateAvailable: false }));
   }
 
+  // ---- audit log (read-only, gated) ----
+  if (url.pathname === '/api/audit' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    return json(res, { entries: readAudit() });
+  }
+
   // ---- brain center (loopback + origin + CSRF gated; local files only) ----
   if (url.pathname === '/api/brain' && req.method === 'GET') {
     if (!metaGate(req, res)) return;
@@ -1140,6 +1164,7 @@ const server = http.createServer((req, res) => {
         const tmp = item.path + '.mc-tmp';
         fs.writeFileSync(tmp, b.content);
         fs.renameSync(tmp, item.path);
+        appendAudit({ kind: 'brain-write', path: item.path, name: item.name, bytes: Buffer.byteLength(b.content), hooks: /settings/.test(item.name) });
         json(res, { ok: true, mtime: fs.statSync(item.path).mtimeMs });
       } catch (e) { metaErr(res, e); }
     });

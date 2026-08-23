@@ -828,6 +828,25 @@ function renderPlaybooks() {
 // ---------- BRAIN view (memories, hooks, agent configs on this machine) ----------
 let brainItems = [], brainCurrent = null, brainDirty = false, brainMode = 'view';
 
+// line-level diff (added / removed counts + a preview) for the confirm dialog
+function miniDiff(before, after) {
+  const a = before.split('\n'), b = after.split('\n');
+  const setA = new Set(a), setB = new Set(b);
+  const added = b.filter(l => !setA.has(l));
+  const removed = a.filter(l => !setB.has(l));
+  return { added, removed };
+}
+function confirmDiff(name, diff, isHooks) {
+  const lines = [];
+  lines.push(`Save changes to ${name}?`);
+  lines.push(`  +${diff.added.length} added, −${diff.removed.length} removed lines`);
+  if (diff.removed.length) lines.push('\nRemoving:\n' + diff.removed.slice(0, 6).map(l => '  − ' + l.slice(0, 70)).join('\n'));
+  if (diff.added.length) lines.push('\nAdding:\n' + diff.added.slice(0, 6).map(l => '  + ' + l.slice(0, 70)).join('\n'));
+  if (isHooks) lines.push('\n⚠ THIS FILE DEFINES HOOKS/PERMISSIONS. Hooks run as shell commands with full trust every time an agent acts. A bad edit here can execute arbitrary code. Only save if you wrote this.');
+  lines.push('\nThis write will be recorded in the audit log.');
+  return confirm(lines.join('\n'));
+}
+
 // pretty JSON with lightweight syntax coloring (tokenize raw text, escape per token)
 function highlightJSON(src) {
   let text = src;
@@ -917,16 +936,44 @@ function renderBrain() {
   if (ed) {
     ed.oninput = () => { if (!brainDirty) { brainDirty = true; const b = $('brainSave'); b.disabled = false; b.textContent = '💾 Save'; } };
     $('brainSave').onclick = async () => {
+      // diff + confirm before writing; loudest warning for hooks/settings (they execute)
+      const before = brainCurrent.content, after = ed.value;
+      if (before === after) return;
+      const isHooks = /settings/i.test(brainCurrent.name);
+      const diff = miniDiff(before, after);
+      if (!confirmDiff(brainCurrent.name, diff, isHooks)) return;
       const r = await fetch('/api/brain/file', {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf },
-        body: JSON.stringify({ id: brainCurrent.id, content: ed.value, baseMtime: brainCurrent.mtime }),
+        body: JSON.stringify({ id: brainCurrent.id, content: after, baseMtime: brainCurrent.mtime }),
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) return alert(j.error || 'save failed');
-      brainCurrent.content = ed.value; brainCurrent.mtime = j.mtime; brainDirty = false;
-      const b = $('brainSave'); b.disabled = true; b.textContent = '✓ Saved';
+      brainCurrent.content = after; brainCurrent.mtime = j.mtime; brainDirty = false;
+      const b = $('brainSave'); b.disabled = true; b.textContent = '✓ Saved (audited)';
     };
   }
+}
+
+// ---------- AUDIT view (immutable record of state-changing actions) ----------
+const AUDIT_ICON = { 'brain-write': '✍️', launch: '🚀', 'launch-end': '🏁', kill: '🛑', approval: '✅', enqueue: '📤' };
+async function loadAudit() {
+  let entries = [];
+  try { entries = (await (await fetch('/api/audit')).json()).entries || []; } catch { /* ignore */ }
+  $('audit').innerHTML =
+    `<div class="fleet-head"><h2>Audit log <span class="qi" title="Every change this dashboard makes to disk is recorded here, append-only. Right now that's Brain file edits; control actions (launches, approvals) will log here too if a control tier is added.">ⓘ</span></h2><span class="dim">${entries.length} recent entries · append-only</span></div>` +
+    (entries.length ? `<div class="audit-list">` + entries.map(e => {
+      const desc = e.kind === 'brain-write' ? `edited <b>${esc(e.name || e.path || '')}</b> (${e.bytes || 0} bytes)${e.hooks ? ' <span class="ferr">— hooks/permissions file</span>' : ''}`
+        : e.kind === 'launch' ? `launched <b>${esc(e.agent)}</b> in ${esc(e.cwd || '')}`
+        : e.kind === 'kill' ? `killed launch <b>${esc(e.id)}</b>`
+        : e.kind === 'approval' ? `${esc(e.decision)} ${esc(e.tool || '')} on ${esc(e.machine || '')}`
+        : esc(e.kind);
+      return `<div class="audit-row">
+        <span class="au-ico">${AUDIT_ICON[e.kind] || '•'}</span>
+        <span class="au-when">${new Date(e.at).toLocaleString()}</span>
+        <span class="au-desc">${desc}</span>
+      </div>`;
+    }).join('') + `</div>`
+    : '<div class="dim" style="padding:20px">No changes recorded yet. Edit a Brain file and it will appear here.</div>');
 }
 
 // ---------- MACHINES view ----------
@@ -1176,15 +1223,15 @@ const fmtAgo = t => {
 const agoClass = t => { const h = (Date.now() - t) / 3.6e6; return h < 6 ? 'ago-fresh' : h < 72 ? 'ago-recent' : 'ago-stale'; };
 
 // ---------- render ----------
-const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'constellation', 'machines'];
+const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines'];
 function setTabs() {
-  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewPlaybooks', 'playbooks'], ['viewBrain', 'brain'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewStory', 'story'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
+  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewPlaybooks', 'playbooks'], ['viewBrain', 'brain'], ['viewAudit', 'audit'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewStory', 'story'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
     const el = $(btn); if (el) el.classList.toggle('on', state.view === v);
   }
   const overview = OVERVIEW.includes(state.view);
   document.querySelector('main').classList.toggle('no-feed', overview);
   $('empty').style.display = 'none'; // only board/timeline turn it back on
-  for (const id of ['fleet', 'tableView', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
+  for (const id of ['fleet', 'tableView', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
   if (overview) for (const p of SESSION_PANES) $(p).style.display = 'none';
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
@@ -1197,6 +1244,7 @@ function setTabs() {
   else if (state.view === 'flows') loadFlows();
   else if (state.view === 'playbooks') loadPlaybooks();
   else if (state.view === 'brain') loadBrain();
+  else if (state.view === 'audit') loadAudit();
   else if (state.view === 'constellation') loadConstellation();
   else if (state.view === 'machines') loadMachines();
 }
@@ -1707,6 +1755,7 @@ $('viewUsage').onclick = () => { if (!BAKED) { state.view = 'usage'; setTabs(); 
 $('viewFlows').onclick = () => { if (!BAKED) { state.view = 'flows'; setTabs(); } };
 $('viewPlaybooks').onclick = () => { if (!BAKED) { state.view = 'playbooks'; setTabs(); } };
 $('viewBrain').onclick = () => { if (!BAKED) { state.view = 'brain'; setTabs(); } };
+$('viewAudit').onclick = () => { if (!BAKED) { state.view = 'audit'; setTabs(); } };
 $('viewConstellation').onclick = () => { if (!BAKED) { state.view = 'constellation'; setTabs(); } };
 $('viewMachines').onclick = () => { if (!BAKED) { state.view = 'machines'; setTabs(); } };
 $('viewBoard').onclick = () => { state.view = 'board'; setTabs(); render(); };
@@ -1744,7 +1793,7 @@ if (BAKED) {
   state.scrub = state.data.events.length;
   document.title = 'Replay — ' + BAKED.title;
   $('spicker').style.display = 'none';
-  for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewUsage', 'viewFlows', 'viewPlaybooks', 'viewBrain', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
+  for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewUsage', 'viewFlows', 'viewPlaybooks', 'viewBrain', 'viewAudit', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
   $('exportBtn').style.display = 'none';
   $('liveBtn').style.display = 'none';
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'replay';
