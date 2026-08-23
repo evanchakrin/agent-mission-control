@@ -102,6 +102,48 @@ function refreshOverview() {
 }
 async function setSessionMeta(stableKey, patch) { if (stableKey) return metaPost('/api/meta/session', { stableKey, patch }); }
 
+// ---------- deep search (full-text across every transcript) ----------
+function openSearch() { $('searchOverlay').classList.add('open'); $('soInput').focus(); }
+function closeSearch() { $('searchOverlay').classList.remove('open'); }
+$('deepSearchBtn').onclick = e => { e.stopPropagation(); openSearch(); };
+$('searchOverlay').onclick = e => { if (e.target === $('searchOverlay')) closeSearch(); };
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeSearch();
+  if (e.key === 'k' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openSearch(); }
+});
+$('soInput').onkeydown = async e => {
+  if (e.key !== 'Enter') return;
+  const q = $('soInput').value.trim();
+  if (q.length < 2) return;
+  $('soResults').innerHTML = '<div class="fleet-loading">Searching every transcript…</div>';
+  let data;
+  try { data = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json(); }
+  catch { $('soResults').innerHTML = '<div class="sp-empty">search failed</div>'; return; }
+  $('soResults').innerHTML = data.hits.length
+    ? `<div class="so-count">${data.hits.length} hits across ${data.scanned} sessions</div>` + data.hits.map(h => `
+      <div class="so-hit" data-file="${esc(h.file)}" data-seq="${h.seq}" style="border-left:3px solid ${kindColor(h.kind)}">
+        <div class="so-t">${esc((h.title || '').slice(0, 60))} <span class="dim">· ${esc(h.machine)} · ${fmtAgo(h.mtime)}${h.tool ? ' · ' + esc(h.tool) : ''}</span></div>
+        <div class="so-s">${esc(h.snippet)}</div>
+      </div>`).join('')
+    : `<div class="sp-empty">no matches in ${data.scanned} sessions</div>`;
+  $('soResults').querySelectorAll('.so-hit').forEach(el => el.onclick = () => {
+    closeSearch();
+    openSessionAt(el.dataset.file, Number(el.dataset.seq));
+  });
+};
+// open a session and jump the scrubber + inspector to a specific event
+function openSessionAt(file, seq) {
+  openSession(file);
+  const started = Date.now();
+  const wait = setInterval(() => {
+    if (state.file === file && state.data.events.length > seq) {
+      clearInterval(wait);
+      seek(seq + 1);
+      openDrawer(seq);
+    } else if (Date.now() - started > 20000) clearInterval(wait);
+  }, 300);
+}
+
 // ---------- notifications ----------
 // A background poll of /api/fleet detects newly-errored sessions and runs that
 // finished (were active, now idle > N min). Fires desktop notifications + a bell.
@@ -117,20 +159,50 @@ function startNotifications() {
     notifTimer = setInterval(pollNotifications, 15000);
   });
 }
+const machineSeen = new Map(); // name -> wasFresh
+let updateNotified = false, budgetNotifiedDay = null;
 async function pollNotifications() {
   let fleet;
   try { fleet = await (await fetch('/api/fleet')).json(); } catch { return; }
   for (const s of fleet) {
     const prev = notifSeen.get(s.file);
-    if (!prev) { notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: Date.now() - s.mtime < 6e5 }); continue; }
+    if (!prev) { notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: Date.now() - s.mtime < 6e5, stalled: s.stalled }); continue; }
     if (s.errors > prev.errors) {
       pushNotif('error', `${s.errors - prev.errors} new error${s.errors - prev.errors > 1 ? 's' : ''}`, s);
     }
+    if (s.stalled && !prev.stalled) pushNotif('error', 'agent stalled — pending tool call >2 min', s);
     const nowActive = Date.now() - s.mtime < 6e5;
     if (prev.active && !nowActive && s.durationMs > 6e5) {
       pushNotif('done', `run finished · ${s.agents} agents · ~${fmtUsd(s.cost)}`, s);
     }
-    notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: nowActive });
+    notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: nowActive, stalled: s.stalled });
+  }
+  // machine silence: a live machine stopped reporting
+  try {
+    const ms = await (await fetch('/api/machines')).json();
+    for (const m of ms.filter(x => x.remote)) {
+      const freshNow = Date.now() - m.lastSeen < 180000;
+      const was = machineSeen.get(m.name);
+      if (was === true && !freshNow) pushNotif('error', 'machine went silent — relay stopped reporting', { title: m.name, file: '', machine: m.name, kind: 'claude', session: m.name });
+      machineSeen.set(m.name, freshNow);
+    }
+  } catch { /* ignore */ }
+  // update available (once per page load)
+  if (!updateNotified) {
+    try {
+      const u = await (await fetch('/api/update-check')).json();
+      if (u.updateAvailable) { updateNotified = true; pushNotif('done', `update available: v${u.latest} (running v${u.current})`, { title: 'Agent Mission Control', file: '', machine: '', kind: 'claude', session: 'update' }); }
+    } catch { /* ignore */ }
+  }
+  // daily cost budget (set in Usage view; stored locally)
+  const budget = Number(localStorage.getItem('mc-daily-budget') || 0);
+  if (budget > 0) {
+    const today = new Date().toDateString();
+    const todayCost = fleet.filter(s => new Date(s.mtime).toDateString() === today).reduce((n, s) => n + s.cost, 0);
+    if (todayCost > budget && budgetNotifiedDay !== today) {
+      budgetNotifiedDay = today;
+      pushNotif('error', `today's est. cost ~${fmtUsd(todayCost)} exceeded your ${fmtUsd(budget)} budget`, { title: 'Daily budget', file: '', machine: '', kind: 'claude', session: 'budget' });
+    }
   }
 }
 function pushNotif(type, msg, s) {
@@ -153,7 +225,7 @@ function renderBell() {
       <div><div class="nt">${esc(n.title)}</div><div class="nm">${esc(n.msg)} · ${esc(n.machine || '')}</div></div>
       <span class="ndot" style="background:${kindColor(n.kind)}"></span>
     </div>`).join('') : '<div class="notif-empty">No alerts yet. Errors and finished long runs show here.</div>';
-  $('notifList').querySelectorAll('.notif[data-file]').forEach(el => el.onclick = () => { $('notifPanel').classList.remove('open'); openSession(el.dataset.file); });
+  $('notifList').querySelectorAll('.notif[data-file]').forEach(el => el.onclick = () => { $('notifPanel').classList.remove('open'); if (el.dataset.file) openSession(el.dataset.file); });
 }
 $('bell').onclick = () => { $('notifPanel').classList.toggle('open'); notifs.forEach(n => n.read = true); renderBell(); };
 $('notifClear').onclick = (e) => { e.stopPropagation(); notifs.length = 0; renderBell(); };
@@ -434,14 +506,15 @@ function renderUsage() {
     b[s.kind] = (b[s.kind] || 0) + v; b.total += v; b.sessions++;
   }
   const keys = [...buckets.keys()].sort();
-  const totAll = { cost: 0, tokensIn: 0, tokensOut: 0, agents: 0, sessions: data.length };
-  for (const s of data) { totAll.cost += s.cost || 0; totAll.tokensIn += s.tokensIn || 0; totAll.tokensOut += s.tokensOut || 0; totAll.agents += s.agents || 0; }
+  const totAll = { cost: 0, tokensIn: 0, tokensCache: 0, tokensOut: 0, agents: 0, sessions: data.length };
+  for (const s of data) { totAll.cost += s.cost || 0; totAll.tokensIn += s.tokensIn || 0; totAll.tokensCache += s.tokensCache || 0; totAll.tokensOut += s.tokensOut || 0; totAll.agents += s.agents || 0; }
   const range = data.length ? `${new Date(Math.min(...data.map(s => s.mtime))).toLocaleDateString()} – ${new Date(Math.max(...data.map(s => s.mtime))).toLocaleDateString()}` : '—';
 
   // summary tiles
   const tiles = `<div class="usage-tiles">
     <div class="utile"><div class="ul">Total est. cost</div><div class="uv accent">~${fmtUsd(totAll.cost)}</div></div>
-    <div class="utile"><div class="ul">Tokens in / out</div><div class="uv">${fmtTok(totAll.tokensIn)} / ${fmtTok(totAll.tokensOut)}</div></div>
+    <div class="utile"><div class="ul">Fresh in / out</div><div class="uv">${fmtTok(totAll.tokensIn)} / ${fmtTok(totAll.tokensOut)}</div></div>
+    <div class="utile"><div class="ul">Cache reads <span title="cached prefix re-read each turn, billed at 0.1×">ⓘ</span></div><div class="uv small" style="font-size:16px">${fmtTok(totAll.tokensCache)}</div></div>
     <div class="utile"><div class="ul">Agents</div><div class="uv">${totAll.agents}</div></div>
     <div class="utile"><div class="ul">Sessions</div><div class="uv">${totAll.sessions}</div></div>
     <div class="utile"><div class="ul">Range</div><div class="uv small">${range}</div></div>
@@ -476,11 +549,14 @@ function renderUsage() {
     `<div class="fleet-head"><h2>Usage over time — ${METRIC_LABEL[usageMetric]}</h2>
       <div class="seg" id="metricSeg">${metrics.map(([v, l]) => `<button data-m="${v}" class="${usageMetric === v ? 'on' : ''}">${l}</button>`).join('')}</div>
       <div class="seg" id="granSeg">${grans.map(([v, l]) => `<button data-g="${v}" class="${usageGran === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+      <label class="budget-lbl">daily alert $<input id="budgetInput" type="number" min="0" step="5" value="${esc(localStorage.getItem('mc-daily-budget') || '')}" placeholder="off"></label>
     </div>` + tiles +
     `<div class="usage-legend"><span style="color:${kindColor('claude')}">■ Claude</span><span style="color:${kindColor('codex')}">■ Codex</span><span style="color:${kindColor('otel')}">■ OTLP</span></div>` +
     `<div class="usage-chart-wrap"><svg width="${chartW}" height="${H}" class="usage-chart">${bars}</svg></div>`;
-  $('metricSeg').querySelectorAll('button').forEach(b => b.onclick = () => { usageMetric = b.dataset.m; renderUsage(); });
-  $('granSeg').querySelectorAll('button').forEach(b => b.onclick = () => { usageGran = b.dataset.g; renderUsage(); });
+  $('usage').querySelector('#metricSeg').querySelectorAll('button').forEach(b => b.onclick = () => { usageMetric = b.dataset.m; renderUsage(); });
+  $('usage').querySelector('#granSeg').querySelectorAll('button').forEach(b => b.onclick = () => { usageGran = b.dataset.g; renderUsage(); });
+  const bi = $('usage').querySelector('#budgetInput');
+  bi.onchange = () => { localStorage.setItem('mc-daily-budget', bi.value || '0'); budgetNotifiedDay = null; };
 }
 
 // ---------- FLOWS view (fleet-wide behavior: weighted tool-flow + trajectory clusters) ----------
@@ -591,8 +667,10 @@ async function loadMachines() {
       const st = byMachine[m.name] || { sessions: 0, agents: 0, cost: 0, kinds: {} };
       const fresh = Date.now() - m.lastSeen < 120000;
       const kindDots = Object.entries(st.kinds).map(([k, n]) => `<span class="mkind" style="color:${kindColor(k)}">● ${(AGENT_KIND[k] || AGENT_KIND.claude).label} ${n}</span>`).join('');
+      const hubV = machinesData.find(x => !x.remote)?.version;
+      const drift = m.version && hubV && m.version !== hubV;
       return `<div class="mcard ${fresh ? 'fresh' : ''}">
-        <h3>${m.remote ? '⇄' : '★'} ${esc(m.name)} <span class="mstatus ${fresh ? 'on' : ''}">${fresh ? 'live' : 'idle'}</span></h3>
+        <h3>${m.remote ? '⇄' : '★'} ${esc(m.name)} ${m.version ? `<span class="mver ${drift ? 'drift' : ''}" title="${drift ? 'version differs from hub v' + esc(hubV) : 'app version'}">v${esc(m.version)}${drift ? ' ⚠' : ''}</span>` : ''} <span class="mstatus ${fresh ? 'on' : ''}">${fresh ? 'live' : 'idle'}</span></h3>
         <div class="mips">${(m.ips || []).map(ip => `<span class="ip">${esc(ip)}</span>`).join('') || '<span class="ip dim">no IPs reported</span>'}</div>
         <div class="mstats"><span><b>${st.sessions}</b> sessions</span><span><b>${st.agents}</b> agents</span><span class="fcost"><b>~${fmtUsd(st.cost)}</b></span></div>
         <div class="mkinds">${kindDots}</div>
@@ -848,7 +926,8 @@ function render() {
 function renderStatbar() {
   const a = state.data.agents;
   const evs = state.data.events;
-  const inT = a.reduce((n, x) => n + (x.inTokens || 0) + (x.cacheTokens || 0), 0);
+  const inT = a.reduce((n, x) => n + (x.inTokens || 0), 0);
+  const cacheT = a.reduce((n, x) => n + (x.cacheTokens || 0), 0);
   const outT = a.reduce((n, x) => n + (x.outTokens || 0), 0);
   const cost = a.reduce((n, x) => n + (x.cost || 0), 0);
   const toolCalls = evs.filter(e => e.kind === 'tool-call' || e.kind === 'spawn').length;
@@ -858,7 +937,7 @@ function renderStatbar() {
   $('statbar').innerHTML =
     `<span>agents <b>${a.length}</b></span><span>events <b>${evs.length}</b></span>` +
     `<span>tool calls <b>${toolCalls}</b></span><span>duration <b>${fmtDur(dur)}</b></span>` +
-    `<span>tokens in <b>${fmtTok(inT)}</b> · out <b>${fmtTok(outT)}</b></span>` +
+    `<span>tokens in <b>${fmtTok(inT)}</b> · cache <b>${fmtTok(cacheT)}</b> · out <b>${fmtTok(outT)}</b></span>` +
     `<span>est. cost <b>~${fmtUsd(cost)}</b></span>` +
     (errs ? `<span style="color:var(--red)">errors <b style="color:var(--red)">${errs}</b></span>` : '');
 }

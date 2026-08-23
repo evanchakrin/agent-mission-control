@@ -23,10 +23,15 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const TOKEN = argValue('--token') || process.env.MISSION_CONTROL_TOKEN || null;
 const RELAY_TO = argValue('--relay') || null; // relay mode: forward local sessions to a hub instead of serving a UI
 
+const APP_VERSION = '5.2.0'; // keep in sync with package.json
+
 // $/MTok, matched by substring of the model id; cache reads bill at 0.1x input.
+// OpenAI rows are family-level estimates (gpt-5 launch pricing) so Codex
+// sessions get a ballpark instead of $0; all UI cost is prefixed "~".
 const PRICING = [
   { m: 'fable', in: 10, out: 50 }, { m: 'mythos', in: 10, out: 50 },
   { m: 'opus', in: 5, out: 25 }, { m: 'sonnet', in: 3, out: 15 }, { m: 'haiku', in: 1, out: 5 },
+  { m: 'gpt-5', in: 1.25, out: 10 }, { m: 'gpt-4', in: 2.5, out: 10 }, { m: 'o3', in: 2, out: 8 }, { m: 'o4', in: 1.1, out: 4.4 },
 ];
 function costOf(a) {
   const p = PRICING.find(x => (a.model || '').includes(x.m));
@@ -455,10 +460,12 @@ function codexList() {
 
 function parseCodexLines(lines, agentId, ctx) {
   const { agents, events, pending } = ctx;
+  const MODEL_RE = /"model":"([a-z0-9][\w.-]{1,40})"/;
   if (!agents.has(agentId)) agents.set(agentId, newAgent(agentId, agentId === 'main' ? 'main' : 'subagent'));
   const agent = agents.get(agentId);
   for (const line of lines) {
     if (!line.trim()) continue;
+    if (!ctx.model && line.includes('"model":"')) { const mm = MODEL_RE.exec(line); if (mm) ctx.model = mm[1]; }
     const o = safeParse(line);
     if (!o || !o.payload) continue;
     const p = o.payload, ts = o.timestamp || null;
@@ -545,7 +552,7 @@ function readCodexSession(uuid) {
       try { parseCodexLines(readCappedLines(tf.path, tf.size), subId, ctx); } catch { /* ignore */ }
     }
   }
-  for (const a of ctx.agents.values()) a.cost = Math.round(costOf(a) * 10000) / 10000; // non-Claude models price at $0
+  for (const a of ctx.agents.values()) { if (!a.model && ctx.model) a.model = ctx.model; a.cost = Math.round(costOf(a) * 10000) / 10000; }
   ctx.events.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
   const events = ctx.events.length > CODEX_EVENT_CAP ? ctx.events.slice(-CODEX_EVENT_CAP) : ctx.events;
   events.forEach((e, i) => { e.seq = i; });
@@ -761,7 +768,7 @@ function ingestRelay(body) {
     ips: Array.isArray(body.ips) ? body.ips : [], at: Date.now(),
   };
   relaySessions.set(id, rec);
-  machines.set(body.machine, { name: body.machine, ips: rec.ips, lastSeen: Date.now(), remote: true });
+  machines.set(body.machine, { name: body.machine, ips: rec.ips, lastSeen: Date.now(), remote: true, version: body.version || null });
   persistRelay(rec);
   return id;
 }
@@ -777,7 +784,7 @@ function localIPs() {
 
 function machineList() {
   const localName = os.hostname();
-  const local = { name: localName, ips: localIPs(), lastSeen: Date.now(), remote: false };
+  const local = { name: localName, ips: localIPs(), lastSeen: Date.now(), remote: false, version: APP_VERSION };
   return [local, ...[...machines.values()].filter(m => m.name !== localName)];
 }
 
@@ -972,9 +979,12 @@ function sessionSummary(meta) {
     toolCalls: evs.filter(e => e.kind === 'tool-call' || e.kind === 'spawn').length,
     errors: evs.filter(e => e.error).length,
     durationMs: first && last ? new Date(last.ts) - new Date(first.ts) : 0,
-    tokensIn: r.agents.reduce((n, a) => n + a.inTokens + a.cacheTokens, 0),
+    tokensIn: r.agents.reduce((n, a) => n + a.inTokens, 0),           // fresh input only
+    tokensCache: r.agents.reduce((n, a) => n + (a.cacheTokens || 0), 0), // cache reads (re-billed prefix, 0.1x rate)
     tokensOut: r.agents.reduce((n, a) => n + a.outTokens, 0),
     cost: Math.round(r.agents.reduce((n, a) => n + (a.cost || 0), 0) * 100) / 100,
+    retrying: r.agents.some(a => a.retrying),
+    stalled: r.agents.some(a => a.pendingTool && a.pendingTool.since && Date.now() - new Date(a.pendingTool.since) > 120000) && Date.now() - meta.mtime < 600000,
   };
 }
 
@@ -1036,9 +1046,21 @@ const server = http.createServer((req, res) => {
 
   // lightweight identity ping — relays poll this every tick to detect a hub
   // restart (in-memory store wiped) and trigger a full resend
-  if (url.pathname === '/v1/boot') return json(res, { boot: BOOT_ID });
+  if (url.pathname === '/v1/boot') return json(res, { boot: BOOT_ID, version: APP_VERSION });
 
   if (url.pathname === '/api/machines') return json(res, machineList());
+
+  // update check: latest version on GitHub main (cached 6h). Hub never
+  // self-updates (a UI you're using shouldn't swap under you) — it just tells.
+  if (url.pathname === '/api/update-check') {
+    const now = Date.now();
+    if (updateCache.at && now - updateCache.at < 6 * 3600e3) return json(res, updateCache.data);
+    return fetchLatestVersion().then(v => {
+      updateCache.at = now;
+      updateCache.data = { current: APP_VERSION, latest: v, updateAvailable: !!v && semverGt(v, APP_VERSION) };
+      json(res, updateCache.data);
+    }).catch(() => json(res, { current: APP_VERSION, latest: null, updateAvailable: false }));
+  }
 
   // ---- session/project metadata (loopback + origin + CSRF gated) ----
   if (url.pathname === '/api/meta' && req.method === 'GET') {
@@ -1116,6 +1138,37 @@ const server = http.createServer((req, res) => {
     });
   }
 
+  // deep search: full-text across every session's events (cached parses)
+  if (url.pathname === '/api/search') {
+    const q = (url.searchParams.get('q') || '').toLowerCase();
+    if (q.length < 2) return json(res, { hits: [], scanned: 0 });
+    const all = [...relayList(), ...otelList(), ...listSessions(), ...codexList()].sort((a, b) => b.mtime - a.mtime);
+    const hits = [];
+    let scanned = 0;
+    for (const meta of all) {
+      if (hits.length >= 120) break;
+      let r;
+      try { r = getResult(meta.file); } catch { continue; }
+      if (!r) continue;
+      scanned++;
+      let perSession = 0;
+      for (const e of r.events) {
+        if (perSession >= 3) break;
+        const hay = (e.full || e.text || '') + ' ' + (e.tool || '');
+        const idx = hay.toLowerCase().indexOf(q);
+        if (idx < 0) continue;
+        perSession++;
+        hits.push({
+          file: meta.file, title: meta.title || meta.session, kind: agentKindOf(meta.file),
+          machine: meta.machine || (meta.file.startsWith('relay:') ? meta.file.split(':')[1] : os.hostname()),
+          mtime: meta.mtime, seq: e.seq, ts: e.ts, eventKind: e.kind, tool: e.tool || null,
+          snippet: hay.slice(Math.max(0, idx - 60), idx + q.length + 90).replace(/\s+/g, ' '),
+        });
+      }
+    }
+    return json(res, { hits, scanned });
+  }
+
   if (url.pathname === '/api/sessions' || url.pathname === '/api/fleet') {
     const all = [...relayList(), ...otelList(), ...listSessions(), ...codexList()].sort((a, b) => b.mtime - a.mtime);
     if (url.pathname === '/api/fleet') return json(res, all.map(sessionSummary).filter(Boolean));
@@ -1190,6 +1243,20 @@ const server = http.createServer((req, res) => {
   res.writeHead(404); res.end('not found');
 });
 
+// ---------- update visibility (no self-update: humans stay in the loop) ----------
+const GH_RAW = 'https://raw.githubusercontent.com/evanchakrin/agent-mission-control/main';
+const updateCache = { at: 0, data: null };
+function semverGt(a, b) {
+  const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) > (pb[i] || 0)) return true; if ((pa[i] || 0) < (pb[i] || 0)) return false; }
+  return false;
+}
+async function fetchLatestVersion() {
+  const r = await fetch(GH_RAW + '/package.json');
+  if (!r.ok) return null;
+  return (await r.json()).version || null;
+}
+
 // ---------- relay (client side) ----------
 // `--relay http://hub:4173 [--token secret] [--name machine-name]`
 // No UI here: every few seconds, any local session whose files changed is
@@ -1218,10 +1285,10 @@ async function runRelay(hub, machineName) {
       if (!result) continue;
       // keep POSTs under the hub's body cap — trim oldest events if needed
       const ips = localIPs();
-      let body = JSON.stringify({ machine: machineName, file: meta.file, meta, result, ips });
+      let body = JSON.stringify({ machine: machineName, file: meta.file, meta, result, ips, version: APP_VERSION });
       while (body.length > 35e6 && result.events.length > 500) {
         result = { ...result, events: result.events.slice(Math.ceil(result.events.length / 2)) };
-        body = JSON.stringify({ machine: machineName, file: meta.file, meta, result, ips });
+        body = JSON.stringify({ machine: machineName, file: meta.file, meta, result, ips, version: APP_VERSION });
       }
       try {
         const r = await fetch(hub + '/v1/relay', {
