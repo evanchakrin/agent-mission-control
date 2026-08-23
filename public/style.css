@@ -325,7 +325,41 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .pb-icon { font-size: 15px; }
 .pb-card { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 12px; overflow: hidden; }
 .pb-card-head { display: flex; align-items: center; justify-content: space-between; padding: 9px 12px; background: var(--panel2); font-size: 13px; }
-.pb-preview { padding: 10px 12px; font-size: 10.5px; color: var(--dim); font-family: Consolas, monospace; white-space: pre-wrap; max-height: 170px; overflow: hidden; }
+.pb-preview { padding: 10px 12px; font-size: 10.5px; color: var(--dim); font-family: Consolas, monospace; white-space: pre-wrap; max-height: 150px; overflow: hidden; }
+.pb-actions { display: flex; gap: 4px; }
+.pb-method { font-size: 11.5px; padding: 10px 14px; margin-bottom: 14px; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; line-height: 1.5; }
+.pb-lib { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+.pb-lib-item { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: var(--panel2); display: flex; flex-direction: column; gap: 8px; }
+.pli-head { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; }
+.pli-head b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pli-kind { font-size: 9.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--accent2); background: rgba(129,140,248,.14); border-radius: 6px; padding: 1px 6px; }
+.pli-head .dim { margin-left: auto; font-size: 10px; }
+.pli-actions { display: flex; gap: 5px; }
+.pli-actions .mini-btn { padding: 3px 9px; }
+
+/* hooks explainer */
+.hooks-explain { padding: 16px 18px; overflow-y: auto; font-size: 12.5px; }
+.he-sec { margin-bottom: 20px; }
+.he-sec h4 { font-size: 13px; margin-bottom: 8px; color: var(--accent); }
+.he-row { display: grid; grid-template-columns: 180px 1fr; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--panel2); }
+.he-row b { color: var(--accent2); }
+.he-event { margin: 10px 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
+.he-event-h { font-weight: 700; margin-bottom: 6px; }
+.he-hook { display: flex; align-items: center; gap: 10px; padding: 5px 6px; border-radius: 6px; }
+.he-hook.off { opacity: .5; }
+.he-hook-body { font-family: Consolas, monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.he-toggle input { width: 32px; height: 17px; appearance: none; background: var(--line); border-radius: 9px; position: relative; cursor: pointer; flex-shrink: 0; }
+.he-toggle input:checked { background: var(--green); }
+.he-toggle input::after { content: ''; position: absolute; width: 13px; height: 13px; border-radius: 50%; background: #fff; top: 2px; left: 2px; transition: left .15s; }
+.he-toggle input:checked::after { left: 17px; }
+
+/* brain history */
+#brainHistPanel { position: absolute; right: 16px; top: 52px; width: 340px; z-index: 6; }
+.brain-hist { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 12px 40px rgba(0,0,0,.5); overflow: hidden; }
+.bh-head { padding: 9px 12px; font-size: 12px; font-weight: 600; color: var(--dim); border-bottom: 1px solid var(--line); }
+.bh-row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; font-size: 11.5px; border-bottom: 1px solid var(--panel2); }
+.bh-row .mini-btn { margin-left: auto; padding: 2px 8px; }
+.brain-main { position: relative; }
 
 /* brain view */
 #brain { position: absolute; inset: 0; display: grid; grid-template-columns: 330px 1fr; }

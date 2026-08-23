@@ -909,19 +909,87 @@ function readAudit(limit = 400) {
   } catch { return []; }
 }
 
+// ---------- playbook library (durable, editable) ----------
+// The long-term home for orchestration plays and agentic-doc snippets. JSON
+// store; gated CRUD; every change audited. Studio can save a generated play
+// straight into the library, and you can author custom ones.
+const PLAYBOOK_FILE = path.join(STATE_DIR, 'playbooks.json');
+function loadPlaybooks() {
+  try { return JSON.parse(fs.readFileSync(PLAYBOOK_FILE, 'utf8')); } catch { return { v: 1, items: [] }; }
+}
+function savePlaybooks(next) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const tmp = PLAYBOOK_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+  fs.renameSync(tmp, PLAYBOOK_FILE);
+}
+
+// ---------- brain version history ----------
+// Every Brain save snapshots the PRIOR content, so config/memory/hooks edits
+// are recoverable — real version control, not a single .mc-backup.
+const BRAIN_HIST = path.join(STATE_DIR, 'brain-history');
+function brainHistDir(p) { return path.join(BRAIN_HIST, crypto.createHash('sha1').update(p).digest('hex')); }
+function snapshotBrain(item) {
+  try {
+    const dir = brainHistDir(item.path);
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = String(Date.now());
+    fs.copyFileSync(item.path, path.join(dir, stamp + '.snap'));
+    // keep a small index with the display name + size
+    const idxFile = path.join(dir, 'index.json');
+    let idx = [];
+    try { idx = JSON.parse(fs.readFileSync(idxFile, 'utf8')); } catch { /* new */ }
+    idx.push({ stamp, name: item.name, size: fs.statSync(item.path).size });
+    idx = idx.slice(-40); // cap history depth
+    fs.writeFileSync(idxFile, JSON.stringify(idx));
+    // prune snapshots not in the index
+    const keep = new Set(idx.map(x => x.stamp + '.snap'));
+    for (const f of fs.readdirSync(dir)) if (f.endsWith('.snap') && !keep.has(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch { /* ignore */ } }
+  } catch (e) { console.error('brain snapshot failed:', e.message); }
+}
+function brainHistory(p) {
+  try { return JSON.parse(fs.readFileSync(path.join(brainHistDir(p), 'index.json'), 'utf8')).reverse(); } catch { return []; }
+}
+function brainSnapshotContent(p, stamp) {
+  if (!/^\d+$/.test(String(stamp))) return null;
+  try { return fs.readFileSync(path.join(brainHistDir(p), stamp + '.snap'), 'utf8'); } catch { return null; }
+}
+
 // ---------- brain center (local memories, hooks, agent configs) ----------
 // Read/write the agent "brains" on THIS machine only: Claude global memory,
 // per-project memory stores, hook settings, Codex AGENTS.md/config. Same
 // loopback+origin+CSRF gating as metadata — these files steer your agents,
 // so they are never exposed to the LAN and never editable remotely.
 const BRAIN_MAX = 512 * 1024;
+// Resolve a Claude project's real working directory from its transcript (the
+// slug is lossy, but transcripts record the true cwd).
+const cwdCache = new Map();
+function claudeProjectCwd(projDir) {
+  if (cwdCache.has(projDir)) return cwdCache.get(projDir);
+  let cwd = null;
+  try {
+    const files = fs.readdirSync(projDir).filter(f => f.endsWith('.jsonl'));
+    for (const f of files.slice(0, 3)) {
+      const fd = fs.openSync(path.join(projDir, f), 'r');
+      const buf = Buffer.alloc(Math.min(16384, fs.statSync(path.join(projDir, f)).size));
+      fs.readSync(fd, buf, 0, buf.length, 0); fs.closeSync(fd);
+      const m = /"cwd":"((?:[^"\\]|\\.)+)"/.exec(buf.toString('utf8'));
+      if (m) { try { cwd = JSON.parse('"' + m[1] + '"'); break; } catch { /* keep looking */ } }
+    }
+  } catch { /* ignore */ }
+  cwdCache.set(projDir, cwd);
+  return cwd;
+}
+
 function brainInventory() {
   const home = os.homedir();
   const items = [];
+  const seen = new Set();
   const add = (category, p, name) => {
     try {
+      if (seen.has(p)) return;
       const st = fs.statSync(p);
-      if (st.isFile() && st.size <= BRAIN_MAX) items.push({ id: enc(p), category, path: p, name: name || path.basename(p), size: st.size, mtime: st.mtimeMs });
+      if (st.isFile() && st.size <= BRAIN_MAX) { seen.add(p); items.push({ id: enc(p), category, path: p, name: name || path.basename(p), size: st.size, mtime: st.mtimeMs }); }
     } catch { /* absent */ }
   };
   add('Claude · global', path.join(home, '.claude', 'CLAUDE.md'), 'CLAUDE.md (global memory)');
@@ -929,12 +997,23 @@ function brainInventory() {
   add('Claude · hooks & settings', path.join(home, '.claude', 'settings.local.json'), 'settings.local.json');
   try {
     for (const proj of fs.readdirSync(PROJECTS_DIR)) {
-      const memDir = path.join(PROJECTS_DIR, proj, 'memory');
+      const projDir = path.join(PROJECTS_DIR, proj);
+      const label = proj.replace(/^[Cc]--Users-[^-]+-/, '').slice(0, 30);
+      // memory store
       try {
-        for (const f of fs.readdirSync(memDir)) {
-          if (f.endsWith('.md')) add('Claude · project memory (' + proj.replace(/^[Cc]--Users-[^-]+-/, '').slice(0, 30) + ')', path.join(memDir, f));
+        for (const f of fs.readdirSync(path.join(projDir, 'memory'))) {
+          if (f.endsWith('.md')) add('Claude · project memory (' + label + ')', path.join(projDir, 'memory', f));
         }
-      } catch { /* no memory dir */ }
+      } catch { /* none */ }
+      // guidance docs in the actual project working directory
+      const cwd = claudeProjectCwd(projDir);
+      if (cwd) {
+        add('Guidance · ' + label, path.join(cwd, 'CLAUDE.md'), 'CLAUDE.md');
+        add('Guidance · ' + label, path.join(cwd, 'CLAUDE.local.md'), 'CLAUDE.local.md');
+        add('Guidance · ' + label, path.join(cwd, 'AGENTS.md'), 'AGENTS.md');
+        add('Guidance · ' + label, path.join(cwd, '.claude', 'settings.json'), 'project settings.json (hooks)');
+        add('Guidance · ' + label, path.join(cwd, '.cursorrules'), '.cursorrules');
+      }
     }
   } catch { /* ignore */ }
   add('Codex', path.join(home, '.codex', 'AGENTS.md'), 'AGENTS.md (Codex global instructions)');
@@ -1138,6 +1217,58 @@ const server = http.createServer((req, res) => {
     return json(res, { entries: readAudit() });
   }
 
+  // ---- brain version history ----
+  if (url.pathname === '/api/brain/history' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    const item = brainResolve(url.searchParams.get('id'));
+    if (!item) return json(res, { error: 'unknown file' }, 404);
+    return json(res, { history: brainHistory(item.path) });
+  }
+  if (url.pathname === '/api/brain/snapshot' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    const item = brainResolve(url.searchParams.get('id'));
+    if (!item) return json(res, { error: 'unknown file' }, 404);
+    const content = brainSnapshotContent(item.path, url.searchParams.get('stamp'));
+    if (content == null) return json(res, { error: 'no such snapshot' }, 404);
+    return json(res, { content });
+  }
+
+  // ---- playbook library (gated CRUD, audited) ----
+  if (url.pathname === '/api/playbooks' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    return json(res, loadPlaybooks());
+  }
+  if (url.pathname === '/api/playbooks' && req.method === 'POST') {
+    if (!writeGate(req, res)) return;
+    return readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        const store = loadPlaybooks();
+        if (b.op === 'save') {
+          const name = clean(b.name, 100) || 'Untitled play';
+          if (typeof b.body !== 'string' || b.body.length > 60000) throw new Error('bad body');
+          if (b.id) {
+            const p = store.items.find(x => x.id === b.id); if (!p) throw new Error('not found');
+            p.name = name; p.body = b.body; p.kind = clean(b.kind, 40) || p.kind; p.updatedAt = Date.now();
+          } else {
+            if (store.items.length >= 300) throw new Error('library full');
+            store.items.push({ id: 'pb_' + crypto.randomBytes(5).toString('hex'), name, kind: clean(b.kind, 40) || 'custom', body: b.body, source: clean(b.source, 40) || 'manual', createdAt: Date.now(), updatedAt: Date.now() });
+          }
+          savePlaybooks(store);
+          appendAudit({ kind: 'playbook-save', name });
+          return json(res, { ok: true, items: store.items });
+        }
+        if (b.op === 'delete') {
+          store.items = store.items.filter(x => x.id !== b.id);
+          savePlaybooks(store);
+          appendAudit({ kind: 'playbook-delete', id: b.id });
+          return json(res, { ok: true, items: store.items });
+        }
+        throw new Error('bad op');
+      } catch (e) { metaErr(res, e); }
+    });
+  }
+
   // ---- brain center (loopback + origin + CSRF gated; local files only) ----
   if (url.pathname === '/api/brain' && req.method === 'GET') {
     if (!metaGate(req, res)) return;
@@ -1161,6 +1292,7 @@ const server = http.createServer((req, res) => {
         const st = fs.statSync(item.path);
         if (b.baseMtime && Math.abs(st.mtimeMs - b.baseMtime) > 1) { const e = new Error('file changed on disk — reload before saving'); e.status409 = true; throw e; }
         fs.copyFileSync(item.path, item.path + '.mc-backup'); // one-deep undo
+        snapshotBrain(item); // full version history
         const tmp = item.path + '.mc-tmp';
         fs.writeFileSync(tmp, b.content);
         fs.renameSync(tmp, item.path);

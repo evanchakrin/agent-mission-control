@@ -712,6 +712,7 @@ function renderFlows() {
 async function loadPlaybooks() {
   if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
   if (!flowsCache) { $('playbooks').innerHTML = '<div class="fleet-loading">Studying your fleet’s track record…</div>'; await loadFlows.fetchOnly(); }
+  await loadPlaybookLib();
   renderPlaybooks();
 }
 loadFlows.fetchOnly = async function () {
@@ -726,21 +727,40 @@ loadFlows.fetchOnly = async function () {
   flowsCache = results;
 };
 
+// model tier from an id string (for token-saving analysis)
+function modelTier(model) {
+  const m = String(model || '').toLowerCase();
+  if (/fable|mythos/.test(m)) return 'flagship';
+  if (/opus|gpt-5|o3|o1/.test(m)) return 'premium';
+  if (/sonnet|gpt-4|codex/.test(m)) return 'mid';
+  if (/haiku|mini|flash|gpt-3/.test(m)) return 'cheap';
+  return 'unknown';
+}
+const TIER_RATE = { premium: 25, mid: 15, cheap: 5 }; // rough $/Mtok output, for savings math
+
 function mineFleet() {
   const data = flowsCache || [];
   const norm = n => String(n || '').replace(/\s*#\d+$/, '').replace(/[0-9a-f-]{12,}/g, '·').slice(0, 30);
   const roles = new Map();
   const sessions = [];
+  const models = new Map(); // model -> {agents, cost, outTok, roles:Set}
   for (const { s, d } of data) {
     const main = d.agents.find(a => a.id === 'main');
     const subCost = d.agents.filter(a => a.id !== 'main').reduce((n, a) => n + (a.cost || 0), 0);
     const mainCost = main ? (main.cost || 0) : 0;
     sessions.push({ s, agents: d.agents.length, errors: d.events.filter(e => e.error).length, mainCost, subCost, roles: d.agents.filter(a => a.id !== 'main').map(a => norm(a.name)) });
     for (const a of d.agents) {
+      if (a.model) {
+        const mm = models.get(a.model) || { agents: 0, cost: 0, outTok: 0, roles: new Set(), tier: modelTier(a.model) };
+        mm.agents++; mm.cost += a.cost || 0; mm.outTok += a.outTokens || 0;
+        if (a.id !== 'main') mm.roles.add(norm(a.name));
+        models.set(a.model, mm);
+      }
       if (a.id === 'main') continue;
       const key = norm(a.name || 'subagent');
-      const r = roles.get(key) || { n: 0, clean: 0, cost: 0, byMachine: {}, example: null };
+      const r = roles.get(key) || { n: 0, clean: 0, cost: 0, byMachine: {}, models: {}, example: null };
       r.n++; if (!a.errors) r.clean++; r.cost += a.cost || 0;
+      if (a.model) r.models[a.model] = (r.models[a.model] || 0) + 1;
       const m = s.machine || 'local';
       r.byMachine[m] = r.byMachine[m] || { n: 0, clean: 0 };
       r.byMachine[m].n++; if (!a.errors) r.byMachine[m].clean++;
@@ -765,68 +785,210 @@ function mineFleet() {
   }
   const cleanRoles = [...roles.entries()].filter(([, r]) => r.n >= 3 && r.clean / r.n >= 0.85).sort((a, b) => b[1].n - a[1].n);
   if (cleanRoles.length >= 2) insights.push({ sev: 'good', icon: '🏆', text: `Your most reliable roles: ${cleanRoles.slice(0, 3).map(([n]) => `"${n}"`).join(', ')} — proven building blocks for new playbooks below.` });
-  return { roles, sessions, insights, cleanRoles };
+
+  // model-tier / token-saving analysis: are premium models doing cheap work?
+  const tierCost = { premium: 0, mid: 0, cheap: 0, unknown: 0 };
+  for (const [, mm] of models) tierCost[mm.tier] += mm.cost;
+  const totalModelCost = Object.values(tierCost).reduce((a, b) => a + b, 0);
+  if (totalModelCost > 20 && tierCost.premium / totalModelCost > 0.6) {
+    // roles that ran ONLY on premium models but succeed reliably = downgrade candidates
+    const downgradable = [...roles.entries()].filter(([, r]) => {
+      const ms = Object.keys(r.models); return r.n >= 3 && r.clean / r.n >= 0.85 && ms.length && ms.every(m => modelTier(m) === 'premium');
+    }).sort((a, b) => b[1].cost - a[1].cost).slice(0, 3);
+    if (downgradable.length) {
+      const save = downgradable.reduce((n, [, r]) => n + r.cost * 0.6, 0);
+      insights.push({ sev: 'warn', icon: '⚖️', text: `${Math.round(tierCost.premium / totalModelCost * 100)}% of your model spend is premium-tier (Opus/GPT-5). Reliable roles like ${downgradable.slice(0, 2).map(([n]) => `"${n}"`).join(', ')} run only on premium models but rarely fail — moving them to a mid tier (Sonnet) could save ~${fmtUsd(save)}. Use a tiered playbook below.`, file: downgradable[0][1].example?.file });
+    }
+  }
+  const tierBreak = Object.entries(tierCost).filter(([, c]) => c > 0.01).map(([t, c]) => `${t} ~${fmtUsd(c)}`).join(' · ');
+  return { roles, sessions, insights, cleanRoles, models, tierCost, tierBreak };
 }
 
 function buildPlaybook(kind, mined) {
   const { cleanRoles } = mined;
   const roster = cleanRoles.slice(0, kind === 'review' ? 4 : 6).map(([n, r]) => ({ name: n, success: Math.round(r.clean / r.n * 100), avgCost: r.cost / r.n }));
   const budget = Math.max(5, Math.ceil(roster.reduce((n, r) => n + r.avgCost, 0) * 1.5));
-  const lines = [];
-  lines.push(`# Playbook: ${kind === 'review' ? 'Adversarial review pass' : 'Parallel build team'} (generated from your fleet's track record)`);
-  lines.push('');
-  lines.push(`Paste this to a Claude Code session. Fill in the GOAL.`);
-  lines.push('');
-  lines.push(`GOAL: <describe what you want built/reviewed>`);
-  lines.push('');
-  lines.push(`Please orchestrate this with a team of subagents, using roles this fleet has proven:`);
-  for (const r of roster) lines.push(`- ${r.name} (historical success ${r.success}%${r.avgCost > 0.01 ? `, avg ~${fmtUsd(r.avgCost)}/run` : ''})`);
-  lines.push('');
-  if (kind === 'review') {
-    lines.push(`Pattern: have each reviewer attack the work independently through a different lens, then a final agent merges confirmed findings. Don't let reviewers see each other's output before verdicts.`);
-  } else {
-    lines.push(`Pattern: split the goal into independent workstreams, one agent per stream, working in parallel; one integrator agent merges results and runs a final consistency check.`);
+  const L = [];
+  if (kind === 'tiered') {
+    L.push(`# Playbook: Tiered token-saving team (generated from your fleet)`, '');
+    L.push(`Paste to a Claude Code / Codex session. Fill in the GOAL.`, '');
+    L.push(`GOAL: <describe the task>`, '');
+    L.push(`Orchestrate this as a TIERED team to minimize token cost — expensive models only where judgment matters:`, '');
+    L.push(`ORCHESTRATOR (you): a flagship or premium model — Fable 5 for the hardest long-horizon planning, or Opus 5 for most work. You plan, delegate, and integrate. Do NOT do the bulk reading/searching yourself — that burns flagship tokens on cheap work.`, '');
+    L.push(`WORKERS: spawn subagents on a MID or CHEAP model (Sonnet, or Haiku for pure fetch/grep/summarize). Give each a narrow, well-scoped task:`);
+    for (const r of roster.slice(0, 4)) L.push(`- ${r.name} → Sonnet (proven ${r.success}% success)`);
+    L.push(`- fetch / search / file-reading helpers → Haiku (no judgment needed)`, '');
+    L.push(`REVIEWERS/VERIFIERS: premium model, but only for the final gate — one adversarial reviewer that checks the integrated result.`, '');
+    L.push(`Rule of thumb from your history: reserve premium tokens for planning + final judgment; push all reading, searching, and first-draft work to cheaper tiers. Report a per-tier token/cost breakdown when done.`);
+    L.push(`Target budget: ~$${budget}.`);
+    return L.join('\n');
   }
-  lines.push(`Keep total spend under ~$${budget} (1.5× your historical average for this team size). Report per-agent results before merging.`);
-  return lines.join('\n');
+  L.push(`# Playbook: ${kind === 'review' ? 'Adversarial review pass' : 'Parallel build team'} (generated from your fleet's track record)`, '');
+  L.push(`Paste this to a Claude Code session. Fill in the GOAL.`, '');
+  L.push(`GOAL: <describe what you want built/reviewed>`, '');
+  L.push(`Please orchestrate this with a team of subagents, using roles this fleet has proven:`);
+  for (const r of roster) L.push(`- ${r.name} (historical success ${r.success}%${r.avgCost > 0.01 ? `, avg ~${fmtUsd(r.avgCost)}/run` : ''})`);
+  L.push('');
+  L.push(kind === 'review'
+    ? `Pattern: have each reviewer attack the work independently through a different lens, then a final agent merges confirmed findings. Don't let reviewers see each other's output before verdicts.`
+    : `Pattern: split the goal into independent workstreams, one agent per stream, working in parallel; one integrator agent merges results and runs a final consistency check.`);
+  L.push(`Keep total spend under ~$${budget} (1.5× your historical average for this team size). Report per-agent results before merging.`);
+  return L.join('\n');
 }
 
+let playbookLib = { items: [] };
+async function loadPlaybookLib() { try { playbookLib = await (await fetch('/api/playbooks')).json(); } catch { playbookLib = { items: [] }; } }
+async function savePlaybookToLib(name, kind, body, source) {
+  const r = await fetch('/api/playbooks', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'save', name, kind, body, source }) });
+  if (r.ok) { playbookLib = await r.json(); return true; } return false;
+}
+
+const PB_GEN = [
+  { k: 'build', label: '🔨 Parallel build team' },
+  { k: 'review', label: '⚔️ Adversarial review pass' },
+  { k: 'tiered', label: '⚖️ Tiered token-saving team' },
+];
 function renderPlaybooks() {
   const mined = mineFleet();
-  const { insights } = mined;
+  const { insights, tierBreak } = mined;
   const sevOrder = { bad: 0, warn: 1, good: 2 };
   insights.sort((a, b) => sevOrder[a.sev] - sevOrder[b.sev]);
   $('playbooks').innerHTML =
-    `<div class="fleet-head"><h2>Playbook Studio <span class="qi" title="Studies your fleet's real track record — which roles succeed, where money leaks, which patterns run clean — and turns it into insights and ready-to-paste orchestration playbooks. It only generates text; nothing runs from here.">ⓘ</span></h2><button id="pbRefresh" class="mini-btn">↻ re-study</button></div>
+    `<div class="fleet-head"><h2>Playbook Studio <span class="qi" title="Studies your fleet's real track record — role success rates, where money leaks, model-tier spend, recurring patterns — and turns it into insights + reusable playbooks saved to your Library. Generation only; nothing runs from here.">ⓘ</span></h2>
+      <span class="dim">${(flowsCache || []).length} sessions studied${tierBreak ? ' · model spend: ' + tierBreak : ''}</span>
+      <button id="pbRefresh" class="mini-btn">↻ re-study</button></div>
+
+    <div class="pb-method dim">How this is computed: I aggregate every subagent across your recent sessions by role (name with the run-number stripped), tracking success rate, cost, model tier, and which machine it ran on — then flag failing roles, environment-dependent roles, premium-model overuse, and orchestrators that hoard spend. All rule-based and local; no session content leaves your machine.</div>
+
     <div class="flows-grid">
       <div class="flows-panel">
         <h3>What your fleet is telling you</h3>
-        <div class="dim" style="margin-bottom:10px">Findings from ${(flowsCache || []).length} recent sessions. Click one to open the session behind it — the Story tab shows you the actual conversation.</div>
-        ${insights.slice(0, 12).map(i => `
+        <div class="dim" style="margin-bottom:10px">Findings from ${(flowsCache || []).length} sessions. Click one to read the actual conversation (Story tab).</div>
+        ${insights.slice(0, 14).map(i => `
           <div class="pb-insight pb-${i.sev}" ${i.file ? `data-file="${esc(i.file)}"` : ''}>
             <span class="pb-icon">${i.icon}</span><span class="pb-text">${esc(i.text)}</span>
           </div>`).join('') || '<div class="dim">Not enough history yet — run more agent sessions and come back.</div>'}
       </div>
       <div class="flows-panel">
-        <h3>Ready-to-paste playbooks</h3>
-        <div class="dim" style="margin-bottom:10px">Orchestration prompts built from YOUR proven roles and real costs. Copy one, paste it to any Claude Code session, fill in the goal.</div>
-        ${['build', 'review'].map(k => `
+        <h3>Generate a playbook</h3>
+        <div class="dim" style="margin-bottom:10px">Built from YOUR proven roles, real costs, and model tiers. Copy to paste now, or save to your Library.</div>
+        ${PB_GEN.map(g => `
           <div class="pb-card">
-            <div class="pb-card-head"><b>${k === 'build' ? '🔨 Parallel build team' : '⚔️ Adversarial review pass'}</b><button class="mini-btn pb-copy" data-kind="${k}">📋 copy</button></div>
-            <pre class="pb-preview">${esc(buildPlaybook(k, mined).split('\n').slice(0, 9).join('\n'))}\n…</pre>
+            <div class="pb-card-head"><b>${g.label}</b><span class="pb-actions"><button class="mini-btn pb-copy" data-kind="${g.k}">📋 copy</button><button class="mini-btn pb-save" data-kind="${g.k}">＋ save</button></span></div>
+            <pre class="pb-preview">${esc(buildPlaybook(g.k, mined).split('\n').slice(0, 8).join('\n'))}\n…</pre>
           </div>`).join('')}
-        <div class="dim" style="margin-top:6px">Budgets are 1.5× your historical average for the roster — a guardrail, not a guess.</div>
       </div>
+    </div>
+
+    <div class="flows-panel" style="margin-top:16px">
+      <h3>📚 Your Playbook Library <span class="dim">(${playbookLib.items.length} saved)</span> <button id="pbNew" class="mini-btn" style="float:right">＋ new blank</button></h3>
+      <div class="dim" style="margin-bottom:10px">Your durable collection — saved plays and agentic-doc snippets, editable, kept in <code>~/.claude/mission-control/playbooks.json</code>.</div>
+      ${playbookLib.items.length ? `<div class="pb-lib">` + playbookLib.items.map(p => `
+        <div class="pb-lib-item" data-id="${esc(p.id)}">
+          <div class="pli-head"><b>${esc(p.name)}</b><span class="pli-kind">${esc(p.kind)}</span><span class="dim">${fmtAgo(p.updatedAt)}</span></div>
+          <div class="pli-actions"><button class="mini-btn pli-copy">📋</button><button class="mini-btn pli-edit">✎</button><button class="mini-btn pli-del">🗑</button></div>
+        </div>`).join('') + `</div>` : '<div class="dim">Empty. Save a generated play above, or start a blank one.</div>'}
     </div>`;
+
   $('pbRefresh').onclick = () => { flowsCache = null; loadPlaybooks(); };
   $('playbooks').querySelectorAll('.pb-insight[data-file]').forEach(el => el.onclick = () => { openSession(el.dataset.file); state.view = 'story'; setTabs(); render(); });
   $('playbooks').querySelectorAll('.pb-copy').forEach(b => b.onclick = () => {
-    navigator.clipboard.writeText(buildPlaybook(b.dataset.kind, mined)).then(() => { b.textContent = '✓ copied'; setTimeout(() => { b.textContent = '📋 copy'; }, 1500); });
+    navigator.clipboard.writeText(buildPlaybook(b.dataset.kind, mined)).then(() => { b.textContent = '✓'; setTimeout(() => { b.textContent = '📋 copy'; }, 1200); });
   });
+  $('playbooks').querySelectorAll('.pb-save').forEach(b => b.onclick = async () => {
+    const g = PB_GEN.find(x => x.k === b.dataset.kind);
+    const name = prompt('Save to library as:', g.label.replace(/^\S+\s/, '')); if (!name) return;
+    if (await savePlaybookToLib(name, b.dataset.kind, buildPlaybook(b.dataset.kind, mined), 'studio')) renderPlaybooks();
+  });
+  $('pbNew').onclick = () => openPlaybookEditor(null);
+  $('playbooks').querySelectorAll('.pb-lib-item').forEach(el => {
+    const p = playbookLib.items.find(x => x.id === el.dataset.id);
+    el.querySelector('.pli-copy').onclick = e => { e.stopPropagation(); navigator.clipboard.writeText(p.body); e.target.textContent = '✓'; setTimeout(() => { e.target.textContent = '📋'; }, 1200); };
+    el.querySelector('.pli-edit').onclick = e => { e.stopPropagation(); openPlaybookEditor(p); };
+    el.querySelector('.pli-del').onclick = async e => { e.stopPropagation(); if (!confirm(`Delete "${p.name}"?`)) return; await fetch('/api/playbooks', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'delete', id: p.id }) }).then(r => r.json()).then(j => { playbookLib = j; renderPlaybooks(); }); };
+  });
+}
+function openPlaybookEditor(pb) {
+  const name = prompt('Playbook name:', pb ? pb.name : 'My play'); if (name === null) return;
+  const body = prompt('Playbook body (or edit later):', pb ? pb.body : '# Playbook\n\nGOAL: ...\n'); if (body === null) return;
+  fetch('/api/playbooks', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'save', id: pb ? pb.id : undefined, name, body, kind: pb ? pb.kind : 'custom', source: pb ? pb.source : 'manual' }) })
+    .then(r => r.json()).then(j => { if (j.items) { playbookLib = j; renderPlaybooks(); } });
 }
 
 // ---------- BRAIN view (memories, hooks, agent configs on this machine) ----------
 let brainItems = [], brainCurrent = null, brainDirty = false, brainMode = 'view';
+
+// plain-language meanings for common settings.json keys
+const SETTINGS_HELP = {
+  hooks: 'Shell commands Claude Code runs automatically at lifecycle moments (before/after a tool, on session start, etc.). These execute with full shell access — the most powerful and most dangerous section.',
+  permissions: 'Allow/deny rules for what tools and commands run without asking. "allow" auto-approves matching actions; "deny" blocks them.',
+  env: 'Environment variables set for every session.',
+  model: 'Default model for this scope.',
+  statusLine: 'Custom status-line command shown in the terminal.',
+  includeCoAuthoredBy: 'Whether commits add the "Co-Authored-By: Claude" trailer.',
+  enableAllProjectMcpServers: 'Auto-enable all MCP servers defined in the project.',
+  autoMode: 'Autonomous-mode environment/permission configuration.',
+};
+const HOOK_EVENT_HELP = {
+  PreToolUse: 'Runs BEFORE a tool executes — can inspect or block it.',
+  PostToolUse: 'Runs AFTER a tool finishes — good for formatting, linting, notifications.',
+  UserPromptSubmit: 'Runs when you submit a message.',
+  SessionStart: 'Runs when a session begins.',
+  Stop: 'Runs when the assistant finishes responding.',
+  SubagentStop: 'Runs when a subagent finishes.',
+  Notification: 'Runs on notifications (e.g. permission prompts).',
+};
+// Render a structured, annotated view of settings.json with hook enable/disable toggles.
+function renderHooksExplainer(content) {
+  let cfg;
+  try { cfg = JSON.parse(content); } catch { return '<div class="dim" style="padding:16px">This file isn\'t valid JSON right now — fix it in Edit mode first.</div>'; }
+  let html = '<div class="hooks-explain">';
+  // top-level sections explained
+  html += '<div class="he-sec"><h4>Sections in this file</h4>';
+  for (const k of Object.keys(cfg)) {
+    html += `<div class="he-row"><b>${esc(k)}</b><span>${esc(SETTINGS_HELP[k] || 'Configuration for ' + k + '.')}</span></div>`;
+  }
+  html += '</div>';
+  // hooks detail with toggles
+  const hooks = cfg.hooks || {};
+  const disabled = cfg._disabledHooks || {};
+  html += '<div class="he-sec"><h4>Hooks — enable / disable</h4><div class="dim" style="margin-bottom:8px">Toggling moves a hook between the live <code>hooks</code> block and a parked <code>_disabledHooks</code> block (Claude Code ignores unknown keys), so you can turn one off without deleting it. Save to apply.</div>';
+  const allEvents = [...new Set([...Object.keys(hooks), ...Object.keys(disabled)])];
+  if (!allEvents.length) html += '<div class="dim">No hooks defined.</div>';
+  for (const ev of allEvents) {
+    html += `<div class="he-event"><div class="he-event-h">${esc(ev)} <span class="dim">— ${esc(HOOK_EVENT_HELP[ev] || 'lifecycle event')}</span></div>`;
+    const live = hooks[ev] || [];
+    const off = disabled[ev] || [];
+    live.forEach((h, i) => { html += hookRow(ev, i, h, true); });
+    off.forEach((h, i) => { html += hookRow(ev, i, h, false); });
+    html += '</div>';
+  }
+  html += '</div></div>';
+  return html;
+}
+function hookRow(ev, idx, hook, on) {
+  const cmds = (hook.hooks || []).map(h => h.command || h.type).join('; ');
+  const matcher = hook.matcher ? ` [${hook.matcher}]` : '';
+  return `<div class="he-hook ${on ? '' : 'off'}">
+    <label class="he-toggle"><input type="checkbox" ${on ? 'checked' : ''} data-ev="${esc(ev)}" data-idx="${idx}" data-on="${on}"><span></span></label>
+    <div class="he-hook-body"><code>${esc(matcher)}</code> ${esc(cmds.slice(0, 200))}</div>
+  </div>`;
+}
+// apply a hook toggle to the JSON and stage it for save
+function toggleHook(ev, idx, wasOn) {
+  let cfg; try { cfg = JSON.parse(brainCurrent.content); } catch { return; }
+  cfg.hooks = cfg.hooks || {}; cfg._disabledHooks = cfg._disabledHooks || {};
+  const from = wasOn ? cfg.hooks : cfg._disabledHooks;
+  const to = wasOn ? cfg._disabledHooks : cfg.hooks;
+  if (!from[ev] || !from[ev][idx]) return;
+  const [moved] = from[ev].splice(idx, 1);
+  to[ev] = to[ev] || []; to[ev].push(moved);
+  if (!from[ev].length) delete from[ev];
+  if (cfg._disabledHooks && !Object.keys(cfg._disabledHooks).length) delete cfg._disabledHooks;
+  brainCurrent.content = JSON.stringify(cfg, null, 2);
+  brainDirty = true;
+  renderBrain();
+}
 
 // line-level diff (added / removed counts + a preview) for the confirm dialog
 function miniDiff(before, after) {
@@ -907,17 +1069,22 @@ function renderBrain() {
       ${brainCurrent ? (() => {
         const isJSON = /\.json$/i.test(brainCurrent.name) || /^\s*[{[]/.test(brainCurrent.content);
         const isMD = /\.md/i.test(brainCurrent.name);
+        const isHooks = /settings\.json/i.test(brainCurrent.name) || /"hooks"\s*:/.test(brainCurrent.content);
         const viewable = isJSON || isMD;
+        let bodyHtml;
+        if (brainMode === 'hooks' && isHooks) bodyHtml = `<div id="brainViewer">${renderHooksExplainer(brainCurrent.content)}</div>`;
+        else if (brainMode === 'view' && viewable) bodyHtml = `<div id="brainViewer" class="${isJSON ? 'bv-json' : 'bv-md'}">${isJSON ? `<pre class="hj">${highlightJSON(brainCurrent.content)}</pre>` : renderMD(brainCurrent.content)}</div>`;
+        else bodyHtml = `<textarea id="brainEditor" spellcheck="false">${esc(brainCurrent.content)}</textarea>`;
         return `
         <div class="brain-bar">
           <b>${esc(brainCurrent.name)}</b>
           <span class="dim" style="font-size:10.5px">${esc(brainCurrent.path)}</span>
-          ${viewable ? `<div class="seg" id="brainModeSeg"><button data-m="view" class="${brainMode === 'view' ? 'on' : ''}">Read</button><button data-m="edit" class="${brainMode === 'edit' ? 'on' : ''}">Edit</button></div>` : ''}
+          ${viewable ? `<div class="seg" id="brainModeSeg"><button data-m="view" class="${brainMode === 'view' ? 'on' : ''}">Read</button>${isHooks ? `<button data-m="hooks" class="${brainMode === 'hooks' ? 'on' : ''}">Hooks</button>` : ''}<button data-m="edit" class="${brainMode === 'edit' ? 'on' : ''}">Edit</button></div>` : ''}
+          <button id="brainHist" class="mini-btn" title="version history">⟲ History</button>
           <button id="brainSave" class="mini-btn" ${brainDirty ? '' : 'disabled'}>${brainDirty ? '💾 Save' : 'Saved'}</button>
         </div>
-        ${brainMode === 'view' && viewable
-          ? `<div id="brainViewer" class="${isJSON ? 'bv-json' : 'bv-md'}">${isJSON ? `<pre class="hj">${highlightJSON(brainCurrent.content)}</pre>` : renderMD(brainCurrent.content)}</div>`
-          : `<textarea id="brainEditor" spellcheck="false">${esc(brainCurrent.content)}</textarea>`}`;
+        ${bodyHtml}
+        <div id="brainHistPanel"></div>`;
       })()
         : '<div class="brain-empty">Pick a file on the left.<br><span class="dim">These are the instructions and memories your agents wake up with — editing them here changes how every future session behaves.</span></div>'}
     </div>`;
@@ -928,10 +1095,31 @@ function renderBrain() {
     brainCurrent = r; brainDirty = false; brainMode = 'view'; renderBrain();
   });
   $('brain').querySelector('#brainModeSeg')?.querySelectorAll('button').forEach(b => b.onclick = () => {
+    // hooks mode keeps staged edits (toggles live there); switching to Read discards raw-text edits
     if (brainDirty && b.dataset.m === 'view' && !confirm('Switch to Read and discard unsaved edits?')) return;
     if (brainDirty && b.dataset.m === 'view') brainDirty = false;
     brainMode = b.dataset.m; renderBrain();
   });
+  $('brain').querySelectorAll('.he-toggle input').forEach(t => t.onchange = () => toggleHook(t.dataset.ev, Number(t.dataset.idx), t.dataset.on === 'true'));
+  const hb = $('brainHist');
+  if (hb) hb.onclick = async () => {
+    const panel = $('brainHistPanel');
+    if (panel.dataset.open === '1') { panel.dataset.open = '0'; panel.innerHTML = ''; return; }
+    panel.dataset.open = '1';
+    const h = (await (await fetch('/api/brain/history?id=' + brainCurrent.id)).json()).history || [];
+    panel.innerHTML = `<div class="brain-hist"><div class="bh-head">Version history (${h.length})</div>` +
+      (h.length ? h.map(v => `<div class="bh-row" data-stamp="${v.stamp}"><span>${new Date(Number(v.stamp)).toLocaleString()}</span><span class="dim">${(v.size/1024).toFixed(1)}KB</span><button class="mini-btn bh-restore">restore</button></div>`).join('')
+        : '<div class="dim" style="padding:8px">No prior versions yet — history starts at your first save here.</div>') + '</div>';
+    panel.querySelectorAll('.bh-row').forEach(row => row.querySelector('.bh-restore').onclick = async () => {
+      const snap = await (await fetch('/api/brain/snapshot?id=' + brainCurrent.id + '&stamp=' + row.dataset.stamp)).json();
+      if (snap.error) return alert(snap.error);
+      if (!confirm('Restore this version? Your current content will be snapshotted first, then replaced.')) return;
+      const r = await fetch('/api/brain/file', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ id: brainCurrent.id, content: snap.content, baseMtime: brainCurrent.mtime }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) return alert(j.error || 'restore failed');
+      brainCurrent.content = snap.content; brainCurrent.mtime = j.mtime; brainDirty = false; brainMode = 'view'; renderBrain();
+    });
+  };
   const ed = $('brainEditor');
   if (ed) {
     ed.oninput = () => { if (!brainDirty) { brainDirty = true; const b = $('brainSave'); b.disabled = false; b.textContent = '💾 Save'; } };
