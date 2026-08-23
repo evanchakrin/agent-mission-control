@@ -181,7 +181,7 @@ async function pollNotifications() {
   try {
     const ms = await (await fetch('/api/machines')).json();
     for (const m of ms.filter(x => x.remote)) {
-      const freshNow = Date.now() - m.lastSeen < 180000;
+      const freshNow = Date.now() - m.lastSeen < 600000; // 10 min: tolerant of relays that predate the boot-poll heartbeat
       const was = machineSeen.get(m.name);
       if (was === true && !freshNow) pushNotif('error', 'machine went silent — relay stopped reporting', { title: m.name, file: '', machine: m.name, kind: 'claude', session: m.name });
       machineSeen.set(m.name, freshNow);
@@ -871,8 +871,11 @@ function statusOf(s) {
   // lifecycle-aware: failed / retrying / stalled beat the generic states
   const meta = state.data.agents.find(a => a.id === s.id) || s;
   const now = state.data.now || Date.now();
-  if (meta.retrying) return 'retrying';
-  if (meta.lastErrored && (s.done || !state.live)) return 'failed';
+  const lastActivity = meta.lastTs || s.lastTs;
+  const recent = lastActivity && now - new Date(lastActivity) < 600000;
+  // "retrying" is a live state — with no activity for 10 min it's just failed
+  if (meta.retrying) return recent && state.live ? 'retrying' : 'failed';
+  if (meta.lastErrored && (s.done || !state.live || !recent)) return 'failed';
   if (state.live && meta.pendingTool && meta.pendingTool.since && now - new Date(meta.pendingTool.since) > 120000 && !s.done) return 'stalled';
   if (s.id !== 'main' && s.done) return meta.lastErrored ? 'failed' : 'done';
   const last = s.lastTs ? new Date(s.lastTs).getTime() : 0;
@@ -991,20 +994,22 @@ function renderBoard() {
 
   // Auto-prune: on busy boards, show only agents that need attention
   // (working / stalled / retrying / failed); collapse done+idle into a chip.
-  let pruned = { done: 0, idle: 0 };
+  let pruned = { done: 0, idle: 0, failed: 0 };
   let subs2 = subs;
+  const nowMs = state.data.now || Date.now();
   if (!state.boardShowAll && subs.length > 10) {
     subs2 = subs.filter(a => {
       const st = statusOf(a);
       if (st === 'done') { pruned.done++; return false; }
       if (st === 'idle') { pruned.idle++; return false; }
+      // stale failures (>30 min old) fold away too — visible in the chip, not as cards
+      if (st === 'failed' && a.lastTs && nowMs - new Date(a.lastTs) > 1800000) { pruned.failed++; return false; }
       return true;
     });
-    // if pruning leaves nothing (all finished), fall back to showing everything
-    if (!subs2.length) { subs2 = subs; pruned = { done: 0, idle: 0 }; }
+    // pruning everything is fine: a finished team is just the orchestrator + chip
   }
   subs = subs2;
-  const prunedN = pruned.done + pruned.idle;
+  const prunedN = pruned.done + pruned.idle + pruned.failed;
 
   // Fleet mode: with more than 10 subagents, switch to compact cards laid out
   // column-major in a scrollable grid (workflow runs cluster together).
@@ -1036,7 +1041,7 @@ function renderBoard() {
     chip.className = 'prune-chip';
     chip.textContent = state.boardShowAll
       ? '◎ focus mode (hide finished)'
-      : `✓ ${pruned.done} done · ${pruned.idle} idle — show all`;
+      : `✓ ${pruned.done} done · ${pruned.idle} idle${pruned.failed ? ` · ${pruned.failed} failed` : ''} — show all`;
     chip.onclick = e => { e.stopPropagation(); state.boardShowAll = !state.boardShowAll; renderBoard(); };
     cards.appendChild(chip);
   }

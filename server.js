@@ -1046,7 +1046,15 @@ const server = http.createServer((req, res) => {
 
   // lightweight identity ping — relays poll this every tick to detect a hub
   // restart (in-memory store wiped) and trigger a full resend
-  if (url.pathname === '/v1/boot') return json(res, { boot: BOOT_ID, version: APP_VERSION });
+  if (url.pathname === '/v1/boot') {
+    // relays poll this every tick; treat it as a machine heartbeat when named
+    const hb = req.headers['x-relay-machine'];
+    if (hb && authorized) {
+      const prev = machines.get(hb) || { name: hb, ips: [], remote: true };
+      machines.set(hb, { ...prev, lastSeen: Date.now(), version: req.headers['x-relay-version'] || prev.version || null });
+    }
+    return json(res, { boot: BOOT_ID, version: APP_VERSION });
+  }
 
   if (url.pathname === '/api/machines') return json(res, machineList());
 
@@ -1270,7 +1278,7 @@ async function runRelay(hub, machineName) {
     // detect hub restart up front, before any skip logic — a wiped hub gets a
     // full resend even when no local session changed
     try {
-      const b = await fetch(hub + '/v1/boot', { headers: TOKEN ? { 'x-relay-token': TOKEN } : {} }).then(r => r.json()).catch(() => null);
+      const b = await fetch(hub + '/v1/boot', { headers: { 'x-relay-machine': machineName, 'x-relay-version': APP_VERSION, ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) } }).then(r => r.json()).catch(() => null);
       if (b && b.boot) {
         if (hubBoot && b.boot !== hubBoot) { sent.clear(); console.log('hub restarted — resending all sessions'); }
         hubBoot = b.boot;
