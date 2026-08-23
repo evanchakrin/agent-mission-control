@@ -396,7 +396,12 @@ async function loadMachines() {
 
 // ---------- CONSTELLATION view (force-directed galaxy) ----------
 let constAnim = null;
-function stopConstellation() { if (constAnim) { cancelAnimationFrame(constAnim); constAnim = null; } }
+function stopConstellation() {
+  if (constAnim) { cancelAnimationFrame(constAnim); constAnim = null; }
+  // defensively blank the canvas so a frozen last frame can never bleed into another view
+  const cv = document.getElementById('constCanvas');
+  if (cv && state.view !== 'constellation') { const c = cv.getContext('2d'); if (c) c.clearRect(0, 0, cv.width, cv.height); }
+}
 async function loadConstellation() {
   if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
   const cv = $('constCanvas'), wrap = $('constellation');

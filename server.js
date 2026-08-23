@@ -1077,7 +1077,8 @@ const server = http.createServer((req, res) => {
   const rel = url.pathname === '/' ? '/index.html' : url.pathname;
   const file = path.resolve(PUBLIC_DIR, '.' + rel);
   if (file.startsWith(path.resolve(PUBLIC_DIR)) && fs.existsSync(file) && fs.statSync(file).isFile()) {
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+    // no-store: the app self-updates in place, so never let a browser pin a stale bundle
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-store' });
     res.end(fs.readFileSync(file));
     return;
   }
