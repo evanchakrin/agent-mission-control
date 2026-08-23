@@ -33,14 +33,26 @@ async function loadSessions() {
   sel.onchange = () => { if (sel.value) openSession(sel.value); };
 }
 
+let fleetCache = null;
 async function loadFleet() {
-  $('fleet').innerHTML = '<div class="fleet-loading">Scanning sessions…</div>';
-  const fleet = await (await fetch('/api/fleet')).json();
-  const totCost = fleet.reduce((n, s) => n + s.cost, 0);
-  const totAgents = fleet.reduce((n, s) => n + s.agents, 0);
+  if (!fleetCache) $('fleet').innerHTML = '<div class="fleet-loading">Scanning sessions…</div>';
+  fleetCache = await (await fetch('/api/fleet')).json();
+  renderFleet();
+}
+
+let fleetFilter = '';
+function renderFleet() {
+  const fleet = fleetCache || [];
+  const q = fleetFilter.toLowerCase();
+  const shown = q ? fleet.filter(s => ((s.title || '') + ' ' + s.project + ' ' + s.session).toLowerCase().includes(q)) : fleet;
+  const totCost = shown.reduce((n, s) => n + s.cost, 0);
+  const totAgents = shown.reduce((n, s) => n + s.agents, 0);
   $('fleet').innerHTML =
-    `<div class="fleet-head"><h2>Fleet — ${fleet.length} sessions · ${totAgents} agents · ~${fmtUsd(totCost)} total</h2></div>` +
-    `<div class="fleet-grid">` + fleet.map(s => `
+    `<div class="fleet-head">
+       <h2>Fleet — ${shown.length}${q ? '/' + fleet.length : ''} sessions · ${totAgents} agents · ~${fmtUsd(totCost)}</h2>
+       <input id="fleetSearch" type="text" placeholder="search sessions… (title, machine, project)" value="${esc(fleetFilter)}">
+     </div>` +
+    `<div class="fleet-grid">` + shown.map(s => `
       <div class="fcard" data-file="${esc(s.file)}">
         <h3>${esc(s.title || s.session.slice(0, 8))}</h3>
         <div class="fproj">${esc(s.project.replace(/^[Cc]--Users-[^-]+-/, ''))}</div>
@@ -51,9 +63,16 @@ async function loadFleet() {
           <span class="fcost"><b>~${fmtUsd(s.cost)}</b></span>
           ${s.errors ? `<span class="ferr"><b>${s.errors}</b> errors</span>` : ''}
         </div>
-        <div class="fdate">${new Date(s.mtime).toLocaleString()}</div>
+        <div class="fdate">${new Date(s.mtime).toLocaleString()} · ${esc(String(s.session).replace(/^.*[\\:]/, '').slice(0, 8))}</div>
       </div>`).join('') + `</div>`;
   $('fleet').querySelectorAll('.fcard').forEach(c => { c.onclick = () => openSession(c.dataset.file); });
+  const search = $('fleetSearch');
+  search.oninput = () => {
+    fleetFilter = search.value;
+    const pos = search.selectionStart;
+    renderFleet();
+    const s2 = $('fleetSearch'); s2.focus(); s2.setSelectionRange(pos, pos);
+  };
 }
 
 function openSession(file) {

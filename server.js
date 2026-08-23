@@ -267,12 +267,23 @@ function listSessions() {
       let title = null;
       try {
         const fd = fs.openSync(full, 'r');
-        const buf = Buffer.alloc(Math.min(8192, st.size));
+        const buf = Buffer.alloc(Math.min(65536, st.size));
         fs.readSync(fd, buf, 0, buf.length, 0);
         fs.closeSync(fd);
-        for (const line of buf.toString('utf8').split('\n')) {
+        const head = buf.toString('utf8');
+        for (const line of head.split('\n')) {
           const o = safeParse(line);
           if (o && (o.type === 'custom-title' || o.type === 'ai-title')) { title = o.customTitle || o.aiTitle; if (o.type === 'custom-title') break; }
+        }
+        if (!title) {
+          // untitled session: fall back to the first real user prompt
+          const m = /"operation":"enqueue"[^\n]*?"content":"((?:[^"\\]|\\.){1,300})/.exec(head);
+          if (m) {
+            try {
+              const text = JSON.parse('"' + m[1].replace(/\\$/, '') + '"');
+              if (!text.startsWith('<')) title = clip(text.replace(/\s+/g, ' ').trim(), 70);
+            } catch { /* partial escape */ }
+          }
         }
       } catch { /* ignore */ }
       const agentCount = subagentFiles(full).length;
@@ -651,11 +662,18 @@ function ingestRelay(body) {
 }
 
 function relayList() {
-  return [...relaySessions.values()].map(s => ({
-    project: '⇄ ' + s.machine, file: s.id, session: s.id,
-    title: (s.meta.title || s.id) + ' · ' + s.machine,
-    size: s.result.events.length, mtime: s.meta.mtime || Date.now(), agentCount: s.result.agents.length - 1,
-  }));
+  return [...relaySessions.values()].map(s => {
+    let title = s.meta.title;
+    if (!title) {
+      const firstUser = s.result.events.find(e => (e.kind === 'user-text' || e.kind === 'user-queued') && e.text && !e.text.startsWith('<'));
+      title = firstUser ? clip(firstUser.text.replace(/\s+/g, ' ').trim(), 70) : s.id.split(':').pop().slice(0, 12);
+    }
+    return {
+      project: '⇄ ' + s.machine, file: s.id, session: s.id,
+      title: title + ' · ' + s.machine,
+      size: s.result.events.length, mtime: s.meta.mtime || Date.now(), agentCount: s.result.agents.length - 1,
+    };
+  });
 }
 
 // Resolve any source: "otel:<service>" / "relay:<machine>:<file>" (in-memory)
@@ -755,10 +773,9 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (url.pathname === '/api/sessions') return json(res, [...relayList(), ...otelList(), ...listSessions(), ...codexList()]);
-
-  if (url.pathname === '/api/fleet') {
-    return json(res, [...relayList(), ...otelList(), ...listSessions(), ...codexList()].map(sessionSummary).filter(Boolean));
+  if (url.pathname === '/api/sessions' || url.pathname === '/api/fleet') {
+    const all = [...relayList(), ...otelList(), ...listSessions(), ...codexList()].sort((a, b) => b.mtime - a.mtime);
+    return json(res, url.pathname === '/api/fleet' ? all.map(sessionSummary).filter(Boolean) : all);
   }
 
   if (url.pathname === '/api/session') {
