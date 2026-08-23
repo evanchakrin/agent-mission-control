@@ -638,8 +638,9 @@ async function loadConstellation() {
 
   let tx = 0, ty = 0, scale = 1, dragging = null, hover = null, panning = false, lastM = null;
   let simFrames = 240; // physics runs until settled, then freezes; interaction re-wakes it
+  let userAdjusted = false; // once the user pans/zooms, stop auto-fitting
   const wake = () => { simFrames = Math.max(simFrames, 90); };
-  cv.onwheel = e => { e.preventDefault(); const f = e.deltaY < 0 ? 1.1 : 0.9; scale = Math.max(0.3, Math.min(4, scale * f)); };
+  cv.onwheel = e => { e.preventDefault(); userAdjusted = true; const f = e.deltaY < 0 ? 1.1 : 0.9; scale = Math.max(0.3, Math.min(4, scale * f)); };
   cv.onmousedown = e => {
     const p = toWorld(e); const n = pick(p);
     if (n && !n.sun) { dragging = n; wake(); } else { panning = true; lastM = { x: e.clientX, y: e.clientY }; }
@@ -648,8 +649,20 @@ async function loadConstellation() {
     const p = toWorld(e); hover = pick(p);
     cv.style.cursor = hover ? 'pointer' : (panning ? 'grabbing' : 'grab');
     if (dragging) { dragging.x = p.x; dragging.y = p.y; dragging.vx = dragging.vy = 0; wake(); }
-    else if (panning) { tx += e.clientX - lastM.x; ty += e.clientY - lastM.y; lastM = { x: e.clientX, y: e.clientY }; }
+    else if (panning) { userAdjusted = true; tx += e.clientX - lastM.x; ty += e.clientY - lastM.y; lastM = { x: e.clientX, y: e.clientY }; }
   };
+  // auto-fit view to the node cloud (with padding) until the user takes over —
+  // keeps clusters tight on screen instead of drifting into empty space
+  function autoFit() {
+    if (userAdjusted || !nodes.length) return;
+    let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+    for (const n of nodes) { minX = Math.min(minX, n.x - n.r); minY = Math.min(minY, n.y - n.r); maxX = Math.max(maxX, n.x + n.r); maxY = Math.max(maxY, n.y + n.r); }
+    const pad = 60, bw = maxX - minX + pad * 2, bh = maxY - minY + pad * 2;
+    const target = Math.min(W / bw, H / bh, 1.6);
+    scale += (target - scale) * 0.08; // ease toward fit
+    tx += ((W - (minX - pad + maxX + pad) * scale) / 2 - tx) * 0.08;
+    ty += ((H - (minY - pad + maxY + pad) * scale) / 2 - ty) * 0.08;
+  }
   cv.onmouseup = e => {
     if (!dragging && !panning) { const n = pick(toWorld(e)); if (n && !n.sun) openSession(n.file); }
     dragging = null; panning = false;
@@ -679,6 +692,7 @@ async function loadConstellation() {
     // run physics only while waking/unsettled; freeze positions once at rest so
     // the galaxy stops the constant slow drift. Pulses keep animating via t.
     if (simFrames > 0 || dragging) { const ke = step(); simFrames--; if (ke < 0.4 && !dragging) simFrames = 0; }
+    autoFit();
     t++;
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.fillStyle = '#080b11'; ctx.fillRect(0, 0, W, H);
