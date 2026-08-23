@@ -1341,14 +1341,31 @@ function renderBoard() {
     } else {
       const chips = Object.entries(a.tools).sort((x, y) => y[1] - x[1]).slice(0, 5)
         .map(([n, c]) => `<span class="chip">${esc(n.replace(/^mcp__[^_]+__/, ''))} <b>×${c}</b></span>`).join('');
+      // orchestrator: a tiny tail of the actual conversation + dispatches
+      let convo = '';
+      if (a.id === 'main') {
+        const tail = state.data.events.slice(0, state.scrub)
+          .filter(e => e.agent === 'main' && ['user-text', 'assistant-text', 'spawn'].includes(e.kind))
+          .slice(-4);
+        if (tail.length) convo = `<div class="mini-convo">` + tail.map(e => {
+          if (e.kind === 'spawn') {
+            const who = state.data.agents.find(x => x.id === e.spawnedAgent)?.name || 'agent';
+            return `<div class="mc-line mc-spawn" data-seq="${e.seq}">🚀 → <b>${esc(who.slice(0, 20))}</b>: ${esc((e.text || '').slice(0, 54))}</div>`;
+          }
+          const you = e.kind !== 'assistant-text';
+          return `<div class="mc-line ${you ? 'mc-you' : 'mc-ai'}" data-seq="${e.seq}"><b>${you ? 'You' : 'AI'}:</b> ${esc((e.text || '').replace(/\s+/g, ' ').slice(0, 76))}</div>`;
+        }).join('') + `</div>`;
+      }
       el.innerHTML =
         `<h2>${a.id === 'main' ? '🛰️' : '🤖'} <span class="nm">${esc(a.name || a.id)}</span> <span class="status ${st}">${st}</span></h2>` +
         (a.task ? `<div class="task">${esc(a.task)}</div>` : '') +
         `<div class="meta"><span>ev <b>${a.events}</b></span><span>out <b>${fmtTok(a.outTokens)}</b></span><span><b>${fmtDur(dur)}</b></span>${costTag}` +
         (a.errors ? `<span class="err">err <b>${a.errors}</b></span>` : '') + `</div>` +
+        convo +
         sparkline(a.recent, a.firstTs || firstTs, a.lastTs || lastTs) +
         (chips ? `<div class="chips">${chips}</div>` : '');
     }
+    el.querySelectorAll('.mc-line').forEach(l => l.onclick = ev2 => { ev2.stopPropagation(); openDrawer(Number(l.dataset.seq)); });
     cards.appendChild(el);
   }
 

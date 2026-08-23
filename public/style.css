@@ -431,6 +431,12 @@ main.no-feed { grid-template-columns: 1fr; }
 .card .meta { display: flex; gap: 10px; margin-top: 8px; font-size: 10px; color: var(--dim); flex-wrap: wrap; }
 .card .meta b { color: var(--text); font-weight: 600; }
 .card .meta .err b { color: var(--red); }
+.mini-convo { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; display: flex; flex-direction: column; gap: 3px; }
+.mc-line { font-size: 10px; line-height: 1.35; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; border-radius: 4px; padding: 1px 4px; }
+.mc-line:hover { background: var(--panel2); color: var(--text); }
+.mc-line.mc-you b { color: var(--red); }
+.mc-line.mc-ai b { color: var(--accent2); }
+.mc-line.mc-spawn { color: var(--accent); }
 .card .spark { margin-top: 7px; display: flex; align-items: flex-end; gap: 2px; height: 18px; }
 .card .spark i { flex: 1; background: var(--accent2); opacity: .55; border-radius: 1px 1px 0 0; min-height: 1px; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
