@@ -187,11 +187,17 @@ async function pollNotifications() {
       machineSeen.set(m.name, freshNow);
     }
   } catch { /* ignore */ }
-  // update available (once per page load)
+  // update available (once per page load) — name each stale instance + action
   if (!updateNotified) {
     try {
       const u = await (await fetch('/api/update-check')).json();
-      if (u.updateAvailable) { updateNotified = true; pushNotif('done', `update available: v${u.latest} (running v${u.current})`, { title: 'Agent Mission Control', file: '', machine: '', kind: 'claude', session: 'update' }); }
+      const ms = await (await fetch('/api/machines')).json().catch(() => []);
+      const stale = [];
+      if (u.updateAvailable) stale.push(`this dashboard (v${u.current} → ask Claude to redeploy)`);
+      for (const m of ms.filter(x => x.remote && x.version && u.latest && x.version !== u.latest && x.version !== u.current)) {
+        stale.push(`${m.name} (v${m.version} → send it the update paste)`);
+      }
+      if (stale.length) { updateNotified = true; pushNotif('done', `v${u.latest || u.current} is latest — behind: ${stale.join('; ')}`, { title: 'Version check', file: '', machine: '', kind: 'claude', session: 'update' }); }
     } catch { /* ignore */ }
   }
   // daily cost budget (set in Usage view; stored locally)

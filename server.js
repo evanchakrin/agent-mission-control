@@ -23,7 +23,13 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const TOKEN = argValue('--token') || process.env.MISSION_CONTROL_TOKEN || null;
 const RELAY_TO = argValue('--relay') || null; // relay mode: forward local sessions to a hub instead of serving a UI
 
-const APP_VERSION = '5.2.0'; // keep in sync with package.json
+// Version: read from package.json beside server.js when present (repo and
+// installed copies both ship it now); the literal is only a last-resort
+// fallback so a stray copy still reports something truthful-ish.
+const APP_VERSION = (() => {
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '6.3.0'; }
+  catch { return '6.3.0'; }
+})();
 
 // $/MTok, matched by substring of the model id; cache reads bill at 0.1x input.
 // OpenAI rows are family-level estimates (gpt-5 launch pricing) so Codex
@@ -1414,6 +1420,7 @@ function installWindows() {
   fs.mkdirSync(dest, { recursive: true });
   fs.copyFileSync(__filename, path.join(dest, 'server.js'));
   fs.cpSync(path.join(__dirname, 'public'), path.join(dest, 'public'), { recursive: true });
+  try { fs.copyFileSync(path.join(__dirname, 'package.json'), path.join(dest, 'package.json')); } catch { /* version falls back */ }
 
   const extra = [];
   for (const f of ['--relay', '--token', '--name', '--port', '--dir']) {
