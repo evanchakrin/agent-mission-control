@@ -125,6 +125,9 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .mstats { display: flex; gap: 14px; font-size: 12px; color: var(--dim); } .mstats b { color: var(--text); } .mstats .fcost b { color: var(--accent); }
 .mkinds { display: flex; gap: 12px; margin-top: 8px; font-size: 11px; } .mkind { font-weight: 600; }
 
+.prune-chip { position: absolute; top: 10px; left: 12px; z-index: 5; background: var(--panel); border: 1px solid var(--accent); color: var(--accent); border-radius: 14px; padding: 4px 13px; font-size: 11px; font-weight: 600; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
+.prune-chip:hover { background: var(--panel2); }
+
 /* card edit menu + badges */
 .fcard { position: relative; }
 .fcard-actions { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; opacity: 0; transition: opacity .15s; }
@@ -246,11 +249,12 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .utile .uv.accent { color: var(--accent); }
 .usage-legend { display: flex; gap: 16px; font-size: 11px; margin-bottom: 8px; }
 .usage-chart-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
-.usage-chart .ubar { rx: 2; }
 .usage-chart .ubar:hover { opacity: .82; }
-.usage-chart .ubar-total { font-size: 9.5px; fill: var(--dim); }
-.usage-chart .ux-label { font-size: 9.5px; fill: var(--dim); }
-.usage-chart .uaxis { stroke: var(--line); stroke-width: 1; }
+.usage-chart .ubar-total { font-size: 10px; font-weight: 600; fill: var(--text); }
+.usage-chart .ux-label { font-size: 10px; fill: var(--dim); }
+.usage-chart .uy-label { font-size: 9.5px; fill: var(--dim); }
+.usage-chart .ugrid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 2 4; opacity: .5; }
+.usage-chart .uaxis { stroke: var(--line); stroke-width: 1.4; }
 
 /* constellation */
 #constellation { position: absolute; inset: 0; overflow: hidden; }

@@ -520,28 +520,43 @@ function renderUsage() {
     <div class="utile"><div class="ul">Range</div><div class="uv small">${range}</div></div>
   </div>`;
 
-  // chart geometry (horizontal scroll if many buckets)
+  // chart geometry: fill available width, stretch bars when few buckets,
+  // horizontal-scroll only when truly many; y-gridlines; labels never overlap
   const max = Math.max(...keys.map(k => buckets.get(k).total), 1);
-  const BW = 46, GAP = 10, H = 260, PAD = 34;
-  const chartW = Math.max(keys.length * (BW + GAP) + PAD, 300);
-  const y = v => (H - PAD) - (v / max) * (H - PAD - 10);
+  const H = 300, PAD_L = 56, PAD_B = 30, PAD_T = 30; // top pad leaves room for total labels above full-height bars
+  const availW = Math.max(($('usage').clientWidth || 900) - 82, 320); // view padding + wrap padding + border + scrollbar
+  const BW = Math.min(64, Math.max(14, Math.floor((availW - PAD_L) / Math.max(keys.length, 1) * 0.72)));
+  const GAP = Math.max(4, Math.round(BW * 0.38));
+  const chartW = Math.max(keys.length * (BW + GAP) + PAD_L + 8, availW); // never narrower than the container, scrolls only when bars demand it
+  const plotH = H - PAD_B - PAD_T;
   const order = ['claude', 'codex', 'otel'];
   let bars = '';
+  // y-axis gridlines at nice fractions
+  for (let g = 0; g <= 4; g++) {
+    const v = max * g / 4, gy = PAD_T + plotH - (g / 4) * plotH;
+    bars += `<line class="ugrid" x1="${PAD_L}" y1="${gy.toFixed(1)}" x2="${chartW - 8}" y2="${gy.toFixed(1)}"/>`;
+    bars += `<text class="uy-label" x="${PAD_L - 8}" y="${(gy + 3).toFixed(1)}" text-anchor="end">${fmtMetric(v, usageMetric)}</text>`;
+  }
+  const labelEvery = Math.ceil(keys.length / Math.floor((chartW - PAD_L) / 74)); // skip labels that would collide
+  const showTotals = BW >= 30;
   keys.forEach((k, i) => {
     const b = buckets.get(k);
-    const x = PAD + i * (BW + GAP);
-    let yTop = H - PAD;
+    const x = PAD_L + i * (BW + GAP);
+    let yTop = PAD_T + plotH;
+    const tip = `${k} — total ${fmtMetric(b.total, usageMetric)}\n` + order.filter(kd => b[kd]).map(kd => `${AGENT_KIND[kd].label}: ${fmtMetric(b[kd], usageMetric)}`).join('\n');
     for (const kind of order) {
       const v = b[kind] || 0; if (!v) continue;
-      const h = (v / max) * (H - PAD - 10);
-      bars += `<rect class="ubar" x="${x}" y="${(yTop - h).toFixed(1)}" width="${BW}" height="${h.toFixed(1)}" fill="${kindColor(kind)}"><title>${k} · ${AGENT_KIND[kind].label}: ${fmtMetric(v, usageMetric)}</title></rect>`;
+      const h = Math.max((v / max) * plotH, 1.5);
+      bars += `<rect class="ubar" x="${x}" y="${(yTop - h).toFixed(1)}" width="${BW}" height="${h.toFixed(1)}" rx="2" fill="${kindColor(kind)}"><title>${esc(tip)}</title></rect>`;
       yTop -= h;
     }
-    bars += `<text class="ubar-total" x="${x + BW / 2}" y="${(y(b.total) - 5).toFixed(1)}" text-anchor="middle">${fmtMetric(b.total, usageMetric)}</text>`;
-    const label = usageGran === 'day' ? k.slice(5) : usageGran === 'month' ? k : k;
-    bars += `<text class="ux-label" x="${x + BW / 2}" y="${H - PAD + 16}" text-anchor="middle" transform="rotate(35 ${x + BW / 2} ${H - PAD + 16})">${label}</text>`;
+    if (showTotals) bars += `<text class="ubar-total" x="${x + BW / 2}" y="${Math.max(yTop - 6, 12).toFixed(1)}" text-anchor="middle">${fmtMetric(b.total, usageMetric)}</text>`;
+    if (i % labelEvery === 0) {
+      const label = usageGran === 'day' ? k.slice(5) : usageGran === 'week' ? k.slice(2) : k;
+      bars += `<text class="ux-label" x="${x + BW / 2}" y="${H - 8}" text-anchor="middle">${label}</text>`;
+    }
   });
-  bars += `<line class="uaxis" x1="${PAD - 4}" y1="${H - PAD}" x2="${chartW}" y2="${H - PAD}"/>`;
+  bars += `<line class="uaxis" x1="${PAD_L}" y1="${PAD_T + plotH}" x2="${chartW - 8}" y2="${PAD_T + plotH}"/>`;
 
   const grans = [['day', 'Day'], ['week', 'Week'], ['month', 'Month'], ['year', 'Year']];
   const metrics = [['cost', 'Cost'], ['tokens', 'Tokens'], ['agents', 'Agents'], ['sessions', 'Sessions']];
@@ -967,12 +982,29 @@ function renderBoard() {
     return;
   }
   const agents = agentStateAt(state.scrub);
-  const subs = agents.filter(x => x.id !== 'main');
+  let subs = agents.filter(x => x.id !== 'main');
   $('empty').textContent = 'No agent activity yet in this session.';
   $('empty').style.display = agents.length ? 'none' : 'flex';
 
   const evsAll = state.data.events;
   const firstTs = evsAll.find(e => e.ts)?.ts, lastTs = [...evsAll].reverse().find(e => e.ts)?.ts;
+
+  // Auto-prune: on busy boards, show only agents that need attention
+  // (working / stalled / retrying / failed); collapse done+idle into a chip.
+  let pruned = { done: 0, idle: 0 };
+  let subs2 = subs;
+  if (!state.boardShowAll && subs.length > 10) {
+    subs2 = subs.filter(a => {
+      const st = statusOf(a);
+      if (st === 'done') { pruned.done++; return false; }
+      if (st === 'idle') { pruned.idle++; return false; }
+      return true;
+    });
+    // if pruning leaves nothing (all finished), fall back to showing everything
+    if (!subs2.length) { subs2 = subs; pruned = { done: 0, idle: 0 }; }
+  }
+  subs = subs2;
+  const prunedN = pruned.done + pruned.idle;
 
   // Fleet mode: with more than 10 subagents, switch to compact cards laid out
   // column-major in a scrollable grid (workflow runs cluster together).
@@ -999,7 +1031,18 @@ function renderBoard() {
   $('board').style.height = H + 'px';
 
   cards.innerHTML = '';
+  if (prunedN || state.boardShowAll) {
+    const chip = document.createElement('button');
+    chip.className = 'prune-chip';
+    chip.textContent = state.boardShowAll
+      ? '◎ focus mode (hide finished)'
+      : `✓ ${pruned.done} done · ${pruned.idle} idle — show all`;
+    chip.onclick = e => { e.stopPropagation(); state.boardShowAll = !state.boardShowAll; renderBoard(); };
+    cards.appendChild(chip);
+  }
+  const shownIds = new Set([...subs.map(a => a.id), 'main']);
   for (const a of agents) {
+    if (!shownIds.has(a.id)) continue;
     const p = pos.get(a.id);
     const el = document.createElement('div');
     el.className = 'card' + (a.id === 'main' ? ' orchestrator' : '') + (compact && a.id !== 'main' ? ' mini' : '') + (state.hot.has(a.id) ? ' hot' : '');
@@ -1254,7 +1297,7 @@ for (const k of KINDS) {
 }
 
 let resizeT = null;
-window.onresize = () => { clearTimeout(resizeT); resizeT = setTimeout(() => { if (state.view !== 'fleet') render(); }, 120); };
+window.onresize = () => { clearTimeout(resizeT); resizeT = setTimeout(() => { if (state.view === 'usage') renderUsage(); else if (!OVERVIEW.includes(state.view)) render(); }, 120); };
 
 // ---------- boot ----------
 if (BAKED) {
