@@ -425,15 +425,17 @@ async function loadConstellation() {
   const nodes = [...suns.values(), ...stars];
 
   let tx = 0, ty = 0, scale = 1, dragging = null, hover = null, panning = false, lastM = null;
+  let simFrames = 240; // physics runs until settled, then freezes; interaction re-wakes it
+  const wake = () => { simFrames = Math.max(simFrames, 90); };
   cv.onwheel = e => { e.preventDefault(); const f = e.deltaY < 0 ? 1.1 : 0.9; scale = Math.max(0.3, Math.min(4, scale * f)); };
   cv.onmousedown = e => {
     const p = toWorld(e); const n = pick(p);
-    if (n && !n.sun) dragging = n; else { panning = true; lastM = { x: e.clientX, y: e.clientY }; }
+    if (n && !n.sun) { dragging = n; wake(); } else { panning = true; lastM = { x: e.clientX, y: e.clientY }; }
   };
   cv.onmousemove = e => {
     const p = toWorld(e); hover = pick(p);
     cv.style.cursor = hover ? 'pointer' : (panning ? 'grabbing' : 'grab');
-    if (dragging) { dragging.x = p.x; dragging.y = p.y; dragging.vx = dragging.vy = 0; }
+    if (dragging) { dragging.x = p.x; dragging.y = p.y; dragging.vx = dragging.vy = 0; wake(); }
     else if (panning) { tx += e.clientX - lastM.x; ty += e.clientY - lastM.y; lastM = { x: e.clientX, y: e.clientY }; }
   };
   cv.onmouseup = e => {
@@ -456,11 +458,16 @@ async function loadConstellation() {
       if (!a.sun) { const s = a.sunNode; const dx = s.x - a.x, dy = s.y - a.y, d = Math.hypot(dx, dy) || 1; const f = (d - 90) * 0.006; a.vx += dx / d * f; a.vy += dy / d * f; }
       a.vx += (W / 2 - a.x) * 0.0008; a.vy += (H / 2 - a.y) * 0.0008;
     }
-    for (const n of nodes) { if (n === dragging) continue; n.vx *= 0.85; n.vy *= 0.85; n.x += n.vx; n.y += n.vy; }
+    let ke = 0;
+    for (const n of nodes) { if (n === dragging) continue; n.vx *= 0.8; n.vy *= 0.8; n.x += n.vx; n.y += n.vy; ke += n.vx * n.vx + n.vy * n.vy; }
+    return ke;
   }
   let t = 0;
   function draw() {
-    step(); t++;
+    // run physics only while waking/unsettled; freeze positions once at rest so
+    // the galaxy stops the constant slow drift. Pulses keep animating via t.
+    if (simFrames > 0 || dragging) { const ke = step(); simFrames--; if (ke < 0.4 && !dragging) simFrames = 0; }
+    t++;
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.fillStyle = '#080b11'; ctx.fillRect(0, 0, W, H);
     ctx.setTransform(DPR * scale, 0, 0, DPR * scale, tx * DPR, ty * DPR);
@@ -637,8 +644,15 @@ function renderBoard() {
   $('board').style.display = ''; $('timeline').style.display = 'none';
   const stage = $('stage'), cards = $('cards'), svg = $('edges');
   const W = stage.clientWidth, H = stage.clientHeight;
+  if (!state.file && !state.data.events.length) { // no session chosen yet
+    cards.innerHTML = ''; svg.innerHTML = '';
+    $('empty').style.display = 'flex';
+    $('empty').textContent = 'Pick a session from the Fleet, Table, or Galaxy to view its agent board.';
+    return;
+  }
   const agents = agentStateAt(state.scrub);
   const subs = agents.filter(x => x.id !== 'main');
+  $('empty').textContent = 'No agent activity yet in this session.';
   $('empty').style.display = agents.length ? 'none' : 'flex';
 
   const evsAll = state.data.events;
@@ -717,7 +731,7 @@ function renderTimeline() {
   $('board').style.display = 'none'; $('timeline').style.display = '';
   const agents = agentStateAt(state.data.events.length);
   const evs = state.data.events.filter(e => e.ts);
-  if (!evs.length) { $('timeline').innerHTML = ''; return; }
+  if (!evs.length) { $('timeline').innerHTML = '<div class="fleet-loading">Pick a session from the Fleet, Table, or Galaxy to view its timeline.</div>'; return; }
   const t0 = new Date(evs[0].ts).getTime();
   const t1 = new Date(evs[evs.length - 1].ts).getTime();
   const span = Math.max(t1 - t0, 1000);
@@ -830,8 +844,8 @@ $('viewTable').onclick = () => { if (!BAKED) { state.view = 'table'; setTabs(); 
 $('viewProjects').onclick = () => { if (!BAKED) { state.view = 'projects'; setTabs(); } };
 $('viewConstellation').onclick = () => { if (!BAKED) { state.view = 'constellation'; setTabs(); } };
 $('viewMachines').onclick = () => { if (!BAKED) { state.view = 'machines'; setTabs(); } };
-$('viewBoard').onclick = () => { if (state.data.events.length || state.file) { state.view = 'board'; setTabs(); render(); } };
-$('viewTimeline').onclick = () => { if (state.data.events.length || state.file) { state.view = 'timeline'; setTabs(); render(); } };
+$('viewBoard').onclick = () => { state.view = 'board'; setTabs(); render(); };
+$('viewTimeline').onclick = () => { state.view = 'timeline'; setTabs(); render(); };
 $('exportBtn').onclick = () => {
   if (!state.file) return;
   const title = $('sessionSel').selectedOptions[0]?.textContent.split(' — ')[0] || '';
