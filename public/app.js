@@ -605,58 +605,98 @@ function sessionSignatureShape(d) {
 }
 function renderFlows() {
   const data = flowsCache || [];
-  // 1) weighted flow edges: orchestrator -> subagent-name (normalized), across sessions
-  const edgeW = new Map(); // "from→to" -> {n, errors}
-  const nodeW = new Map();
   const norm = n => String(n || '').replace(/\s*#\d+$/, '').replace(/[0-9a-f-]{12,}/g, '·').slice(0, 30);
-  for (const { d } of data) {
+  // per-role aggregation across the whole fleet
+  const roles = new Map();
+  for (const { s, d } of data) {
     for (const a of d.agents) {
       if (a.id === 'main') continue;
-      const to = norm(a.name || 'subagent');
-      nodeW.set(to, (nodeW.get(to) || 0) + 1);
-      const k = 'orchestrator→' + to;
-      const e = edgeW.get(k) || { n: 0, errors: 0 };
-      e.n++; e.errors += a.errors || 0;
-      edgeW.set(k, e);
+      const key = norm(a.name || 'subagent');
+      const r = roles.get(key) || { n: 0, errors: 0, clean: 0, cost: 0, durMs: 0, durN: 0, machines: new Set(), lastMs: 0, example: null };
+      r.n++;
+      r.errors += a.errors || 0;
+      if (!a.errors) r.clean++;
+      r.cost += a.cost || 0;
+      if (a.firstTs && a.lastTs) { r.durMs += new Date(a.lastTs) - new Date(a.firstTs); r.durN++; }
+      r.machines.add(s.machine || 'local');
+      if (s.mtime > r.lastMs) { r.lastMs = s.mtime; r.example = s; }
+      roles.set(key, r);
     }
   }
-  const topEdges = [...edgeW.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 24);
-  const maxN = Math.max(...topEdges.map(([, e]) => e.n), 1);
-  // 2) trajectory clusters
+  const topRoles = [...roles.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 20);
+  const maxN = Math.max(...topRoles.map(([, r]) => r.n), 1);
+
+  // trajectory clusters, in plain language
+  const FAN_WORDS = { solo: 'worked alone', 'small-team': 'small team (2–5 agents)', team: 'team (6–30 agents)', fleet: 'big fleet (30+ agents)' };
   const clusters = new Map();
   for (const { s, d } of data) {
     const sig = sessionSignatureShape(d);
     if (!clusters.has(sig)) clusters.set(sig, []);
     clusters.get(sig).push(s);
   }
-  const sorted = [...clusters.entries()].sort((a, b) => b[1].length - a[1].length);
-  const outliers = sorted.filter(([, v]) => v.length === 1);
+  const sorted = [...clusters.entries()].filter(([, v]) => v.length > 1).sort((a, b) => b[1].length - a[1].length);
+  const outliers = [...clusters.entries()].filter(([, v]) => v.length === 1);
+  const biggest = sorted[0];
+  const plainSig = sig => {
+    const [fan, tools, err] = sig.split(' · ');
+    return `${FAN_WORDS[fan] || fan}, mostly using ${tools.replace(/\+/g, ' and ')}${err === 'errors' ? ', hit errors' : ', ran clean'}`;
+  };
+
   $('flows').innerHTML =
-    `<div class="fleet-head"><h2>Fleet behavior — ${data.length} sessions analyzed</h2><button id="flowsRefresh" class="mini-btn">↻ refresh</button></div>
+    `<div class="fleet-head"><h2>How your fleet behaves — ${data.length} recent sessions</h2><button id="flowsRefresh" class="mini-btn">↻ refresh</button></div>
+
+    <div class="flows-panel" style="margin-bottom:16px">
+      <h3>Your most-used agent roles <span class="qi" title="Every time an orchestrator hands work to a named helper agent, that's a delegation. This table totals them across every session on every machine, so you can see which specialist roles your fleet actually relies on — and which ones fail.">ⓘ</span></h3>
+      <div class="dim" style="margin-bottom:10px">The specialist agents your orchestrators call on most, ranked by how often. Red bars mean that role hits errors — a role with a low success rate is a prompt worth improving.</div>
+      <div class="role-table">
+        <div class="rt-head"><span>Role</span><span title="how many times this role was spawned">Used</span><span title="share of runs that finished with zero errors — under 80% means this role's prompt or task needs work">Success</span><span title="average time this role runs before finishing">Avg time</span><span title="total estimated spend on this role across all sessions">Total cost</span><span title="which of your machines this role ran on">Machines</span><span title="most recent session using this role — click to open">Last seen</span></div>
+        ${topRoles.map(([name, r]) => {
+          const success = Math.round(r.clean / r.n * 100);
+          const sCls = success >= 80 ? 'ok' : success >= 50 ? 'warn' : 'bad';
+          return `<div class="rt-row" data-file="${esc(r.example?.file || '')}" title="Click to open the most recent session that used ${esc(name)}">
+            <span class="rt-name"><span class="rt-bar" style="width:${Math.max(6, r.n / maxN * 100)}%"></span><b>${esc(name)}</b></span>
+            <span>×${r.n}</span>
+            <span class="rt-s ${sCls}">${success}%</span>
+            <span>${r.durN ? fmtDur(r.durMs / r.durN) : '—'}</span>
+            <span class="fcost">~${fmtUsd(r.cost)}</span>
+            <span class="dim">${[...r.machines].join(', ')}</span>
+            <span class="dim">${fmtAgo(r.lastMs)}</span>
+          </div>`;
+        }).join('') || '<div class="dim">no delegation observed yet</div>'}
+      </div>
+    </div>
+
     <div class="flows-grid">
       <div class="flows-panel">
-        <h3>Most-delegated work <span class="dim">(orchestrator → agent role, weighted by frequency)</span></h3>
-        ${topEdges.map(([k, e]) => {
-          const to = k.split('→')[1];
-          const w = Math.max(4, (e.n / maxN) * 100);
-          return `<div class="flow-edge"><span class="fe-name">${esc(to)}</span>
-            <span class="fe-bar-wrap"><span class="fe-bar ${e.errors ? 'fe-err' : ''}" style="width:${w}%"></span></span>
-            <span class="fe-n">×${e.n}${e.errors ? ` <b class="ferr">${e.errors}err</b>` : ''}</span></div>`;
-        }).join('') || '<div class="dim">no delegation observed</div>'}
+        <h3>Your usual patterns <span class="qi" title="Sessions are grouped by how they behaved: how many agents they used, which tools dominated, and whether they hit errors. Big groups = your routines.">ⓘ</span></h3>
+        <div class="dim" style="margin-bottom:10px">These are your fleet's habits — the shapes of work it does over and over. ${biggest ? `Your most common: <b>${esc(plainSig(biggest[0]))}</b> (${biggest[1].length} sessions).` : ''}</div>
+        ${sorted.slice(0, 8).map(([sig, ss]) => `
+          <div class="flow-cluster">
+            <span class="fc-n">×${ss.length}</span>
+            <span class="fc-sig" title="${esc(sig)}">${esc(plainSig(sig))}</span>
+            <span class="fc-eg" data-file="${esc(ss[0].file)}" title="open an example">e.g. ${esc((ss[0].title || '').slice(0, 28))}</span>
+          </div>`).join('') || '<div class="dim">not enough sessions yet</div>'}
       </div>
       <div class="flows-panel">
-        <h3>Trajectory clusters <span class="dim">(sessions that behave alike)</span></h3>
-        ${sorted.slice(0, 12).map(([sig, ss]) => `
-          <div class="flow-cluster ${ss.length === 1 ? 'fc-outlier' : ''}">
-            <span class="fc-n">${ss.length === 1 ? '⚠ outlier' : '×' + ss.length}</span>
-            <span class="fc-sig">${esc(sig)}</span>
-            <span class="fc-eg" data-file="${esc(ss[0].file)}">e.g. ${esc((ss[0].title || '').slice(0, 34))}</span>
-          </div>`).join('')}
-        ${outliers.length ? `<div class="dim" style="margin-top:8px">${outliers.length} outlier trajectories — sessions that behave like nothing else in your fleet.</div>` : ''}
+        <h3>Worth a look <span class="qi" title="Sessions whose behavior matched nothing else in your fleet. Unusual isn't bad — but it's where surprises live: one-off experiments, runs that went sideways, or a new workflow being born.">ⓘ</span></h3>
+        <div class="dim" style="margin-bottom:10px">These sessions behaved like nothing else you run. Skim them: an unfamiliar one that <b>hit errors</b> may be a failure worth understanding; a clean one may be a new pattern worth repeating. Archive the ones that are just noise.</div>
+        ${outliers.slice(0, 8).map(([sig, ss]) => {
+          const s = ss[0];
+          const errish = sig.includes('errors');
+          return `<div class="flow-cluster fc-outlier ${errish ? 'fc-outlier-err' : ''}">
+            <span class="fc-n">${errish ? '⚠' : '✦'}</span>
+            <div class="fc-body">
+              <span class="fc-eg" data-file="${esc(s.file)}" title="open this session">${esc((s.title || '').slice(0, 40))}</span>
+              <span class="fc-why">${esc(plainSig(sig))} — unlike anything else</span>
+            </div>
+            ${s.stableKey ? `<button class="fc-arch" data-sk="${esc(s.stableKey)}" title="archive this session (just noise)">🗄</button>` : ''}
+          </div>`;
+        }).join('') || '<div class="dim">no outliers — everything matches a known pattern</div>'}
       </div>
     </div>`;
   $('flowsRefresh').onclick = () => { flowsCache = null; loadFlows(); };
-  $('flows').querySelectorAll('.fc-eg').forEach(el => el.onclick = () => openSession(el.dataset.file));
+  $('flows').querySelectorAll('.fc-eg, .rt-row').forEach(el => el.onclick = () => { if (el.dataset.file) openSession(el.dataset.file); });
+  $('flows').querySelectorAll('.fc-arch').forEach(b => b.onclick = e => { e.stopPropagation(); setSessionMeta(b.dataset.sk, { archived: true }).then(() => { flowsCache = null; loadFlows(); }); });
 }
 
 // ---------- MACHINES view ----------
@@ -908,14 +948,14 @@ const agoClass = t => { const h = (Date.now() - t) / 3.6e6; return h < 6 ? 'ago-
 // ---------- render ----------
 const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'constellation', 'machines'];
 function setTabs() {
-  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewWaterfall', 'waterfall'], ['viewTimeline', 'timeline']]) {
+  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
     const el = $(btn); if (el) el.classList.toggle('on', state.view === v);
   }
   const overview = OVERVIEW.includes(state.view);
   document.querySelector('main').classList.toggle('no-feed', overview);
   $('empty').style.display = 'none'; // only board/timeline turn it back on
   for (const id of ['fleet', 'tableView', 'projects', 'usage', 'flows', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
-  if (overview) { $('board').style.display = 'none'; $('timeline').style.display = 'none'; $('waterfall').style.display = 'none'; }
+  if (overview) for (const p of SESSION_PANES) $(p).style.display = 'none';
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
   $('statbar').style.display = overview ? 'none' : '';
@@ -934,6 +974,8 @@ function render() {
   renderStatbar();
   if (state.view === 'board') renderBoard();
   else if (state.view === 'waterfall') renderWaterfall();
+  else if (state.view === 'lanes') renderLanes();
+  else if (state.view === 'costflow') renderCostFlow();
   else renderTimeline();
   renderFeed();
   $('scrub').max = state.data.events.length;
@@ -974,8 +1016,11 @@ function sparkline(recentTs, firstTs, lastTs) {
   return '<div class="spark">' + buckets.map(b => `<i style="height:${Math.round(b / max * 100)}%"></i>`).join('') + '</div>';
 }
 
+const SESSION_PANES = ['board', 'timeline', 'waterfall', 'lanes', 'costflow'];
+function showPane(id) { for (const p of SESSION_PANES) $(p).style.display = p === id ? '' : 'none'; }
+
 function renderBoard() {
-  $('board').style.display = ''; $('timeline').style.display = 'none'; $('waterfall').style.display = 'none';
+  showPane('board');
   const stage = $('stage'), cards = $('cards'), svg = $('edges');
   const W = stage.clientWidth, H = stage.clientHeight;
   if (!state.file && !state.data.events.length) { // no session chosen yet
@@ -1111,8 +1156,7 @@ function renderBoard() {
 // ---------- WATERFALL view (nested span tree with rollups) ----------
 const wfCollapsed = new Set();
 function renderWaterfall() {
-  $('board').style.display = 'none'; $('timeline').style.display = 'none';
-  $('waterfall').style.display = '';
+  showPane('waterfall');
   const evs = state.data.events.filter(e => e.ts);
   if (!evs.length) { $('waterfall').innerHTML = '<div class="fleet-loading">Pick a session to see its span waterfall.</div>'; return; }
   const t0 = new Date(evs[0].ts).getTime();
@@ -1160,8 +1204,84 @@ function renderWaterfall() {
   $('waterfall').querySelectorAll('.wf-span').forEach(r => r.onclick = e => { e.stopPropagation(); openDrawer(Number(r.dataset.seq)); });
 }
 
+// ---------- LANES view (the event feed as horizontal per-agent card streams) ----------
+const EV_ICON = { 'user-text': '💬', 'user-queued': '💬', 'assistant-text': '🗣', 'tool-call': '🔧', 'tool-result': '↩', 'spawn': '🚀', 'spawn-result': '🏁' };
+function renderLanes() {
+  showPane('lanes');
+  const evs = state.data.events.slice(0, state.scrub);
+  if (!evs.length) { $('lanes').innerHTML = '<div class="fleet-loading">Pick a session to see its activity lanes.</div>'; return; }
+  const agents = agentStateAt(state.scrub);
+  const main = agents.find(a => a.id === 'main');
+  // active lanes first, orchestrator always on top; cap lanes to keep it readable
+  const subs = agents.filter(a => a.id !== 'main')
+    .sort((a, b) => ['working', 'retrying', 'stalled'].includes(statusOf(b)) - ['working', 'retrying', 'stalled'].includes(statusOf(a)) || String(b.lastTs).localeCompare(String(a.lastTs)));
+  const laneAgents = [main, ...subs.slice(0, 24)].filter(Boolean);
+  const dropped = subs.length - Math.min(subs.length, 24);
+  const CARDS_PER_LANE = 50;
+  $('lanes').innerHTML = laneAgents.map(a => {
+    const st = statusOf(a);
+    const laneEvs = evs.filter(e => e.agent === a.id).slice(-CARDS_PER_LANE);
+    return `<div class="lane">
+      <div class="lane-head ${a.id === 'main' ? 'lane-main' : ''}">
+        <span class="lane-dot st-${st}"></span>
+        <span class="lane-name">${a.id === 'main' ? '🛰️' : '🤖'} ${esc((a.name || a.id).slice(0, 26))}</span>
+        <span class="lane-sub">${laneEvs.length}${evs.filter(e => e.agent === a.id).length > CARDS_PER_LANE ? '+' : ''} ev · ${st}</span>
+      </div>
+      <div class="lane-cards" data-agent="${esc(a.id)}">${laneEvs.map(e => `
+        <div class="lcard k-${e.kind}${e.error ? ' err' : ''}" data-seq="${e.seq}" title="${e.ts ? new Date(e.ts).toLocaleTimeString() : ''}">
+          <div class="lc-top">${EV_ICON[e.kind] || '•'} ${e.tool ? esc(e.tool.replace(/^mcp__[^_]+__/, '').slice(0, 16)) : (KIND_LABEL[e.kind] || '')}${e.retry ? ` <b class="es-retry">↻${e.retry}</b>` : ''}</div>
+          <div class="lc-txt">${esc((e.text || '').slice(0, 64))}</div>
+        </div>`).join('') || '<div class="lane-empty">no activity</div>'}</div>
+    </div>`;
+  }).join('') + (dropped ? `<div class="dim" style="padding:8px 14px">+${dropped} quieter agents not shown (see Board or Waterfall for all)</div>` : '');
+  $('lanes').querySelectorAll('.lcard').forEach(el => el.onclick = () => openDrawer(Number(el.dataset.seq)));
+  // live: keep each lane scrolled to the newest card
+  if (state.live) $('lanes').querySelectorAll('.lane-cards').forEach(el => { el.scrollLeft = el.scrollWidth; });
+}
+
+// ---------- COST FLOW view (Sankey: where this session's money went) ----------
+function renderCostFlow() {
+  showPane('costflow');
+  const agents = agentStateAt(state.data.events.length);
+  if (!agents.length) { $('costflow').innerHTML = '<div class="fleet-loading">Pick a session to see its cost flow.</div>'; return; }
+  const useCost = agents.some(a => (a.cost || 0) > 0.001);
+  const weight = a => useCost ? (a.cost || 0) : (a.outTokens || 0);
+  const unit = v => useCost ? '~' + fmtUsd(v) : fmtTok(v) + ' tok';
+  let flows = agents.filter(a => weight(a) > 0).sort((a, b) => weight(b) - weight(a));
+  const total = flows.reduce((n, a) => n + weight(a), 0) || 1;
+  const TOP = 14;
+  let other = null;
+  if (flows.length > TOP) {
+    const rest = flows.slice(TOP);
+    other = { name: `${rest.length} smaller agents`, w: rest.reduce((n, a) => n + weight(a), 0), other: true };
+    flows = flows.slice(0, TOP);
+  }
+  const rows = [...flows.map(a => ({ name: a.id === 'main' ? (a.name || 'Orchestrator') + ' (direct)' : a.name || a.id, w: weight(a), a })), ...(other ? [other] : [])];
+  const W = Math.max($('costflow').clientWidth - 60, 600), H = Math.max(rows.length * 34 + 60, 300);
+  const RIB_X0 = 210, RIB_X1 = W - 260;
+  const plotH = H - 40;
+  const totalPx = plotH - rows.length * 6;
+  let ySrc = 20, yDst = 20, ribbons = '', labels = '';
+  labels += `<text class="cf-src" x="${RIB_X0 - 12}" y="${plotH / 2}" text-anchor="end">${esc((state.fileTitle || 'session').slice(0, 24))} ${unit(total)}</text>`;
+  labels += `<rect x="${RIB_X0 - 6}" y="14" width="6" height="${plotH}" rx="3" fill="var(--accent2)" opacity=".8"/>`;
+  for (const r of rows) {
+    const h = Math.max((r.w / total) * totalPx, 3);
+    const srcY = ySrc, dstY = yDst;
+    const midX = (RIB_X0 + RIB_X1) / 2;
+    const st = r.a ? statusOf(r.a) : 'done';
+    const col = r.other ? '#8a93a8' : st === 'failed' ? '#f87171' : r.a && r.a.id === 'main' ? '#818cf8' : '#5eead4';
+    ribbons += `<path class="cf-rib" fill="${col}" opacity=".55" d="M ${RIB_X0} ${srcY} C ${midX} ${srcY}, ${midX} ${dstY}, ${RIB_X1} ${dstY} L ${RIB_X1} ${dstY + h} C ${midX} ${dstY + h}, ${midX} ${srcY + h}, ${RIB_X0} ${srcY + h} Z"><title>${esc(r.name)}: ${unit(r.w)} (${Math.round(r.w / total * 100)}%)</title></path>`;
+    const pct = Math.round(r.w / total * 100);
+    labels += `<text class="cf-lbl" x="${RIB_X1 + 10}" y="${dstY + h / 2 + 4}">${esc(r.name.slice(0, 30))} <tspan class="cf-val">${unit(r.w)} · ${pct}%</tspan></text>`;
+    ySrc += h; yDst += h + 6;
+  }
+  $('costflow').innerHTML =
+    `<div class="fleet-head" style="padding:14px 18px 0"><h2>Where the ${useCost ? 'money' : 'output'} went <span class="qi" title="Each ribbon is one agent's share of this session's total ${useCost ? 'estimated cost' : 'output tokens'}. Thicker = more. Red = that agent failed.">ⓘ</span></h2></div>
+    <div class="cf-wrap"><svg width="${W}" height="${H}">${ribbons}${labels}</svg></div>`;
+}
+
 function renderTimeline() {
-  $('board').style.display = 'none'; $('timeline').style.display = ''; $('waterfall').style.display = 'none';
+  showPane('timeline');
   const agents = agentStateAt(state.data.events.length);
   const evs = state.data.events.filter(e => e.ts);
   if (!evs.length) { $('timeline').innerHTML = '<div class="fleet-loading">Pick a session from the Fleet, Table, or Galaxy to view its timeline.</div>'; return; }
@@ -1281,6 +1401,8 @@ $('viewConstellation').onclick = () => { if (!BAKED) { state.view = 'constellati
 $('viewMachines').onclick = () => { if (!BAKED) { state.view = 'machines'; setTabs(); } };
 $('viewBoard').onclick = () => { state.view = 'board'; setTabs(); render(); };
 $('viewWaterfall').onclick = () => { state.view = 'waterfall'; setTabs(); render(); };
+$('viewLanes').onclick = () => { state.view = 'lanes'; setTabs(); render(); };
+$('viewCost').onclick = () => { state.view = 'costflow'; setTabs(); render(); };
 $('viewTimeline').onclick = () => { state.view = 'timeline'; setTabs(); render(); };
 $('exportBtn').onclick = () => {
   if (!state.file) return;

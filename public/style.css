@@ -202,6 +202,24 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .flows-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
 .flows-panel h3 { font-size: 13px; margin-bottom: 12px; }
 .flows-panel .dim { color: var(--dim); font-weight: 400; font-size: 11px; }
+.qi { color: var(--dim); cursor: help; font-size: 11px; border: 1px solid var(--line); border-radius: 50%; padding: 0 4px; }
+.role-table { font-size: 12px; }
+.rt-head, .rt-row { display: grid; grid-template-columns: minmax(180px,1.6fr) 55px 65px 75px 80px minmax(90px,1fr) 70px; gap: 8px; align-items: center; padding: 6px 8px; }
+.rt-head { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid var(--line); cursor: default; }
+.rt-head span { cursor: help; }
+.rt-row { border-bottom: 1px solid rgba(34,42,58,.4); cursor: pointer; }
+.rt-row:hover { background: var(--panel2); }
+.rt-name { position: relative; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 2px 6px; }
+.rt-bar { position: absolute; left: 0; top: 0; bottom: 0; background: rgba(129,140,248,.14); border-radius: 4px; z-index: 0; }
+.rt-name b { position: relative; z-index: 1; font-weight: 600; }
+.rt-s { font-weight: 700; }
+.rt-s.ok { color: var(--green); } .rt-s.warn { color: var(--amber); } .rt-s.bad { color: var(--red); }
+.fc-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.fc-why { font-size: 10.5px; color: var(--dim); }
+.fc-outlier-err { border-color: rgba(248,113,113,.45); }
+.fc-arch { margin-left: auto; background: var(--panel); border: 1px solid var(--line); color: var(--dim); border-radius: 5px; height: 24px; min-width: 26px; cursor: pointer; }
+.fc-arch:hover { color: var(--amber); border-color: var(--amber); }
+
 .flow-edge { display: grid; grid-template-columns: 180px 1fr 80px; gap: 10px; align-items: center; padding: 4px 0; font-size: 12px; }
 .fe-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fe-bar-wrap { height: 10px; background: var(--panel2); border-radius: 5px; overflow: hidden; }
@@ -238,6 +256,41 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 /* budget input */
 .budget-lbl { display: flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--dim); }
 #budgetInput { width: 70px; background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 5px 7px; font-size: 12px; }
+
+/* lanes view */
+#lanes { position: absolute; inset: 0; overflow-y: auto; padding: 10px 0; }
+.lane { border-bottom: 1px solid var(--line); }
+.lane-head { display: flex; align-items: center; gap: 8px; padding: 8px 14px 4px; font-size: 12px; }
+.lane-head.lane-main .lane-name { color: var(--accent2); font-weight: 700; }
+.lane-name { font-weight: 600; }
+.lane-sub { color: var(--dim); font-size: 10.5px; }
+.lane-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--dim); }
+.lane-dot.st-working { background: var(--amber); animation: blink 1.4s infinite; }
+.lane-dot.st-done { background: var(--green); }
+.lane-dot.st-failed { background: var(--red); }
+.lane-dot.st-retrying { background: var(--red); animation: blink .8s infinite; }
+.lane-dot.st-stalled { background: var(--amber); animation: blink 2s infinite; }
+.lane-cards { display: flex; gap: 6px; overflow-x: auto; padding: 4px 14px 10px; scrollbar-width: thin; }
+.lcard { flex: 0 0 150px; background: var(--panel); border: 1px solid var(--line); border-left-width: 3px; border-radius: 7px; padding: 6px 8px; cursor: pointer; }
+.lcard:hover { border-color: var(--accent); }
+.lcard.k-tool-call { border-left-color: var(--accent2); }
+.lcard.k-tool-result { border-left-color: #60a5fa; }
+.lcard.k-assistant-text { border-left-color: var(--amber); }
+.lcard.k-user-text, .lcard.k-user-queued { border-left-color: var(--red); }
+.lcard.k-spawn { border-left-color: var(--accent); }
+.lcard.k-spawn-result { border-left-color: var(--green); }
+.lcard.err { background: rgba(248,113,113,.1); border-left-color: var(--red); }
+.lc-top { font-size: 10.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lc-txt { font-size: 10px; color: var(--dim); margin-top: 3px; height: 26px; overflow: hidden; line-height: 1.3; }
+.lane-empty { font-size: 11px; color: var(--dim); padding: 8px; }
+
+/* cost flow (sankey) */
+#costflow { position: absolute; inset: 0; overflow: auto; }
+.cf-wrap { padding: 6px 18px 18px; }
+.cf-rib:hover { opacity: .85 !important; }
+.cf-src { font-size: 12px; font-weight: 700; fill: var(--text); }
+.cf-lbl { font-size: 11.5px; fill: var(--text); font-weight: 600; }
+.cf-val { fill: var(--dim); font-weight: 400; font-size: 10.5px; }
 
 /* usage view */
 #usage { position: absolute; inset: 0; overflow: auto; padding: 22px; }
