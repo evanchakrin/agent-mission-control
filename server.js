@@ -329,6 +329,183 @@ function workflowNames(sessionPath) {
   return names;
 }
 
+// ---------- Codex CLI / Desktop sessions ----------
+// Codex writes rollouts to ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
+// Lines are {timestamp, type, payload}. We map messages, tool calls (paired by
+// call_id for durations), token_count events, and sub_agent_activity lanes.
+const CODEX_DIR = argValue('--codex-dir') || process.env.CODEX_DIR || path.join(os.homedir(), '.codex', 'sessions');
+const CODEX_EVENT_CAP = 15000;
+
+function codexFiles() {
+  const out = [];
+  function walk(dir) {
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (/^rollout-.*\.jsonl$/.test(e.name)) {
+        let st;
+        try { st = fs.statSync(full); } catch { continue; }
+        if (!st.size) continue;
+        const uuid = e.name.replace(/\.jsonl$/, '').split('-').slice(-5).join('-');
+        out.push({ uuid, path: full, mtime: st.mtimeMs, size: st.size });
+      }
+    }
+  }
+  walk(CODEX_DIR);
+  return out;
+}
+
+const codexMetaCache = new Map(); // path -> {size, meta}
+function codexMeta(file) {
+  const hit = codexMetaCache.get(file.path);
+  if (hit && hit.size === file.size) return hit.meta;
+  let meta = { cwd: null, threadSource: 'user' };
+  try {
+    const fd = fs.openSync(file.path, 'r');
+    const buf = Buffer.alloc(Math.min(65536, file.size));
+    fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    const head = buf.toString('utf8');
+    // session_meta lines can exceed any fixed read (huge base_instructions), so
+    // regex the two fields we need rather than requiring a complete JSON line
+    const cwd = /"cwd":"((?:[^"\\]|\\.)*)"/.exec(head);
+    const src = /"thread_source":"([^"]*)"/.exec(head);
+    meta = { cwd: cwd ? JSON.parse('"' + cwd[1] + '"') : null, threadSource: src ? src[1] : 'user' };
+  } catch { /* ignore */ }
+  codexMetaCache.set(file.path, { size: file.size, meta });
+  return meta;
+}
+
+function codexList() {
+  return codexFiles()
+    .filter(f => codexMeta(f).threadSource === 'user')
+    .sort((a, b) => b.mtime - a.mtime)
+    .map(f => {
+      const meta = codexMeta(f);
+      const proj = meta.cwd ? path.basename(meta.cwd) : 'unknown';
+      return { project: 'Codex', file: 'codex:' + f.uuid, session: f.uuid, title: proj + ' · Codex', size: f.size, mtime: f.mtime, agentCount: 0 };
+    });
+}
+
+function parseCodexLines(lines, agentId, ctx) {
+  const { agents, events, pending } = ctx;
+  if (!agents.has(agentId)) agents.set(agentId, newAgent(agentId, agentId === 'main' ? 'main' : 'subagent'));
+  const agent = agents.get(agentId);
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const o = safeParse(line);
+    if (!o || !o.payload) continue;
+    const p = o.payload, ts = o.timestamp || null;
+    const touch = (a) => { if (!a.firstTs) a.firstTs = ts; a.lastTs = ts; a.events++; };
+
+    if (o.type === 'response_item') {
+      if (p.type === 'message') {
+        const text = (p.content || []).map(c => c.text || '').join('\n');
+        if (!text.trim()) continue;
+        if (p.role === 'user' && !text.startsWith('<')) {
+          touch(agent);
+          events.push({ ts, agent: agentId, kind: 'user-text', text: clip(text, 240), full: clip(text, 2500) });
+        } else if (p.role === 'assistant') {
+          touch(agent); agent.lastKind = 'assistant-text';
+          events.push({ ts, agent: agentId, kind: 'assistant-text', text: clip(text, 240), full: clip(text, 2500) });
+        }
+      } else if (p.type === 'custom_tool_call' || p.type === 'function_call') {
+        touch(agent); agent.lastKind = 'tool-call';
+        const tool = p.name || 'tool';
+        agent.tools[tool] = (agent.tools[tool] || 0) + 1;
+        const argText = p.input || p.arguments || '';
+        const evt = { ts, agent: agentId, kind: 'tool-call', tool, toolUseId: p.call_id, text: clip(argText, 240), full: clip(argText, 2500) };
+        events.push(evt);
+        if (p.call_id) pending.set(p.call_id, evt);
+      } else if (p.type === 'custom_tool_call_output' || p.type === 'function_call_output') {
+        const start = pending.get(p.call_id);
+        if (start && !start.endTs && ts) start.endTs = ts;
+        const out = typeof p.output === 'string' ? p.output : JSON.stringify(p.output || '');
+        const error = /"(failed|error)"|^error/i.test(String(out).slice(0, 200));
+        if (error) agent.errors++;
+        events.push({ ts, agent: agentId, kind: 'tool-result', toolUseId: p.call_id, error, text: clip(out, 240), full: clip(out, 2500) });
+      }
+    } else if (o.type === 'event_msg') {
+      if (p.type === 'token_count' && p.info && p.info.last_token_usage) {
+        const u = p.info.last_token_usage;
+        agent.inTokens += Math.max(0, (u.input_tokens || 0) - (u.cached_input_tokens || 0));
+        agent.cacheTokens += u.cached_input_tokens || 0;
+        agent.outTokens += u.output_tokens || 0;
+      } else if (p.type === 'sub_agent_activity' && p.agent_path && p.agent_path !== '/root') {
+        const name = p.agent_path.split('/').filter(Boolean).pop();
+        const subId = 'sub:' + p.agent_path;
+        if (!agents.has(subId)) {
+          agents.set(subId, { ...newAgent(subId, 'subagent'), name });
+          events.push({ ts, agent: 'main', kind: 'spawn', tool: 'sub_agent', spawnedAgent: subId, text: clip(p.agent_path, 240), full: clip(p.agent_path, 2500) });
+        }
+        const sub = agents.get(subId);
+        touch(sub);
+        if (p.kind === 'started') sub.task = name;
+        if (p.kind === 'completed' || p.kind === 'interrupted') sub.done = true;
+        ctx.subThreads.set(p.agent_thread_id, subId);
+      }
+    }
+  }
+}
+
+// Rollout files can reach hundreds of MB. Cap what we load: the newest 24MB
+// (aligned to a line boundary). Early token_count events are lost for huge
+// sessions, but events/agents/tools come from the recent tail, which is what
+// the dashboard shows anyway.
+const CODEX_READ_CAP = 24 * 1024 * 1024;
+function readCappedLines(filePath, size) {
+  if (size <= CODEX_READ_CAP) return fs.readFileSync(filePath, 'utf8').split('\n');
+  const fd = fs.openSync(filePath, 'r');
+  const buf = Buffer.alloc(CODEX_READ_CAP);
+  fs.readSync(fd, buf, 0, buf.length, size - buf.length);
+  fs.closeSync(fd);
+  const lines = buf.toString('utf8').split('\n');
+  lines.shift(); // first line is almost certainly a partial JSON record
+  return lines;
+}
+
+function readCodexSession(uuid) {
+  const files = codexFiles();
+  const file = files.find(f => f.uuid === uuid);
+  if (!file) return null;
+  const ctx = { agents: new Map(), events: [], pending: new Map(), subThreads: new Map() };
+  const meta = codexMeta(file);
+  ctx.agents.set('main', { ...newAgent('main', 'main'), name: (meta.cwd ? path.basename(meta.cwd) : 'Codex') + ' /root' });
+  parseCodexLines(readCappedLines(file.path, file.size), 'main', ctx);
+  // subagent threads have their own rollout files, keyed by agent_thread_id
+  for (const [threadId, subId] of ctx.subThreads) {
+    const tf = files.find(f => f.uuid === threadId);
+    if (tf) {
+      try { parseCodexLines(readCappedLines(tf.path, tf.size), subId, ctx); } catch { /* ignore */ }
+    }
+  }
+  for (const a of ctx.agents.values()) a.cost = Math.round(costOf(a) * 10000) / 10000; // non-Claude models price at $0
+  ctx.events.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+  const events = ctx.events.length > CODEX_EVENT_CAP ? ctx.events.slice(-CODEX_EVENT_CAP) : ctx.events;
+  events.forEach((e, i) => { e.seq = i; });
+  return { events, agents: [...ctx.agents.values()] };
+}
+
+function codexSignature(uuid) {
+  const file = codexFiles().find(f => f.uuid === uuid);
+  return file ? String(file.size) : '';
+}
+
+const codexCache = new Map(); // uuid -> {sig, result}
+function readCodexCached(uuid) {
+  const sig = codexSignature(uuid);
+  const hit = codexCache.get(uuid);
+  if (hit && hit.sig === sig) return hit.result;
+  const result = readCodexSession(uuid);
+  if (result) {
+    codexCache.set(uuid, { sig, result });
+    if (codexCache.size > 6) codexCache.delete(codexCache.keys().next().value);
+  }
+  return result;
+}
+
 // Change signature = main size + every subagent file size (detects growth anywhere).
 function sessionSignature(sessionPath) {
   let sig = '';
@@ -482,6 +659,7 @@ function getResult(fileParam) {
     const sess = relaySessions.get(fileParam);
     return sess ? sess.result : null;
   }
+  if (fileParam.startsWith('codex:')) return readCodexCached(fileParam.slice(6));
   const full = resolveSessionPath(fileParam);
   if (!full || !fs.existsSync(full)) return null;
   return readSession(full);
@@ -567,10 +745,10 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (url.pathname === '/api/sessions') return json(res, [...relayList(), ...otelList(), ...listSessions()]);
+  if (url.pathname === '/api/sessions') return json(res, [...relayList(), ...otelList(), ...listSessions(), ...codexList()]);
 
   if (url.pathname === '/api/fleet') {
-    return json(res, [...relayList(), ...otelList(), ...listSessions()].map(sessionSummary).filter(Boolean));
+    return json(res, [...relayList(), ...otelList(), ...listSessions(), ...codexList()].map(sessionSummary).filter(Boolean));
   }
 
   if (url.pathname === '/api/session') {
@@ -608,7 +786,9 @@ const server = http.createServer((req, res) => {
         ? String(otelSessions.get(fileParam)?.version || 0)
         : fileParam.startsWith('relay:')
           ? String(relaySessions.get(fileParam)?.version || 0)
-          : sessionSignature(resolveSessionPath(fileParam));
+          : fileParam.startsWith('codex:')
+            ? codexSignature(fileParam.slice(6))
+            : sessionSignature(resolveSessionPath(fileParam));
       if (sig !== lastSig) {
         lastSig = sig;
         try {
@@ -646,16 +826,17 @@ async function runRelay(hub, machineName) {
   console.log(`Relaying local sessions → ${hub}/v1/relay as "${machineName}"`);
   console.log(`Watching transcripts in ${PROJECTS_DIR}`);
   const tick = async () => {
-    for (const meta of listSessions()) {
-      const full = resolveSessionPath(meta.file);
-      if (!full) continue;
-      const sig = sessionSignature(full);
-      if (sent.get(meta.file) === sig) continue;
+    for (const meta of [...listSessions(), ...codexList()]) {
+      const isCodex = meta.file.startsWith('codex:');
+      const sig = isCodex ? codexSignature(meta.file.slice(6)) : sessionSignature(resolveSessionPath(meta.file));
+      if (!sig || sent.get(meta.file) === sig) continue;
+      const result = getResult(meta.file);
+      if (!result) continue;
       try {
         const r = await fetch(hub + '/v1/relay', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
-          body: JSON.stringify({ machine: machineName, file: meta.file, meta, result: readSession(full) }),
+          body: JSON.stringify({ machine: machineName, file: meta.file, meta, result }),
         });
         if (r.ok) { sent.set(meta.file, sig); console.log(`sent ${meta.title || meta.session} (${sig.length > 40 ? sig.slice(0, 40) + '…' : sig})`); }
         else console.error(`hub rejected ${meta.file}: ${r.status} ${await r.text()}`);

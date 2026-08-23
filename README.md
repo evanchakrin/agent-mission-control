@@ -63,6 +63,10 @@ node demo/simulate-crew.js
 
 A three-agent "content-crew" (Researcher → Writer → Reviewer) streams in live over ~15 seconds.
 
+## Codex sessions
+
+Codex CLI / Desktop rollouts under `~/.codex/sessions` are discovered automatically and appear in the Fleet labeled `Codex` — including their named subagent teams (`sub_agent_activity` lanes, with each subagent's own rollout thread merged in). Tool calls are paired by `call_id` for durations, and `token_count` events drive token accounting. Very large rollouts (hundreds of MB) are tail-read with a 24MB cap and events capped at 15k, keeping the recent history. Override the location with `--codex-dir` or `CODEX_DIR`. Relay mode forwards Codex sessions to the hub too.
+
 ## Multi-machine: relay mode
 
 Run one dashboard (the hub). Every other machine relays its sessions to it:
