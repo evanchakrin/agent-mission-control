@@ -50,6 +50,15 @@ This metadata is **local and durable** — stored at `~/.claude/mission-control/
 
 **Security:** all `/api/meta*` routes (reads and writes) are gated to loopback only, plus a same-origin check and a per-boot CSRF token on writes — a web page you visit cannot reach in and mutate your data, and a remote relay (even with the shared token) can POST session content but cannot touch your projects/archive. Metadata mutation is never exposed on the LAN.
 
+## Understanding control flow
+
+- **Waterfall** (in-session) — nested span tree: every tool call as a duration bar under its agent, with per-agent rollups (calls, tokens, cost, duration, errors), collapsible, click any span for the inspector.
+- **Lifecycle states** — agents and Board edges distinguish **failed / retrying / stalled** from healthy-but-slow: retry counts are derived from errored-then-repeated tool calls, stalls from long-pending calls. Edge styles: green=returned, dashed=in-flight, red=failed, red-dashed=retrying, amber=stalled.
+- **Typed, labeled edges** — each orchestrator→subagent edge carries the delegated task text, so the Board shows what work is flowing, not just topology.
+- **⇶ Flows** (fleet-wide) — aggregates behavior across your whole fleet: most-delegated agent roles weighted by frequency (with error counts), and **trajectory clusters** grouping sessions that behave alike — outliers flagged. No single-run cloud tool can build this; it needs the cross-machine data only a local fleet hub has.
+
+The OTLP receiver also understands OpenInference (Phoenix) and Traceloop/OpenLLMetry attribute conventions (`llm.model_name`, `openinference.span.kind`, `llm.token_count.*`, `input/output.value`) in addition to `gen_ai.*` — any app instrumented with those exporters works out of the box.
+
 ## Command center views
 
 The overview has four lenses, all color-coded by agent type (Claude coral, Codex blue, OTLP violet):

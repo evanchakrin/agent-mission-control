@@ -142,6 +142,50 @@ function processLine(o, agentId, ctx) {
   }
 }
 
+// Lifecycle post-processing, shared by every source. Derives per-event retry
+// counts (same agent re-calls the same tool right after an errored result) and
+// per-agent pending/failed markers so the UI can show stuck vs retrying vs
+// healthy instead of everything looking like "slow".
+function postProcessLifecycle(result) {
+  const pending = new Map();      // toolUseId -> event
+  const lastErrTool = new Map();  // agentId -> tool name that just errored
+  const retryCount = new Map();   // agentId:tool -> consecutive retries
+  const lastEvt = new Map();      // agentId -> last event
+  for (const e of result.events) {
+    lastEvt.set(e.agent, e);
+    if (e.kind === 'tool-call' || e.kind === 'spawn') {
+      if (e.toolUseId) pending.set(e.toolUseId, e);
+      const k = e.agent + ':' + e.tool;
+      if (lastErrTool.get(e.agent) === e.tool) {
+        const n = (retryCount.get(k) || 0) + 1;
+        retryCount.set(k, n);
+        e.retry = n;
+      } else if (!e.retry) {
+        retryCount.delete(k);
+      }
+      lastErrTool.delete(e.agent);
+    } else if (e.kind === 'tool-result' || e.kind === 'spawn-result') {
+      if (e.toolUseId) pending.delete(e.toolUseId);
+      if (e.error) {
+        const call = result.events.find(x => x.toolUseId === e.toolUseId && (x.kind === 'tool-call' || x.kind === 'spawn'));
+        if (call) lastErrTool.set(e.agent, call.tool);
+      } else {
+        lastErrTool.delete(e.agent);
+      }
+    }
+  }
+  const pendingByAgent = new Map();
+  for (const e of pending.values()) pendingByAgent.set(e.agent, e); // last unresolved call wins
+  for (const a of result.agents) {
+    const p = pendingByAgent.get(a.id);
+    a.pendingTool = p ? { tool: p.tool, since: p.ts } : null;
+    const le = lastEvt.get(a.id);
+    a.lastErrored = !!(le && le.error);
+    a.retrying = lastErrTool.has(a.id); // errored and hasn't succeeded since
+  }
+  return result;
+}
+
 // mainLines: JSONL lines of the orchestrator transcript.
 // subFiles: [{id, lines, group}] — one per subagents/**/agent-*.jsonl file.
 function normalize(mainLines, subFiles, wfNames = new Map()) {
@@ -247,7 +291,7 @@ function normalize(mainLines, subFiles, wfNames = new Map()) {
   }
   ctx.events.forEach((e, i) => { e.seq = i; });
 
-  return { events: ctx.events, agents: [...ctx.agents.values()] };
+  return postProcessLifecycle({ events: ctx.events, agents: [...ctx.agents.values()] });
 }
 
 // ---------- session discovery & reading ----------
@@ -505,7 +549,7 @@ function readCodexSession(uuid) {
   ctx.events.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
   const events = ctx.events.length > CODEX_EVENT_CAP ? ctx.events.slice(-CODEX_EVENT_CAP) : ctx.events;
   events.forEach((e, i) => { e.seq = i; });
-  return { events, agents: [...ctx.agents.values()] };
+  return postProcessLifecycle({ events, agents: [...ctx.agents.values()] });
 }
 
 function codexSignature(uuid) {
@@ -596,33 +640,42 @@ function ingestTraces(body) {
         const at = otelAttrs(span.attributes);
         const ts = span.startTimeUnixNano ? new Date(Number(span.startTimeUnixNano) / 1e6).toISOString() : null;
         const endTs = span.endTimeUnixNano ? new Date(Number(span.endTimeUnixNano) / 1e6).toISOString() : null;
-        const agentName = at['gen_ai.agent.name'] || at['agent.name'] || at['crewai.agent.role'] || null;
+        // agent identity: gen_ai conventions, OpenInference (Phoenix), and common framework attrs
+        const agentName = at['gen_ai.agent.name'] || at['agent.name'] || at['crewai.agent.role']
+          || at['openinference.agent.name'] || at['llm.agent.name'] || at['traceloop.entity.name'] || null;
         const agentId = agentName ? 'sub:' + agentName : 'main';
         if (!sess.agents.has(agentId)) sess.agents.set(agentId, { ...newAgent(agentId, 'subagent'), name: agentName });
         const agent = sess.agents.get(agentId);
         if (!agent.firstTs || (ts && ts < agent.firstTs)) agent.firstTs = ts;
         if (!agent.lastTs || (endTs || ts) > agent.lastTs) agent.lastTs = endTs || ts;
         agent.events++;
-        const model = at['gen_ai.request.model'] || at['gen_ai.response.model'];
+        // model: gen_ai + OpenInference (llm.model_name) + Traceloop (llm.request.model)
+        const model = at['gen_ai.request.model'] || at['gen_ai.response.model']
+          || at['llm.model_name'] || at['llm.request.model'] || at['llm.response.model'];
         if (model && !agent.model) agent.model = model;
         const error = !!(span.status && span.status.code === 2);
         if (error) agent.errors++;
+        // OpenInference span kind (LLM/TOOL/AGENT/CHAIN) is authoritative when present
+        const oiKind = String(at['openinference.span.kind'] || at['span.kind'] || '').toUpperCase();
         const op = String(at['gen_ai.operation.name'] || span.name || '').toLowerCase();
-        if (model || /chat|completion|generate/.test(op)) {
-          agent.inTokens += Number(at['gen_ai.usage.input_tokens'] || at['gen_ai.usage.prompt_tokens'] || 0);
-          agent.outTokens += Number(at['gen_ai.usage.output_tokens'] || at['gen_ai.usage.completion_tokens'] || 0);
-          const prompt = at['gen_ai.prompt'] || at['gen_ai.input.messages'];
+        const isLLM = oiKind === 'LLM' || (!oiKind.match(/TOOL|RETRIEVER|EMBEDDING/) && (model || /chat|completion|generate/.test(op)));
+        if (isLLM) {
+          agent.inTokens += Number(at['gen_ai.usage.input_tokens'] || at['gen_ai.usage.prompt_tokens'] || at['llm.token_count.prompt'] || 0);
+          agent.outTokens += Number(at['gen_ai.usage.output_tokens'] || at['gen_ai.usage.completion_tokens'] || at['llm.token_count.completion'] || 0);
+          const prompt = at['gen_ai.prompt'] || at['gen_ai.input.messages'] || at['input.value'] || at['llm.input_messages.0.message.content'];
           if (prompt) sess.events.push({ ts, agent: agentId, kind: 'user-text', text: clip(prompt, 240), full: clip(prompt, 2500) });
-          const completion = at['gen_ai.completion'] || at['gen_ai.output.messages'] || at['gen_ai.response.text'] || `${span.name} (${model || 'LLM'})`;
+          const completion = at['gen_ai.completion'] || at['gen_ai.output.messages'] || at['gen_ai.response.text']
+            || at['output.value'] || at['llm.output_messages.0.message.content'] || `${span.name} (${model || 'LLM'})`;
           sess.events.push({ ts: endTs || ts, agent: agentId, kind: 'assistant-text', error, text: clip(completion, 240), full: clip(completion, 2500) });
           agent.lastKind = 'assistant-text';
           if (model) agent.tools[model] = (agent.tools[model] || 0) + 1;
         } else {
-          const tool = at['gen_ai.tool.name'] || span.name || 'span';
+          const tool = at['gen_ai.tool.name'] || at['tool.name'] || span.name || 'span';
           agent.tools[tool] = (agent.tools[tool] || 0) + 1;
           agent.lastKind = 'tool-call';
-          const args = at['gen_ai.tool.call.arguments'] || at['gen_ai.tool.description'] || '';
-          sess.events.push({ ts, agent: agentId, kind: 'tool-call', tool, error, endTs, text: clip(args, 240), full: clip(args, 2500) });
+          const args = at['gen_ai.tool.call.arguments'] || at['tool.parameters'] || at['input.value'] || at['gen_ai.tool.description'] || '';
+          const retry = Number(at['retry.count'] || at['gen_ai.request.retry_count'] || 0);
+          sess.events.push({ ts, agent: agentId, kind: 'tool-call', tool, error, endTs, retry: retry || undefined, text: clip(args, 240), full: clip(args, 2500) });
         }
         agent.cost = Math.round(costOf(agent) * 10000) / 10000;
       }
@@ -634,7 +687,7 @@ function ingestTraces(body) {
 function otelResult(sess) {
   const events = [...sess.events].sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
   events.forEach((e, i) => { e.seq = i; });
-  return { events, agents: [...sess.agents.values()] };
+  return postProcessLifecycle({ events, agents: [...sess.agents.values()] });
 }
 
 function otelList() {

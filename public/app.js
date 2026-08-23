@@ -453,6 +453,91 @@ function renderUsage() {
   $('granSeg').querySelectorAll('button').forEach(b => b.onclick = () => { usageGran = b.dataset.g; renderUsage(); });
 }
 
+// ---------- FLOWS view (fleet-wide behavior: weighted tool-flow + trajectory clusters) ----------
+// Nobody else has cross-machine multi-session data: this aggregates EVERY
+// session's top tool usage and control shape into one behavioral picture.
+let flowsCache = null;
+async function loadFlows() {
+  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  if (!flowsCache) {
+    $('flows').innerHTML = '<div class="fleet-loading">Analyzing fleet behavior across all sessions…</div>';
+    // sample up to 60 most recent sessions' full event streams
+    const picks = filteredFleet().slice(0, 60);
+    const results = [];
+    for (const chunk of [picks.slice(0, 20), picks.slice(20, 40), picks.slice(40, 60)]) {
+      const part = await Promise.all(chunk.map(s =>
+        fetch('/api/session?file=' + encodeURIComponent(s.file)).then(r => r.json()).then(d => ({ s, d })).catch(() => null)));
+      results.push(...part.filter(Boolean));
+    }
+    flowsCache = results;
+  }
+  renderFlows();
+}
+function sessionSignatureShape(d) {
+  // trajectory signature: dominant tools + fanout bucket + error-ness
+  const toolCounts = {};
+  for (const a of d.agents) for (const [t, n] of Object.entries(a.tools || {})) toolCounts[t.replace(/^mcp__[^_]+__/, '')] = (toolCounts[t.replace(/^mcp__[^_]+__/, '')] || 0) + n;
+  const top = Object.entries(toolCounts).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([t]) => t);
+  const fan = d.agents.length <= 1 ? 'solo' : d.agents.length <= 5 ? 'small-team' : d.agents.length <= 30 ? 'team' : 'fleet';
+  const err = d.events.some(e => e.error) ? 'errors' : 'clean';
+  return `${fan} · ${top.join('+') || 'no-tools'} · ${err}`;
+}
+function renderFlows() {
+  const data = flowsCache || [];
+  // 1) weighted flow edges: orchestrator -> subagent-name (normalized), across sessions
+  const edgeW = new Map(); // "from→to" -> {n, errors}
+  const nodeW = new Map();
+  const norm = n => String(n || '').replace(/\s*#\d+$/, '').replace(/[0-9a-f-]{12,}/g, '·').slice(0, 30);
+  for (const { d } of data) {
+    for (const a of d.agents) {
+      if (a.id === 'main') continue;
+      const to = norm(a.name || 'subagent');
+      nodeW.set(to, (nodeW.get(to) || 0) + 1);
+      const k = 'orchestrator→' + to;
+      const e = edgeW.get(k) || { n: 0, errors: 0 };
+      e.n++; e.errors += a.errors || 0;
+      edgeW.set(k, e);
+    }
+  }
+  const topEdges = [...edgeW.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 24);
+  const maxN = Math.max(...topEdges.map(([, e]) => e.n), 1);
+  // 2) trajectory clusters
+  const clusters = new Map();
+  for (const { s, d } of data) {
+    const sig = sessionSignatureShape(d);
+    if (!clusters.has(sig)) clusters.set(sig, []);
+    clusters.get(sig).push(s);
+  }
+  const sorted = [...clusters.entries()].sort((a, b) => b[1].length - a[1].length);
+  const outliers = sorted.filter(([, v]) => v.length === 1);
+  $('flows').innerHTML =
+    `<div class="fleet-head"><h2>Fleet behavior — ${data.length} sessions analyzed</h2><button id="flowsRefresh" class="mini-btn">↻ refresh</button></div>
+    <div class="flows-grid">
+      <div class="flows-panel">
+        <h3>Most-delegated work <span class="dim">(orchestrator → agent role, weighted by frequency)</span></h3>
+        ${topEdges.map(([k, e]) => {
+          const to = k.split('→')[1];
+          const w = Math.max(4, (e.n / maxN) * 100);
+          return `<div class="flow-edge"><span class="fe-name">${esc(to)}</span>
+            <span class="fe-bar-wrap"><span class="fe-bar ${e.errors ? 'fe-err' : ''}" style="width:${w}%"></span></span>
+            <span class="fe-n">×${e.n}${e.errors ? ` <b class="ferr">${e.errors}err</b>` : ''}</span></div>`;
+        }).join('') || '<div class="dim">no delegation observed</div>'}
+      </div>
+      <div class="flows-panel">
+        <h3>Trajectory clusters <span class="dim">(sessions that behave alike)</span></h3>
+        ${sorted.slice(0, 12).map(([sig, ss]) => `
+          <div class="flow-cluster ${ss.length === 1 ? 'fc-outlier' : ''}">
+            <span class="fc-n">${ss.length === 1 ? '⚠ outlier' : '×' + ss.length}</span>
+            <span class="fc-sig">${esc(sig)}</span>
+            <span class="fc-eg" data-file="${esc(ss[0].file)}">e.g. ${esc((ss[0].title || '').slice(0, 34))}</span>
+          </div>`).join('')}
+        ${outliers.length ? `<div class="dim" style="margin-top:8px">${outliers.length} outlier trajectories — sessions that behave like nothing else in your fleet.</div>` : ''}
+      </div>
+    </div>`;
+  $('flowsRefresh').onclick = () => { flowsCache = null; loadFlows(); };
+  $('flows').querySelectorAll('.fc-eg').forEach(el => el.onclick = () => openSession(el.dataset.file));
+}
+
 // ---------- MACHINES view ----------
 async function loadMachines() {
   const [machinesData, fleet] = await Promise.all([
@@ -646,9 +731,15 @@ function agentStateAt(idx) {
 }
 
 function statusOf(s) {
-  if (s.id !== 'main' && s.done) return 'done';
+  // lifecycle-aware: failed / retrying / stalled beat the generic states
+  const meta = state.data.agents.find(a => a.id === s.id) || s;
+  const now = state.data.now || Date.now();
+  if (meta.retrying) return 'retrying';
+  if (meta.lastErrored && (s.done || !state.live)) return 'failed';
+  if (state.live && meta.pendingTool && meta.pendingTool.since && now - new Date(meta.pendingTool.since) > 120000 && !s.done) return 'stalled';
+  if (s.id !== 'main' && s.done) return meta.lastErrored ? 'failed' : 'done';
   const last = s.lastTs ? new Date(s.lastTs).getTime() : 0;
-  if (state.live && state.data.now && state.data.now - last < 20000) return 'working';
+  if (state.live && now - last < 20000) return 'working';
   if (!state.live && s.events > 0) return 'working';
   return 'idle';
 }
@@ -675,16 +766,16 @@ const fmtAgo = t => {
 const agoClass = t => { const h = (Date.now() - t) / 3.6e6; return h < 6 ? 'ago-fresh' : h < 72 ? 'ago-recent' : 'ago-stale'; };
 
 // ---------- render ----------
-const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'constellation', 'machines'];
+const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'constellation', 'machines'];
 function setTabs() {
-  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewTimeline', 'timeline']]) {
+  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewWaterfall', 'waterfall'], ['viewTimeline', 'timeline']]) {
     const el = $(btn); if (el) el.classList.toggle('on', state.view === v);
   }
   const overview = OVERVIEW.includes(state.view);
   document.querySelector('main').classList.toggle('no-feed', overview);
   $('empty').style.display = 'none'; // only board/timeline turn it back on
-  for (const id of ['fleet', 'tableView', 'projects', 'usage', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
-  if (overview) { $('board').style.display = 'none'; $('timeline').style.display = 'none'; }
+  for (const id of ['fleet', 'tableView', 'projects', 'usage', 'flows', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
+  if (overview) { $('board').style.display = 'none'; $('timeline').style.display = 'none'; $('waterfall').style.display = 'none'; }
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
   $('statbar').style.display = overview ? 'none' : '';
@@ -693,14 +784,17 @@ function setTabs() {
   else if (state.view === 'table') loadTable();
   else if (state.view === 'projects') loadProjects();
   else if (state.view === 'usage') loadUsage();
+  else if (state.view === 'flows') loadFlows();
   else if (state.view === 'constellation') loadConstellation();
   else if (state.view === 'machines') loadMachines();
 }
 
 function render() {
-  if (state.view === 'fleet') return;
+  if (OVERVIEW.includes(state.view)) return;
   renderStatbar();
-  if (state.view === 'board') renderBoard(); else renderTimeline();
+  if (state.view === 'board') renderBoard();
+  else if (state.view === 'waterfall') renderWaterfall();
+  else renderTimeline();
   renderFeed();
   $('scrub').max = state.data.events.length;
   $('scrub').value = state.scrub;
@@ -740,7 +834,7 @@ function sparkline(recentTs, firstTs, lastTs) {
 }
 
 function renderBoard() {
-  $('board').style.display = ''; $('timeline').style.display = 'none';
+  $('board').style.display = ''; $('timeline').style.display = 'none'; $('waterfall').style.display = 'none';
   const stage = $('stage'), cards = $('cards'), svg = $('edges');
   const W = stage.clientWidth, H = stage.clientHeight;
   if (!state.file && !state.data.events.length) { // no session chosen yet
@@ -819,15 +913,84 @@ function renderBoard() {
     const x1 = mp.x + 274, y1 = mp.y + 58, x2 = p.x, y2 = p.y + (compact ? 30 : 48);
     const mx = (x1 + x2) / 2;
     const hot = state.hot.has(a.id);
+    const st = statusOf(a);
+    // typed lifecycle edges: returned=green solid+arrow, failed=red, retrying=red dash,
+    // stalled=amber dash, in-flight=dashed neutral, active=teal glow
+    const edgeCls =
+      st === 'failed' ? 'edge-failed' :
+      st === 'retrying' ? 'edge-retrying' :
+      st === 'stalled' ? 'edge-stalled' :
+      a.done ? 'edge-done' : 'edge-pending';
     const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
-    paths += `<path class="edge ${hot ? 'hot' : ''}" d="${d}"/>`;
+    paths += `<path class="edge ${edgeCls} ${hot ? 'hot' : ''}" d="${d}"/>`;
+    if (a.done && !compact) paths += `<circle class="edge-cap ${st === 'failed' ? 'cap-failed' : 'cap-done'}" cx="${x2}" cy="${y2}" r="3.5"/>`;
+    // task label riding the edge (what work is flowing, not just topology)
+    if (!compact && a.task) {
+      const label = a.task.replace(/\s+/g, ' ').slice(0, 34) + (a.task.length > 34 ? '…' : '');
+      paths += `<text class="edge-label" x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 6}" text-anchor="middle">${esc(label)}</text>`;
+    }
+    if (st === 'retrying' || st === 'stalled') {
+      paths += `<text class="edge-state ${st === 'retrying' ? 'es-retry' : 'es-stall'}" x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 + 12}" text-anchor="middle">${st === 'retrying' ? '↻ retrying' : '⏸ stalled ' + (a.pendingTool ? 'in ' + esc(a.pendingTool.tool) : '')}</text>`;
+    }
     if (hot) paths += `<circle class="pulse-dot" r="4"><animateMotion dur="1s" repeatCount="indefinite" path="${d}"/></circle>`;
   }
   svg.innerHTML = paths;
 }
 
+// ---------- WATERFALL view (nested span tree with rollups) ----------
+const wfCollapsed = new Set();
+function renderWaterfall() {
+  $('board').style.display = 'none'; $('timeline').style.display = 'none';
+  $('waterfall').style.display = '';
+  const evs = state.data.events.filter(e => e.ts);
+  if (!evs.length) { $('waterfall').innerHTML = '<div class="fleet-loading">Pick a session to see its span waterfall.</div>'; return; }
+  const t0 = new Date(evs[0].ts).getTime();
+  const t1 = Math.max(...evs.map(e => new Date(e.endTs || e.ts).getTime()));
+  const span = Math.max(t1 - t0, 1000);
+  const pct = ts => ((new Date(ts).getTime() - t0) / span * 100);
+
+  // hierarchy: main first, then each subagent (indent 1), spans within
+  const agents = agentStateAt(state.data.events.length);
+  const main = agents.find(a => a.id === 'main');
+  const ordered = [main, ...agents.filter(a => a.id !== 'main')].filter(Boolean);
+  let rows = '';
+  for (const a of ordered) {
+    const depth = a.id === 'main' ? 0 : 1;
+    const aEvs = evs.filter(e => e.agent === a.id && (e.kind === 'tool-call' || e.kind === 'spawn'));
+    const aDur = a.firstTs && a.lastTs ? new Date(a.lastTs) - new Date(a.firstTs) : 0;
+    const collapsed = wfCollapsed.has(a.id);
+    const st = statusOf(a);
+    // agent rollup row: span bar over its active window + aggregate stats
+    rows += `<div class="wf-row wf-agent" data-agent="${esc(a.id)}" style="padding-left:${depth * 22 + 8}px">
+      <span class="wf-caret">${aEvs.length ? (collapsed ? '▸' : '▾') : ''}</span>
+      <span class="wf-name" style="color:${a.id === 'main' ? 'var(--accent2)' : 'var(--text)'}">${a.id === 'main' ? '🛰️' : '🤖'} ${esc(a.name || a.id)}</span>
+      <span class="wf-roll">${aEvs.length} calls · ${fmtTok(a.outTokens)} out · ${fmtDur(aDur)}${a.cost >= 0.005 ? ' · ~' + fmtUsd(a.cost) : ''}${a.errors ? ` · <b class="ferr">${a.errors} err</b>` : ''} <span class="status ${st}">${st}</span></span>
+      <span class="wf-track"><span class="wf-bar wf-bar-agent" style="left:${a.firstTs ? pct(a.firstTs).toFixed(2) : 0}%;width:${a.firstTs && a.lastTs ? Math.max(pct(a.lastTs) - pct(a.firstTs), 0.4).toFixed(2) : 0.4}%"></span></span>
+    </div>`;
+    if (collapsed) continue;
+    for (const e of aEvs.slice(-400)) {
+      const end = e.endTs || e.ts;
+      const w = Math.max(pct(end) - pct(e.ts), 0.25);
+      const durMs = e.endTs ? new Date(e.endTs) - new Date(e.ts) : 0;
+      const cls = e.error ? 'wf-err' : e.kind === 'spawn' ? 'wf-spawn' : 'wf-tool';
+      rows += `<div class="wf-row wf-span" data-seq="${e.seq}" style="padding-left:${depth * 22 + 34}px">
+        <span class="wf-name dim">${e.retry ? `<b class="es-retry">↻${e.retry}</b> ` : ''}${esc((e.tool || '').replace(/^mcp__[^_]+__/, ''))}</span>
+        <span class="wf-roll">${durMs ? fmtDur(durMs) : '…'}</span>
+        <span class="wf-track"><span class="wf-bar ${cls}" style="left:${pct(e.ts).toFixed(2)}%;width:${w.toFixed(2)}%" title="${esc((e.text || '').slice(0, 100))}"></span></span>
+      </div>`;
+    }
+  }
+  $('waterfall').innerHTML = `<div class="wf-head"><span>agent / span</span><span></span><span class="wf-axis">${new Date(t0).toLocaleTimeString()} — ${new Date(t1).toLocaleTimeString()} (${fmtDur(span)})</span></div>` + rows;
+  $('waterfall').querySelectorAll('.wf-agent').forEach(r => r.onclick = () => {
+    const id = r.dataset.agent;
+    if (wfCollapsed.has(id)) wfCollapsed.delete(id); else wfCollapsed.add(id);
+    renderWaterfall();
+  });
+  $('waterfall').querySelectorAll('.wf-span').forEach(r => r.onclick = e => { e.stopPropagation(); openDrawer(Number(r.dataset.seq)); });
+}
+
 function renderTimeline() {
-  $('board').style.display = 'none'; $('timeline').style.display = '';
+  $('board').style.display = 'none'; $('timeline').style.display = ''; $('waterfall').style.display = 'none';
   const agents = agentStateAt(state.data.events.length);
   const evs = state.data.events.filter(e => e.ts);
   if (!evs.length) { $('timeline').innerHTML = '<div class="fleet-loading">Pick a session from the Fleet, Table, or Galaxy to view its timeline.</div>'; return; }
@@ -942,9 +1105,11 @@ $('viewFleet').onclick = () => { if (!BAKED) { state.view = 'fleet'; setTabs(); 
 $('viewTable').onclick = () => { if (!BAKED) { state.view = 'table'; setTabs(); } };
 $('viewProjects').onclick = () => { if (!BAKED) { state.view = 'projects'; setTabs(); } };
 $('viewUsage').onclick = () => { if (!BAKED) { state.view = 'usage'; setTabs(); } };
+$('viewFlows').onclick = () => { if (!BAKED) { state.view = 'flows'; setTabs(); } };
 $('viewConstellation').onclick = () => { if (!BAKED) { state.view = 'constellation'; setTabs(); } };
 $('viewMachines').onclick = () => { if (!BAKED) { state.view = 'machines'; setTabs(); } };
 $('viewBoard').onclick = () => { state.view = 'board'; setTabs(); render(); };
+$('viewWaterfall').onclick = () => { state.view = 'waterfall'; setTabs(); render(); };
 $('viewTimeline').onclick = () => { state.view = 'timeline'; setTabs(); render(); };
 $('exportBtn').onclick = () => {
   if (!state.file) return;
@@ -975,7 +1140,7 @@ if (BAKED) {
   state.scrub = state.data.events.length;
   document.title = 'Replay — ' + BAKED.title;
   $('sessionSel').style.display = 'none';
-  for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewUsage', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
+  for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewUsage', 'viewFlows', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
   $('exportBtn').style.display = 'none';
   $('liveBtn').style.display = 'none';
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'replay';
