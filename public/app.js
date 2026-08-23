@@ -154,7 +154,7 @@ function renderFleet() {
       const m = metaOf(s);
       return `
       <div class="fcard${m.archived ? ' is-archived' : ''}" data-file="${esc(s.file)}" data-sk="${esc(s.stableKey || '')}" draggable="true" style="border-left:3px solid ${col}">
-        ${s.stableKey ? '<button class="fcard-menu" title="organize">⋯</button>' : ''}
+        ${s.stableKey ? `<div class="fcard-actions"><button class="fcard-arch" title="${m.archived ? 'unarchive' : 'archive'}">${m.archived ? '⤴' : '🗄'}</button><button class="fcard-menu" title="organize">⋯</button></div>` : ''}
         <h3>${esc(s.title || s.session.slice(0, 8))}</h3>
         <div class="fproj"><span class="kind-badge" style="background:${col}22;color:${col}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span> ${esc(s.machine || '')} · ${esc(s.project.replace(/^[Cc⇄]+\s?[·]?\s?/, '').replace(/^[Cc]--Users-[^-]+-/, ''))}</div>
         ${cardBadges(s) ? `<div class="fbadges">${cardBadges(s)}</div>` : ''}
@@ -165,7 +165,7 @@ function renderFleet() {
           <span class="fcost"><b>~${fmtUsd(s.cost)}</b></span>
           ${s.errors ? `<span class="ferr"><b>${s.errors}</b> errors</span>` : ''}
         </div>
-        <div class="fdate">${new Date(s.mtime).toLocaleString()} · ${esc(String(s.session).replace(/^.*[\\:]/, '').slice(0, 8))}</div>
+        <div class="fdate"><span class="ago ${agoClass(s.mtime)}">${fmtAgo(s.mtime)}</span> · ${new Date(s.mtime).toLocaleString()}</div>
       </div>`;
     }).join('') + `</div>`;
   $('fleet').querySelectorAll('.fcard').forEach(c => {
@@ -173,6 +173,8 @@ function renderFleet() {
     c.onclick = () => openSession(c.dataset.file);
     const menu = c.querySelector('.fcard-menu');
     if (menu && s) menu.onclick = e => showCardMenu(e, s);
+    const arch = c.querySelector('.fcard-arch');
+    if (arch && s) arch.onclick = e => { e.stopPropagation(); setSessionMeta(s.stableKey, { archived: !metaOf(s).archived }); };
     if (s && s.stableKey) c.ondragstart = e => e.dataTransfer.setData('text/plain', s.stableKey);
   });
   wireFleetControls(renderFleet);
@@ -295,7 +297,7 @@ function renderTable() {
         <td class="num">${s.agents}</td><td class="num">${s.events}</td><td class="num">${s.toolCalls}</td>
         <td class="num">${fmtDur(s.durationMs)}</td><td class="num">${fmtTok(s.tokensOut)}</td>
         <td class="num fcost">~${fmtUsd(s.cost)}</td><td class="num ${s.errors ? 'ferr' : ''}">${s.errors || ''}</td>
-        <td class="num tdate">${new Date(s.mtime).toLocaleDateString()}</td>
+        <td class="num tdate"><span class="ago ${agoClass(s.mtime)}">${fmtAgo(s.mtime)}</span></td>
       </tr>`;
     }).join('') + `</tbody></table></div>`;
   $('tableView').querySelectorAll('th').forEach(th => { th.onclick = () => { const k = th.dataset.k; tableSort = { col: k, dir: tableSort.col === k ? -tableSort.dir : (cols.find(c => c.k === k).num ? -1 : 1) }; renderTable(); }; });
@@ -554,6 +556,19 @@ const fmtDur = ms => {
   const s = Math.round(ms / 1000);
   return s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m` : s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
 };
+// relative "time ago" — coarse, human
+const fmtAgo = t => {
+  const s = Math.round((Date.now() - t) / 1000);
+  if (s < 45) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  const d = Math.round(s / 86400);
+  if (d < 14) return `${d}d ago`;
+  if (d < 60) return `${Math.round(d / 7)}w ago`;
+  if (d < 365) return `${Math.round(d / 30)}mo ago`;
+  return `${(d / 365).toFixed(1)}y ago`;
+};
+const agoClass = t => { const h = (Date.now() - t) / 3.6e6; return h < 6 ? 'ago-fresh' : h < 72 ? 'ago-recent' : 'ago-stale'; };
 
 // ---------- render ----------
 const OVERVIEW = ['fleet', 'table', 'projects', 'constellation', 'machines'];

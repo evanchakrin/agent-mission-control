@@ -106,9 +106,17 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 
 /* card edit menu + badges */
 .fcard { position: relative; }
-.fcard-menu { position: absolute; top: 8px; right: 8px; background: var(--panel2); border: 1px solid var(--line); color: var(--dim); border-radius: 6px; width: 24px; height: 22px; cursor: pointer; font-size: 13px; line-height: 1; opacity: 0; transition: opacity .15s; }
-.fcard:hover .fcard-menu { opacity: 1; }
+.fcard-actions { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; opacity: 0; transition: opacity .15s; }
+.fcard:hover .fcard-actions { opacity: 1; }
+.fcard-arch, .fcard-menu { background: var(--panel2); border: 1px solid var(--line); color: var(--dim); border-radius: 6px; height: 22px; min-width: 24px; cursor: pointer; font-size: 12px; line-height: 1; padding: 0 5px; }
+.fcard-arch:hover { color: var(--amber); border-color: var(--amber); }
 .fcard-menu:hover { color: var(--accent); border-color: var(--accent); }
+
+/* relative-time pill */
+.ago { font-weight: 600; }
+.ago-fresh { color: var(--green); }
+.ago-recent { color: var(--text); }
+.ago-stale { color: var(--dim); }
 .fcard.is-archived { opacity: .55; }
 .fbadges { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 2px; }
 .mini-badge { font-size: 9.5px; padding: 1px 6px; border-radius: 7px; font-weight: 600; background: var(--panel2); color: var(--dim); }
