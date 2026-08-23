@@ -798,6 +798,10 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // lightweight identity ping — relays poll this every tick to detect a hub
+  // restart (in-memory store wiped) and trigger a full resend
+  if (url.pathname === '/v1/boot') return json(res, { boot: BOOT_ID });
+
   if (url.pathname === '/api/machines') return json(res, machineList());
 
   if (url.pathname === '/api/sessions' || url.pathname === '/api/fleet') {
@@ -881,6 +885,15 @@ async function runRelay(hub, machineName) {
   console.log(`Relaying local sessions → ${hub}/v1/relay as "${machineName}"`);
   console.log(`Watching transcripts in ${PROJECTS_DIR}`);
   const tick = async () => {
+    // detect hub restart up front, before any skip logic — a wiped hub gets a
+    // full resend even when no local session changed
+    try {
+      const b = await fetch(hub + '/v1/boot', { headers: TOKEN ? { 'x-relay-token': TOKEN } : {} }).then(r => r.json()).catch(() => null);
+      if (b && b.boot) {
+        if (hubBoot && b.boot !== hubBoot) { sent.clear(); console.log('hub restarted — resending all sessions'); }
+        hubBoot = b.boot;
+      }
+    } catch { /* hub down; sends below will fail and retry */ }
     for (const meta of [...listSessions(), ...codexList()]) {
       const isCodex = meta.file.startsWith('codex:');
       const sig = isCodex ? codexSignature(meta.file.slice(6)) : sessionSignature(resolveSessionPath(meta.file));

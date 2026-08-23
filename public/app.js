@@ -41,6 +41,63 @@ async function loadSessions() {
   sel.onchange = () => { if (sel.value) openSession(sel.value); };
 }
 
+// ---------- notifications ----------
+// A background poll of /api/fleet detects newly-errored sessions and runs that
+// finished (were active, now idle > N min). Fires desktop notifications + a bell.
+const notifs = [];
+const notifSeen = new Map(); // file -> {errors, lastMtime, wasActive}
+let notifTimer = null;
+function startNotifications() {
+  if (notifTimer || BAKED) return;
+  // seed baseline silently so we don't alert on the whole backlog at startup
+  fetch('/api/fleet').then(r => r.json()).then(fleet => {
+    for (const s of fleet) notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: Date.now() - s.mtime < 6e5 });
+    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+    notifTimer = setInterval(pollNotifications, 15000);
+  });
+}
+async function pollNotifications() {
+  let fleet;
+  try { fleet = await (await fetch('/api/fleet')).json(); } catch { return; }
+  for (const s of fleet) {
+    const prev = notifSeen.get(s.file);
+    if (!prev) { notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: Date.now() - s.mtime < 6e5 }); continue; }
+    if (s.errors > prev.errors) {
+      pushNotif('error', `${s.errors - prev.errors} new error${s.errors - prev.errors > 1 ? 's' : ''}`, s);
+    }
+    const nowActive = Date.now() - s.mtime < 6e5;
+    if (prev.active && !nowActive && s.durationMs > 6e5) {
+      pushNotif('done', `run finished · ${s.agents} agents · ~${fmtUsd(s.cost)}`, s);
+    }
+    notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: nowActive });
+  }
+}
+function pushNotif(type, msg, s) {
+  const n = { type, msg, title: s.title || s.session.slice(0, 8), file: s.file, machine: s.machine, kind: s.kind, at: Date.now() };
+  notifs.unshift(n);
+  if (notifs.length > 40) notifs.pop();
+  renderBell();
+  if ('Notification' in window && Notification.permission === 'granted') {
+    try { new Notification(`${type === 'error' ? '⚠️' : '✅'} ${n.title}`, { body: `${msg} · ${n.machine || ''}`, silent: type !== 'error' }); } catch { /* blocked */ }
+  }
+}
+function renderBell() {
+  const unread = notifs.filter(n => !n.read).length;
+  const bc = $('bellCount');
+  bc.style.display = unread ? '' : 'none'; bc.textContent = unread;
+  $('bell').classList.toggle('has', unread > 0);
+  $('notifList').innerHTML = notifs.length ? notifs.map(n => `
+    <div class="notif ${n.type}" data-file="${esc(n.file)}">
+      <span class="ni">${n.type === 'error' ? '⚠️' : '✅'}</span>
+      <div><div class="nt">${esc(n.title)}</div><div class="nm">${esc(n.msg)} · ${esc(n.machine || '')}</div></div>
+      <span class="ndot" style="background:${kindColor(n.kind)}"></span>
+    </div>`).join('') : '<div class="notif-empty">No alerts yet. Errors and finished long runs show here.</div>';
+  $('notifList').querySelectorAll('.notif[data-file]').forEach(el => el.onclick = () => { $('notifPanel').classList.remove('open'); openSession(el.dataset.file); });
+}
+$('bell').onclick = () => { $('notifPanel').classList.toggle('open'); notifs.forEach(n => n.read = true); renderBell(); };
+$('notifClear').onclick = (e) => { e.stopPropagation(); notifs.length = 0; renderBell(); };
+document.addEventListener('click', e => { if (!$('notifPanel').contains(e.target) && e.target !== $('bell') && !$('bell').contains(e.target)) $('notifPanel').classList.remove('open'); });
+
 let fleetCache = null;
 async function loadFleet() {
   if (!fleetCache) $('fleet').innerHTML = '<div class="fleet-loading">Scanning sessions…</div>';
@@ -645,4 +702,5 @@ if (BAKED) {
 } else {
   loadSessions();
   setTabs();
+  startNotifications();
 }
