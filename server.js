@@ -361,18 +361,27 @@ const codexMetaCache = new Map(); // path -> {size, meta}
 function codexMeta(file) {
   const hit = codexMetaCache.get(file.path);
   if (hit && hit.size === file.size) return hit.meta;
-  let meta = { cwd: null, threadSource: 'user' };
+  let meta = { cwd: null, threadSource: 'user', title: null };
   try {
     const fd = fs.openSync(file.path, 'r');
-    const buf = Buffer.alloc(Math.min(65536, file.size));
+    const buf = Buffer.alloc(Math.min(524288, file.size));
     fs.readSync(fd, buf, 0, buf.length, 0);
     fs.closeSync(fd);
     const head = buf.toString('utf8');
     // session_meta lines can exceed any fixed read (huge base_instructions), so
-    // regex the two fields we need rather than requiring a complete JSON line
+    // regex the fields we need rather than requiring a complete JSON line
     const cwd = /"cwd":"((?:[^"\\]|\\.)*)"/.exec(head);
     const src = /"thread_source":"([^"]*)"/.exec(head);
-    meta = { cwd: cwd ? JSON.parse('"' + cwd[1] + '"') : null, threadSource: src ? src[1] : 'user' };
+    // title: first real user prompt (skip injected <...> meta blocks)
+    let title = null;
+    const userMsg = /"role":"user","content":\[\{"type":"input_text","text":"((?:[^"\\]|\\.){1,300})/g;
+    let m;
+    while ((m = userMsg.exec(head))) {
+      let text;
+      try { text = JSON.parse('"' + m[1].replace(/\\$/, '') + '"'); } catch { continue; }
+      if (!text.startsWith('<') && !text.startsWith('# AGENTS.md') && !text.startsWith('Caveat:')) { title = clip(text.replace(/\s+/g, ' ').trim(), 70); break; }
+    }
+    meta = { cwd: cwd ? JSON.parse('"' + cwd[1] + '"') : null, threadSource: src ? src[1] : 'user', title };
   } catch { /* ignore */ }
   codexMetaCache.set(file.path, { size: file.size, meta });
   return meta;
@@ -385,7 +394,7 @@ function codexList() {
     .map(f => {
       const meta = codexMeta(f);
       const proj = meta.cwd ? path.basename(meta.cwd) : 'unknown';
-      return { project: 'Codex', file: 'codex:' + f.uuid, session: f.uuid, title: proj + ' · Codex', size: f.size, mtime: f.mtime, agentCount: 0 };
+      return { project: 'Codex · ' + proj, file: 'codex:' + f.uuid, session: f.uuid, title: meta.title || proj, size: f.size, mtime: f.mtime, agentCount: 0 };
     });
 }
 
@@ -629,6 +638,7 @@ function otelList() {
 // their own transcripts and POST parsed sessions here. Stored in memory,
 // keyed "relay:<machine>:<file>", and shown in the fleet like local sessions.
 const relaySessions = new Map(); // id -> {id, meta, version, result}
+const BOOT_ID = Math.random().toString(36).slice(2); // relay store is in-memory; clients resend when this changes
 
 function ingestRelay(body) {
   const id = 'relay:' + body.machine + ':' + body.file;
@@ -737,7 +747,7 @@ const server = http.createServer((req, res) => {
       try {
         const b = JSON.parse(body);
         if (!b.machine || !b.file || !b.result) throw new Error('need machine, file, result');
-        json(res, { ok: true, id: ingestRelay(b) });
+        json(res, { ok: true, id: ingestRelay(b), boot: BOOT_ID });
       } catch (e) {
         json(res, { error: e.message }, 400);
       }
@@ -823,6 +833,7 @@ const server = http.createServer((req, res) => {
 // parsed and POSTed to the hub, where it appears in the fleet.
 async function runRelay(hub, machineName) {
   const sent = new Map(); // file -> last signature
+  let hubBoot = null;     // hub restarts wipe its in-memory store; resend everything when its boot id changes
   console.log(`Relaying local sessions → ${hub}/v1/relay as "${machineName}"`);
   console.log(`Watching transcripts in ${PROJECTS_DIR}`);
   const tick = async () => {
@@ -830,19 +841,33 @@ async function runRelay(hub, machineName) {
       const isCodex = meta.file.startsWith('codex:');
       const sig = isCodex ? codexSignature(meta.file.slice(6)) : sessionSignature(resolveSessionPath(meta.file));
       if (!sig || sent.get(meta.file) === sig) continue;
-      const result = getResult(meta.file);
+      let result;
+      try { result = getResult(meta.file); } catch (e) { console.error(`parse failed ${meta.file}: ${e.message}`); continue; }
       if (!result) continue;
+      // keep POSTs under the hub's body cap — trim oldest events if needed
+      let body = JSON.stringify({ machine: machineName, file: meta.file, meta, result });
+      while (body.length > 35e6 && result.events.length > 500) {
+        result = { ...result, events: result.events.slice(Math.ceil(result.events.length / 2)) };
+        body = JSON.stringify({ machine: machineName, file: meta.file, meta, result });
+      }
       try {
         const r = await fetch(hub + '/v1/relay', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
-          body: JSON.stringify({ machine: machineName, file: meta.file, meta, result }),
+          body,
         });
-        if (r.ok) { sent.set(meta.file, sig); console.log(`sent ${meta.title || meta.session} (${sig.length > 40 ? sig.slice(0, 40) + '…' : sig})`); }
-        else console.error(`hub rejected ${meta.file}: ${r.status} ${await r.text()}`);
+        if (r.ok) {
+          sent.set(meta.file, sig);
+          const info = await r.json().catch(() => ({}));
+          if (info.boot && hubBoot && info.boot !== hubBoot) { sent.clear(); sent.set(meta.file, sig); }
+          if (info.boot) hubBoot = info.boot;
+          console.log(`sent ${meta.title || meta.session} (${Math.round(body.length / 1024)}KB)`);
+        } else {
+          console.error(`hub rejected ${meta.file}: ${r.status} ${await r.text()}`);
+        }
       } catch (e) {
-        console.error(`hub unreachable: ${e.message} — retrying`);
-        return; // try again next tick without marking anything sent
+        console.error(`send failed for ${meta.file}: ${e.message} — will retry`);
+        // keep going: one bad session must not block the rest
       }
     }
   };

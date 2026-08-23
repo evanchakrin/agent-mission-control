@@ -133,6 +133,7 @@ function setTabs() {
   const inSession = state.view !== 'fleet';
   document.querySelector('main').classList.toggle('no-feed', !inSession);
   $('fleet').style.display = inSession ? 'none' : '';
+  if (!inSession) { $('board').style.display = 'none'; $('timeline').style.display = 'none'; $('empty').style.display = 'none'; }
   $('feed').style.display = inSession ? '' : 'none';
   document.querySelector('footer').style.display = inSession ? '' : 'none';
   $('statbar').style.display = inSession ? '' : 'none';
