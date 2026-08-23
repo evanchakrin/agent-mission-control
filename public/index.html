@@ -9,7 +9,10 @@
 <body>
 <header>
   <h1>Agent Mission Control</h1>
-  <select id="sessionSel"></select>
+  <div class="spicker" id="spicker">
+    <button id="spickerBtn">— select session —</button>
+    <div id="spickerPanel"><input id="spickerSearch" type="text" placeholder="search sessions…"><div id="spickerList"></div></div>
+  </div>
   <div class="tabs">
     <button id="viewFleet" class="on">⌂ Fleet</button>
     <button id="viewTable">Table</button>

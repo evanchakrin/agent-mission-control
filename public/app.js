@@ -25,20 +25,45 @@ const state = {
   hot: new Map(), lastSeq: -1,
 };
 
-// ---------- sessions & fleet ----------
+// ---------- session picker (custom dropdown: color-coded, archived hidden) ----------
+let sessionsCache = [];
 async function loadSessions() {
-  const sessions = await (await fetch('/api/sessions')).json();
-  const sel = $('sessionSel');
-  sel.innerHTML = '<option value="">— select session —</option>';
-  for (const s of sessions) {
-    const opt = document.createElement('option');
-    opt.value = s.file;
-    const when = new Date(s.mtime).toLocaleString();
-    const agents = s.agentCount ? ` · ${s.agentCount} agents` : '';
-    opt.textContent = `${s.title || s.session.slice(0, 8)} — ${s.project.replace(/^[Cc]--Users-[^-]+-/, '')}${agents} (${when})`;
-    sel.appendChild(opt);
-  }
-  sel.onchange = () => { if (sel.value) openSession(sel.value); };
+  sessionsCache = await (await fetch('/api/sessions')).json();
+}
+function renderPicker(filter = '') {
+  const q = filter.toLowerCase();
+  const items = sessionsCache
+    .filter(s => !(s.stableKey && metaMap[s.stableKey] && metaMap[s.stableKey].archived)) // active only
+    .filter(s => !q || ((s.title || '') + ' ' + (s.machine || '') + ' ' + s.project).toLowerCase().includes(q))
+    .slice(0, 80);
+  $('spickerList').innerHTML = items.map(s => {
+    const col = kindColor(s.kind);
+    const m = metaMap[s.stableKey] || {};
+    const proj = projectById(m.projectId);
+    return `<div class="sp-item" data-file="${esc(s.file)}" style="border-left:3px solid ${col}">
+      <div class="sp-title">${m.pinned ? '★ ' : ''}${esc(s.title || s.session.slice(0, 8))}</div>
+      <div class="sp-meta"><span class="kind-badge" style="background:${col}22;color:${col}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span>
+        ${proj ? `<span class="mini-badge" style="background:${proj.color}22;color:${proj.color}">${esc(proj.name)}</span>` : ''}
+        <span>${esc(s.machine || '')}</span><span class="ago ${agoClass(s.mtime)}">${fmtAgo(s.mtime)}</span>${s.agentCount ? `<span>${s.agentCount} agents</span>` : ''}</div>
+    </div>`;
+  }).join('') || '<div class="sp-empty">no active sessions match</div>';
+  $('spickerList').querySelectorAll('.sp-item').forEach(el => el.onclick = () => { closePicker(); openSession(el.dataset.file); });
+}
+function closePicker() { $('spickerPanel').classList.remove('open'); }
+$('spickerBtn').onclick = async e => {
+  e.stopPropagation();
+  const open = $('spickerPanel').classList.toggle('open');
+  if (open) { await loadSessions(); renderPicker($('spickerSearch').value); $('spickerSearch').focus(); }
+};
+$('spickerSearch').oninput = () => renderPicker($('spickerSearch').value);
+$('spickerPanel').onclick = e => e.stopPropagation();
+document.addEventListener('click', closePicker);
+function setPickerLabel(file) {
+  const s = sessionsCache.find(x => x.file === file) || (fleetCache || []).find(x => x.file === file);
+  $('spickerBtn').innerHTML = s
+    ? `<span class="sp-dot" style="background:${kindColor(s.kind)}"></span>${esc((s.title || '').slice(0, 44))}`
+    : 'session';
+  state.fileTitle = s ? (s.title || '') : '';
 }
 
 // ---------- session/project metadata ----------
@@ -684,7 +709,7 @@ async function loadConstellation() {
 function openSession(file) {
   state.view = 'board';
   setTabs();
-  $('sessionSel').value = file;
+  setPickerLabel(file);
   connect(file);
 }
 
@@ -1118,7 +1143,7 @@ $('viewWaterfall').onclick = () => { state.view = 'waterfall'; setTabs(); render
 $('viewTimeline').onclick = () => { state.view = 'timeline'; setTabs(); render(); };
 $('exportBtn').onclick = () => {
   if (!state.file) return;
-  const title = $('sessionSel').selectedOptions[0]?.textContent.split(' — ')[0] || '';
+  const title = state.fileTitle || '';
   location.href = '/api/export?file=' + encodeURIComponent(state.file) + '&title=' + encodeURIComponent(title);
 };
 $('filterText').oninput = () => { state.filterText = $('filterText').value; renderFeed(); };
@@ -1144,7 +1169,7 @@ if (BAKED) {
   state.data = BAKED.data;
   state.scrub = state.data.events.length;
   document.title = 'Replay — ' + BAKED.title;
-  $('sessionSel').style.display = 'none';
+  $('spicker').style.display = 'none';
   for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewUsage', 'viewFlows', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
   $('exportBtn').style.display = 'none';
   $('liveBtn').style.display = 'none';
