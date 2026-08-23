@@ -590,8 +590,9 @@ function setTabs() {
   }
   const overview = OVERVIEW.includes(state.view);
   document.querySelector('main').classList.toggle('no-feed', overview);
+  $('empty').style.display = 'none'; // only board/timeline turn it back on
   for (const id of ['fleet', 'tableView', 'projects', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
-  if (overview) { $('board').style.display = 'none'; $('timeline').style.display = 'none'; $('empty').style.display = 'none'; }
+  if (overview) { $('board').style.display = 'none'; $('timeline').style.display = 'none'; }
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
   $('statbar').style.display = overview ? 'none' : '';
