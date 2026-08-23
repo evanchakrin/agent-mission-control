@@ -820,7 +820,46 @@ function renderPlaybooks() {
 }
 
 // ---------- BRAIN view (memories, hooks, agent configs on this machine) ----------
-let brainItems = [], brainCurrent = null, brainDirty = false;
+let brainItems = [], brainCurrent = null, brainDirty = false, brainMode = 'view';
+
+// pretty JSON with lightweight syntax coloring (tokenize raw text, escape per token)
+function highlightJSON(src) {
+  let text = src;
+  try { text = JSON.stringify(JSON.parse(src), null, 2); } catch { /* leave as-is */ }
+  const re = /("(?:[^"\\]|\\.)*")(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
+  let out = '', last = 0, m;
+  while ((m = re.exec(text))) {
+    out += esc(text.slice(last, m.index));
+    if (m[1]) out += m[2] ? `<span class="hj-key">${esc(m[1])}</span>${m[2]}` : `<span class="hj-str">${esc(m[1])}</span>`;
+    else if (m[3]) out += `<span class="hj-kw">${m[3]}</span>`;
+    else out += `<span class="hj-num">${esc(m[0])}</span>`;
+    last = m.index + m[0].length;
+  }
+  return out + esc(text.slice(last));
+}
+// minimal, safe markdown renderer (escape first, then transform)
+function renderMD(src) {
+  const lines = esc(src).split('\n');
+  let out = '', inCode = false, inList = false;
+  const closeList = () => { if (inList) { out += '</ul>'; inList = false; } };
+  for (const raw of lines) {
+    if (raw.startsWith('```')) { closeList(); out += inCode ? '</pre>' : '<pre class="md-code">'; inCode = !inCode; continue; }
+    if (inCode) { out += raw + '\n'; continue; }
+    let l = raw
+      .replace(/`([^`]+)`/g, '<code class="md-ic">$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+      .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<i>$2</i>')
+      .replace(/\[\[([^\]]+)\]\]/g, '<span class="md-wiki">$1</span>');
+    const h = /^(#{1,4})\s+(.*)/.exec(l);
+    if (h) { closeList(); out += `<div class="md-h md-h${h[1].length}">${h[2]}</div>`; continue; }
+    if (/^\s*[-*]\s+/.test(l)) { if (!inList) { out += '<ul class="md-ul">'; inList = true; } out += `<li>${l.replace(/^\s*[-*]\s+/, '')}</li>`; continue; }
+    closeList();
+    if (/^---+\s*$/.test(l)) { out += '<hr class="md-hr">'; continue; }
+    out += l ? `<p class="md-p">${l}</p>` : '';
+  }
+  closeList(); if (inCode) out += '</pre>';
+  return out;
+}
 async function loadBrain() {
   try {
     const r = await (await fetch('/api/brain')).json();
@@ -840,20 +879,33 @@ function renderBrain() {
         </div>`).join('')).join('') || '<div class="dim" style="padding:10px">no brain files found</div>'}
     </div>
     <div class="brain-main">
-      ${brainCurrent ? `
+      ${brainCurrent ? (() => {
+        const isJSON = /\.json$/i.test(brainCurrent.name) || /^\s*[{[]/.test(brainCurrent.content);
+        const isMD = /\.md/i.test(brainCurrent.name);
+        const viewable = isJSON || isMD;
+        return `
         <div class="brain-bar">
           <b>${esc(brainCurrent.name)}</b>
           <span class="dim" style="font-size:10.5px">${esc(brainCurrent.path)}</span>
+          ${viewable ? `<div class="seg" id="brainModeSeg"><button data-m="view" class="${brainMode === 'view' ? 'on' : ''}">Read</button><button data-m="edit" class="${brainMode === 'edit' ? 'on' : ''}">Edit</button></div>` : ''}
           <button id="brainSave" class="mini-btn" ${brainDirty ? '' : 'disabled'}>${brainDirty ? '💾 Save' : 'Saved'}</button>
         </div>
-        <textarea id="brainEditor" spellcheck="false">${esc(brainCurrent.content)}</textarea>`
+        ${brainMode === 'view' && viewable
+          ? `<div id="brainViewer" class="${isJSON ? 'bv-json' : 'bv-md'}">${isJSON ? `<pre class="hj">${highlightJSON(brainCurrent.content)}</pre>` : renderMD(brainCurrent.content)}</div>`
+          : `<textarea id="brainEditor" spellcheck="false">${esc(brainCurrent.content)}</textarea>`}`;
+      })()
         : '<div class="brain-empty">Pick a file on the left.<br><span class="dim">These are the instructions and memories your agents wake up with — editing them here changes how every future session behaves.</span></div>'}
     </div>`;
   $('brain').querySelectorAll('.brain-item').forEach(el => el.onclick = async () => {
     if (brainDirty && !confirm('Discard unsaved changes?')) return;
     const r = await (await fetch('/api/brain/file?id=' + el.dataset.id)).json();
     if (r.error) return alert(r.error);
-    brainCurrent = r; brainDirty = false; renderBrain();
+    brainCurrent = r; brainDirty = false; brainMode = 'view'; renderBrain();
+  });
+  $('brain').querySelector('#brainModeSeg')?.querySelectorAll('button').forEach(b => b.onclick = () => {
+    if (brainDirty && b.dataset.m === 'view' && !confirm('Switch to Read and discard unsaved edits?')) return;
+    if (brainDirty && b.dataset.m === 'view') brainDirty = false;
+    brainMode = b.dataset.m; renderBrain();
   });
   const ed = $('brainEditor');
   if (ed) {
