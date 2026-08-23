@@ -136,8 +136,8 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .mini-btn { background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 7px; padding: 6px 12px; cursor: pointer; font-size: 12px; }
 .mini-btn:hover { border-color: var(--accent); color: var(--accent); }
 .ro-warn { font-size: 11px; color: var(--amber); }
-.proj-board { display: flex; gap: 14px; align-items: flex-start; overflow-x: auto; padding-bottom: 10px; }
-.proj-col { flex: 0 0 300px; background: var(--panel); border: 1px solid var(--line); border-top: 3px solid var(--pc); border-radius: 10px; min-height: 120px; }
+.proj-board { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; align-items: start; padding-bottom: 10px; }
+.proj-col { background: var(--panel); border: 1px solid var(--line); border-top: 3px solid var(--pc); border-radius: 10px; min-height: 120px; }
 .proj-col.drag-over { border-color: var(--accent); box-shadow: 0 0 16px rgba(94,234,212,.25); }
 .proj-col-head { display: flex; align-items: center; gap: 8px; padding: 11px 13px; font-size: 13px; font-weight: 600; border-bottom: 1px solid var(--line); }
 .proj-col-head .pcn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -150,6 +150,22 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .pchip-t { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pchip-m { font-size: 10px; color: var(--dim); margin-top: 2px; }
 .proj-empty { font-size: 11px; color: var(--dim); text-align: center; padding: 16px 8px; border: 1px dashed var(--line); border-radius: 7px; }
+
+/* usage view */
+#usage { position: absolute; inset: 0; overflow: auto; padding: 22px; }
+.usage-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.utile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.utile .ul { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+.utile .uv { font-size: 20px; font-weight: 700; margin-top: 4px; }
+.utile .uv.small { font-size: 12px; font-weight: 500; color: var(--dim); }
+.utile .uv.accent { color: var(--accent); }
+.usage-legend { display: flex; gap: 16px; font-size: 11px; margin-bottom: 8px; }
+.usage-chart-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+.usage-chart .ubar { rx: 2; }
+.usage-chart .ubar:hover { opacity: .82; }
+.usage-chart .ubar-total { font-size: 9.5px; fill: var(--dim); }
+.usage-chart .ux-label { font-size: 9.5px; fill: var(--dim); }
+.usage-chart .uaxis { stroke: var(--line); stroke-width: 1; }
 
 /* constellation */
 #constellation { position: absolute; inset: 0; overflow: hidden; }

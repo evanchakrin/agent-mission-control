@@ -361,6 +361,90 @@ function renderProjects() {
 }
 const PROJ_COLORS = ['#fb7185', '#60a5fa', '#c084fc', '#34d399', '#fbbf24', '#f472b6', '#22d3ee', '#a3e635'];
 
+// ---------- USAGE view (tokens / agents / cost over time) ----------
+let usageGran = 'month', usageMetric = 'cost';
+async function loadUsage() {
+  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  renderUsage();
+}
+function bucketKey(ts, gran) {
+  const d = new Date(ts);
+  const y = d.getFullYear(), mo = String(d.getMonth() + 1).padStart(2, '0'), da = String(d.getDate()).padStart(2, '0');
+  if (gran === 'year') return `${y}`;
+  if (gran === 'month') return `${y}-${mo}`;
+  if (gran === 'week') { const oneJan = new Date(y, 0, 1); const wk = Math.ceil(((d - oneJan) / 86400000 + oneJan.getDay() + 1) / 7); return `${y}-W${String(wk).padStart(2, '0')}`; }
+  return `${y}-${mo}-${da}`;
+}
+function metricVal(s, metric) {
+  if (metric === 'cost') return s.cost || 0;
+  if (metric === 'tokens') return (s.tokensIn || 0) + (s.tokensOut || 0);
+  if (metric === 'agents') return s.agents || 0;
+  return 1; // sessions
+}
+const METRIC_LABEL = { cost: 'Est. cost', tokens: 'Tokens', agents: 'Agents', sessions: 'Sessions' };
+const fmtMetric = (v, m) => m === 'cost' ? fmtUsd(v) : m === 'tokens' ? fmtTok(v) : String(Math.round(v));
+
+function renderUsage() {
+  const data = (fleetCache || []).filter(s => s.mtime);
+  // bucket -> {kind -> sum}
+  const buckets = new Map();
+  for (const s of data) {
+    const k = bucketKey(s.mtime, usageGran);
+    if (!buckets.has(k)) buckets.set(k, { claude: 0, codex: 0, otel: 0, total: 0, sessions: 0 });
+    const b = buckets.get(k);
+    const v = metricVal(s, usageMetric);
+    b[s.kind] = (b[s.kind] || 0) + v; b.total += v; b.sessions++;
+  }
+  const keys = [...buckets.keys()].sort();
+  const totAll = { cost: 0, tokensIn: 0, tokensOut: 0, agents: 0, sessions: data.length };
+  for (const s of data) { totAll.cost += s.cost || 0; totAll.tokensIn += s.tokensIn || 0; totAll.tokensOut += s.tokensOut || 0; totAll.agents += s.agents || 0; }
+  const range = data.length ? `${new Date(Math.min(...data.map(s => s.mtime))).toLocaleDateString()} – ${new Date(Math.max(...data.map(s => s.mtime))).toLocaleDateString()}` : '—';
+
+  // summary tiles
+  const tiles = `<div class="usage-tiles">
+    <div class="utile"><div class="ul">Total est. cost</div><div class="uv accent">~${fmtUsd(totAll.cost)}</div></div>
+    <div class="utile"><div class="ul">Tokens in / out</div><div class="uv">${fmtTok(totAll.tokensIn)} / ${fmtTok(totAll.tokensOut)}</div></div>
+    <div class="utile"><div class="ul">Agents</div><div class="uv">${totAll.agents}</div></div>
+    <div class="utile"><div class="ul">Sessions</div><div class="uv">${totAll.sessions}</div></div>
+    <div class="utile"><div class="ul">Range</div><div class="uv small">${range}</div></div>
+  </div>`;
+
+  // chart geometry (horizontal scroll if many buckets)
+  const max = Math.max(...keys.map(k => buckets.get(k).total), 1);
+  const BW = 46, GAP = 10, H = 260, PAD = 34;
+  const chartW = Math.max(keys.length * (BW + GAP) + PAD, 300);
+  const y = v => (H - PAD) - (v / max) * (H - PAD - 10);
+  const order = ['claude', 'codex', 'otel'];
+  let bars = '';
+  keys.forEach((k, i) => {
+    const b = buckets.get(k);
+    const x = PAD + i * (BW + GAP);
+    let yTop = H - PAD;
+    for (const kind of order) {
+      const v = b[kind] || 0; if (!v) continue;
+      const h = (v / max) * (H - PAD - 10);
+      bars += `<rect class="ubar" x="${x}" y="${(yTop - h).toFixed(1)}" width="${BW}" height="${h.toFixed(1)}" fill="${kindColor(kind)}"><title>${k} · ${AGENT_KIND[kind].label}: ${fmtMetric(v, usageMetric)}</title></rect>`;
+      yTop -= h;
+    }
+    bars += `<text class="ubar-total" x="${x + BW / 2}" y="${(y(b.total) - 5).toFixed(1)}" text-anchor="middle">${fmtMetric(b.total, usageMetric)}</text>`;
+    const label = usageGran === 'day' ? k.slice(5) : usageGran === 'month' ? k : k;
+    bars += `<text class="ux-label" x="${x + BW / 2}" y="${H - PAD + 16}" text-anchor="middle" transform="rotate(35 ${x + BW / 2} ${H - PAD + 16})">${label}</text>`;
+  });
+  bars += `<line class="uaxis" x1="${PAD - 4}" y1="${H - PAD}" x2="${chartW}" y2="${H - PAD}"/>`;
+
+  const grans = [['day', 'Day'], ['week', 'Week'], ['month', 'Month'], ['year', 'Year']];
+  const metrics = [['cost', 'Cost'], ['tokens', 'Tokens'], ['agents', 'Agents'], ['sessions', 'Sessions']];
+  $('usage').innerHTML =
+    `<div class="fleet-head"><h2>Usage over time — ${METRIC_LABEL[usageMetric]}</h2>
+      <div class="seg" id="metricSeg">${metrics.map(([v, l]) => `<button data-m="${v}" class="${usageMetric === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+      <div class="seg" id="granSeg">${grans.map(([v, l]) => `<button data-g="${v}" class="${usageGran === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+    </div>` + tiles +
+    `<div class="usage-legend"><span style="color:${kindColor('claude')}">■ Claude</span><span style="color:${kindColor('codex')}">■ Codex</span><span style="color:${kindColor('otel')}">■ OTLP</span></div>` +
+    `<div class="usage-chart-wrap"><svg width="${chartW}" height="${H}" class="usage-chart">${bars}</svg></div>`;
+  $('metricSeg').querySelectorAll('button').forEach(b => b.onclick = () => { usageMetric = b.dataset.m; renderUsage(); });
+  $('granSeg').querySelectorAll('button').forEach(b => b.onclick = () => { usageGran = b.dataset.g; renderUsage(); });
+}
+
 // ---------- MACHINES view ----------
 async function loadMachines() {
   const [machinesData, fleet] = await Promise.all([
@@ -583,15 +667,15 @@ const fmtAgo = t => {
 const agoClass = t => { const h = (Date.now() - t) / 3.6e6; return h < 6 ? 'ago-fresh' : h < 72 ? 'ago-recent' : 'ago-stale'; };
 
 // ---------- render ----------
-const OVERVIEW = ['fleet', 'table', 'projects', 'constellation', 'machines'];
+const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'constellation', 'machines'];
 function setTabs() {
-  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewTimeline', 'timeline']]) {
+  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewTimeline', 'timeline']]) {
     const el = $(btn); if (el) el.classList.toggle('on', state.view === v);
   }
   const overview = OVERVIEW.includes(state.view);
   document.querySelector('main').classList.toggle('no-feed', overview);
   $('empty').style.display = 'none'; // only board/timeline turn it back on
-  for (const id of ['fleet', 'tableView', 'projects', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
+  for (const id of ['fleet', 'tableView', 'projects', 'usage', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
   if (overview) { $('board').style.display = 'none'; $('timeline').style.display = 'none'; }
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
@@ -600,6 +684,7 @@ function setTabs() {
   if (state.view === 'fleet') loadFleet();
   else if (state.view === 'table') loadTable();
   else if (state.view === 'projects') loadProjects();
+  else if (state.view === 'usage') loadUsage();
   else if (state.view === 'constellation') loadConstellation();
   else if (state.view === 'machines') loadMachines();
 }
@@ -848,6 +933,7 @@ $('liveBtn').onclick = () => {
 $('viewFleet').onclick = () => { if (!BAKED) { state.view = 'fleet'; setTabs(); } };
 $('viewTable').onclick = () => { if (!BAKED) { state.view = 'table'; setTabs(); } };
 $('viewProjects').onclick = () => { if (!BAKED) { state.view = 'projects'; setTabs(); } };
+$('viewUsage').onclick = () => { if (!BAKED) { state.view = 'usage'; setTabs(); } };
 $('viewConstellation').onclick = () => { if (!BAKED) { state.view = 'constellation'; setTabs(); } };
 $('viewMachines').onclick = () => { if (!BAKED) { state.view = 'machines'; setTabs(); } };
 $('viewBoard').onclick = () => { state.view = 'board'; setTabs(); render(); };
@@ -881,7 +967,7 @@ if (BAKED) {
   state.scrub = state.data.events.length;
   document.title = 'Replay — ' + BAKED.title;
   $('sessionSel').style.display = 'none';
-  for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
+  for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewUsage', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
   $('exportBtn').style.display = 'none';
   $('liveBtn').style.display = 'none';
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'replay';
