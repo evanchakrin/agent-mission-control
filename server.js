@@ -658,7 +658,30 @@ function ingestRelay(body) {
     id, machine: body.machine, meta: body.meta || {},
     version: (prev ? prev.version : 0) + 1, result: body.result,
   });
+  machines.set(body.machine, { name: body.machine, ips: Array.isArray(body.ips) ? body.ips : [], lastSeen: Date.now(), remote: true });
   return id;
+}
+
+// ---------- machines registry (read-only telemetry) ----------
+const machines = new Map(); // name -> {name, ips, lastSeen, remote}
+
+function localIPs() {
+  return Object.values(os.networkInterfaces()).flat()
+    .filter(i => i && i.family === 'IPv4' && !i.internal)
+    .map(i => i.address);
+}
+
+function machineList() {
+  const localName = os.hostname();
+  const local = { name: localName, ips: localIPs(), lastSeen: Date.now(), remote: false };
+  return [local, ...[...machines.values()].filter(m => m.name !== localName)];
+}
+
+// Which agent kind produced a session, from its source-prefixed file id.
+function agentKindOf(file) {
+  if (file.startsWith('codex:') || file.includes(':codex:')) return 'codex';
+  if (file.startsWith('otel:')) return 'otel';
+  return 'claude';
 }
 
 function relayList() {
@@ -705,8 +728,10 @@ function sessionSummary(meta) {
   if (!r) return null;
   const evs = r.events;
   const first = evs.find(e => e.ts), last = [...evs].reverse().find(e => e.ts);
+  const machine = meta.file.startsWith('relay:') ? meta.file.split(':')[1] : os.hostname();
   return {
     file: meta.file, project: meta.project, session: meta.session, title: meta.title, mtime: meta.mtime,
+    kind: agentKindOf(meta.file), machine,
     agents: r.agents.length, events: evs.length,
     toolCalls: evs.filter(e => e.kind === 'tool-call' || e.kind === 'spawn').length,
     errors: evs.filter(e => e.error).length,
@@ -772,6 +797,8 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
+
+  if (url.pathname === '/api/machines') return json(res, machineList());
 
   if (url.pathname === '/api/sessions' || url.pathname === '/api/fleet') {
     const all = [...relayList(), ...otelList(), ...listSessions(), ...codexList()].sort((a, b) => b.mtime - a.mtime);
@@ -862,10 +889,11 @@ async function runRelay(hub, machineName) {
       try { result = getResult(meta.file); } catch (e) { console.error(`parse failed ${meta.file}: ${e.message}`); continue; }
       if (!result) continue;
       // keep POSTs under the hub's body cap — trim oldest events if needed
-      let body = JSON.stringify({ machine: machineName, file: meta.file, meta, result });
+      const ips = localIPs();
+      let body = JSON.stringify({ machine: machineName, file: meta.file, meta, result, ips });
       while (body.length > 35e6 && result.events.length > 500) {
         result = { ...result, events: result.events.slice(Math.ceil(result.events.length / 2)) };
-        body = JSON.stringify({ machine: machineName, file: meta.file, meta, result });
+        body = JSON.stringify({ machine: machineName, file: meta.file, meta, result, ips });
       }
       try {
         const r = await fetch(hub + '/v1/relay', {

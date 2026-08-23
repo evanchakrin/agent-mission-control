@@ -42,6 +42,15 @@ Claude Code writes transcripts under `~/.claude/projects/<project-slug>/`:
 
 The server tails all of these (700 ms polling, whole-parse cached by a size signature over every file) and streams normalized events to the browser over Server-Sent Events. Subagents are matched to the `Agent`/`Task` calls that spawned them by the agent id embedded in the tool result, with timestamp-order pairing as a fallback; legacy inline `isSidechain` transcripts are also supported.
 
+## Command center views
+
+The overview has four lenses, all color-coded by agent type (Claude coral, Codex blue, OTLP violet):
+
+- **Fleet** — session cards with a search box and filters (agent type, machine).
+- **Table** — every session as a sortable row (click any column header); same filters.
+- **Galaxy** — a force-directed constellation: each machine is a sun, each session a star orbiting it, sized by cost and glowing when recently active. Drag stars, scroll to zoom, click to open.
+- **Machines** — one card per machine with its IP addresses, live/idle status, session and agent counts, cost, and agent-type breakdown.
+
 ## Beyond Claude Code: OpenTelemetry ingestion
 
 The server is also an OTLP/HTTP trace receiver. Any OpenTelemetry-instrumented agent framework (CrewAI, LangGraph, AutoGen, OpenLIT, custom SDK code) can stream spans to it, and the session appears live in the Fleet view alongside your Claude Code sessions — same board, timeline, playback, and cost analytics.

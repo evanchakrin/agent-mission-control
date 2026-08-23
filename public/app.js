@@ -4,6 +4,14 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '
 
 const BAKED = window.__BAKED__ || null; // standalone replay export mode
 
+// agent-type identity: color + label, used across cards, table, and constellation
+const AGENT_KIND = {
+  claude: { label: 'Claude', color: '#fb7185' },   // coral
+  codex: { label: 'Codex', color: '#60a5fa' },     // blue
+  otel: { label: 'OTLP', color: '#c084fc' },        // violet
+};
+const kindColor = k => (AGENT_KIND[k] || AGENT_KIND.claude).color;
+
 const KINDS = ['user-text', 'user-queued', 'assistant-text', 'tool-call', 'tool-result', 'spawn', 'spawn-result'];
 const KIND_LABEL = { 'user-text': 'user', 'user-queued': 'queued', 'assistant-text': 'reply', 'tool-call': 'tool', 'tool-result': 'result', 'spawn': 'spawn', 'spawn-result': 'return' };
 const KIND_COLOR = { 'user-text': '#f87171', 'user-queued': '#f87171', 'assistant-text': '#fbbf24', 'tool-call': '#818cf8', 'tool-result': '#60a5fa', 'spawn': '#5eead4', 'spawn-result': '#34d399' };
@@ -43,19 +51,17 @@ async function loadFleet() {
 let fleetFilter = '';
 function renderFleet() {
   const fleet = fleetCache || [];
-  const q = fleetFilter.toLowerCase();
-  const shown = q ? fleet.filter(s => ((s.title || '') + ' ' + s.project + ' ' + s.session).toLowerCase().includes(q)) : fleet;
+  const shown = filteredFleet();
   const totCost = shown.reduce((n, s) => n + s.cost, 0);
   const totAgents = shown.reduce((n, s) => n + s.agents, 0);
   $('fleet').innerHTML =
-    `<div class="fleet-head">
-       <h2>Fleet — ${shown.length}${q ? '/' + fleet.length : ''} sessions · ${totAgents} agents · ~${fmtUsd(totCost)}</h2>
-       <input id="fleetSearch" type="text" placeholder="search sessions… (title, machine, project)" value="${esc(fleetFilter)}">
-     </div>` +
-    `<div class="fleet-grid">` + shown.map(s => `
-      <div class="fcard" data-file="${esc(s.file)}">
+    fleetControls(shown.length, fleet.length, totAgents, totCost) +
+    `<div class="fleet-grid">` + shown.map(s => {
+      const col = kindColor(s.kind);
+      return `
+      <div class="fcard" data-file="${esc(s.file)}" style="border-left:3px solid ${col}">
         <h3>${esc(s.title || s.session.slice(0, 8))}</h3>
-        <div class="fproj">${esc(s.project.replace(/^[Cc]--Users-[^-]+-/, ''))}</div>
+        <div class="fproj"><span class="kind-badge" style="background:${col}22;color:${col}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span> ${esc(s.machine || '')} · ${esc(s.project.replace(/^[Cc⇄]+\s?[·]?\s?/, '').replace(/^[Cc]--Users-[^-]+-/, ''))}</div>
         <div class="fstats">
           <span><b>${s.agents}</b> agents</span><span><b>${s.events}</b> events</span>
           <span><b>${s.toolCalls}</b> tools</span><span><b>${fmtDur(s.durationMs)}</b></span>
@@ -64,15 +70,213 @@ function renderFleet() {
           ${s.errors ? `<span class="ferr"><b>${s.errors}</b> errors</span>` : ''}
         </div>
         <div class="fdate">${new Date(s.mtime).toLocaleString()} · ${esc(String(s.session).replace(/^.*[\\:]/, '').slice(0, 8))}</div>
-      </div>`).join('') + `</div>`;
+      </div>`;
+    }).join('') + `</div>`;
   $('fleet').querySelectorAll('.fcard').forEach(c => { c.onclick = () => openSession(c.dataset.file); });
+  wireFleetControls(renderFleet);
+}
+
+// ---------- shared fleet filtering (used by grid + table) ----------
+let fleetKind = 'all', fleetMachine = 'all';
+function filteredFleet() {
+  const q = fleetFilter.toLowerCase();
+  return (fleetCache || []).filter(s =>
+    (fleetKind === 'all' || s.kind === fleetKind) &&
+    (fleetMachine === 'all' || s.machine === fleetMachine) &&
+    (!q || ((s.title || '') + ' ' + s.project + ' ' + s.machine + ' ' + s.session).toLowerCase().includes(q)));
+}
+function fleetControls(shownN, totalN, agents, cost) {
+  const machinesInFleet = [...new Set((fleetCache || []).map(s => s.machine).filter(Boolean))];
+  const kinds = ['all', 'claude', 'codex', 'otel'];
+  return `<div class="fleet-head">
+    <h2>${shownN}${shownN !== totalN ? '/' + totalN : ''} sessions · ${agents} agents · ~${fmtUsd(cost)}</h2>
+    <input id="fleetSearch" type="text" placeholder="search… title, machine, project" value="${esc(fleetFilter)}">
+    <div class="seg" id="kindSeg">${kinds.map(k => `<button data-k="${k}" class="${fleetKind === k ? 'on' : ''}" ${k !== 'all' ? `style="--c:${kindColor(k)}"` : ''}>${k === 'all' ? 'All' : AGENT_KIND[k].label}</button>`).join('')}</div>
+    <select id="machineSel"><option value="all">all machines</option>${machinesInFleet.map(m => `<option value="${esc(m)}" ${fleetMachine === m ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select>
+  </div>`;
+}
+function wireFleetControls(rerender) {
   const search = $('fleetSearch');
-  search.oninput = () => {
-    fleetFilter = search.value;
-    const pos = search.selectionStart;
-    renderFleet();
-    const s2 = $('fleetSearch'); s2.focus(); s2.setSelectionRange(pos, pos);
+  if (search) search.oninput = () => { fleetFilter = search.value; const p = search.selectionStart; rerender(); const s2 = $('fleetSearch'); if (s2) { s2.focus(); s2.setSelectionRange(p, p); } };
+  $('kindSeg')?.querySelectorAll('button').forEach(b => { b.onclick = () => { fleetKind = b.dataset.k; rerender(); }; });
+  const ms = $('machineSel');
+  if (ms) ms.onchange = () => { fleetMachine = ms.value; rerender(); };
+}
+
+// ---------- TABLE view ----------
+let tableSort = { col: 'mtime', dir: -1 };
+async function loadTable() {
+  if (!fleetCache) { $('tableView').innerHTML = '<div class="fleet-loading">Scanning…</div>'; fleetCache = await (await fetch('/api/fleet')).json(); }
+  renderTable();
+}
+function renderTable() {
+  const cols = [
+    { k: 'title', label: 'Session', num: false },
+    { k: 'kind', label: 'Agent', num: false },
+    { k: 'machine', label: 'Machine', num: false },
+    { k: 'agents', label: 'Agents', num: true },
+    { k: 'events', label: 'Events', num: true },
+    { k: 'toolCalls', label: 'Tools', num: true },
+    { k: 'durationMs', label: 'Duration', num: true },
+    { k: 'tokensOut', label: 'Out tok', num: true },
+    { k: 'cost', label: 'Cost', num: true },
+    { k: 'errors', label: 'Err', num: true },
+    { k: 'mtime', label: 'When', num: true },
+  ];
+  let rows = filteredFleet().slice();
+  const { col, dir } = tableSort;
+  rows.sort((a, b) => {
+    const av = a[col], bv = b[col];
+    if (typeof av === 'number') return (av - bv) * dir;
+    return String(av || '').localeCompare(String(bv || '')) * dir;
+  });
+  const totCost = rows.reduce((n, s) => n + s.cost, 0), totAgents = rows.reduce((n, s) => n + s.agents, 0);
+  $('tableView').innerHTML =
+    fleetControls(rows.length, (fleetCache || []).length, totAgents, totCost) +
+    `<div class="table-wrap"><table class="ftable"><thead><tr>` +
+    cols.map(c => `<th data-k="${c.k}" class="${c.num ? 'num' : ''} ${col === c.k ? 'sorted' : ''}">${c.label}${col === c.k ? (dir < 0 ? ' ▼' : ' ▲') : ''}</th>`).join('') +
+    `</tr></thead><tbody>` +
+    rows.map(s => {
+      const c = kindColor(s.kind);
+      return `<tr data-file="${esc(s.file)}">
+        <td class="tsess">${esc(s.title || s.session.slice(0, 8))}</td>
+        <td><span class="kind-badge" style="background:${c}22;color:${c}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span></td>
+        <td>${esc(s.machine || '')}</td>
+        <td class="num">${s.agents}</td><td class="num">${s.events}</td><td class="num">${s.toolCalls}</td>
+        <td class="num">${fmtDur(s.durationMs)}</td><td class="num">${fmtTok(s.tokensOut)}</td>
+        <td class="num fcost">~${fmtUsd(s.cost)}</td><td class="num ${s.errors ? 'ferr' : ''}">${s.errors || ''}</td>
+        <td class="num tdate">${new Date(s.mtime).toLocaleDateString()}</td>
+      </tr>`;
+    }).join('') + `</tbody></table></div>`;
+  $('tableView').querySelectorAll('th').forEach(th => { th.onclick = () => { const k = th.dataset.k; tableSort = { col: k, dir: tableSort.col === k ? -tableSort.dir : (cols.find(c => c.k === k).num ? -1 : 1) }; renderTable(); }; });
+  $('tableView').querySelectorAll('tr[data-file]').forEach(tr => { tr.onclick = () => openSession(tr.dataset.file); });
+  wireFleetControls(renderTable);
+}
+
+// ---------- MACHINES view ----------
+async function loadMachines() {
+  const [machinesData, fleet] = await Promise.all([
+    fetch('/api/machines').then(r => r.json()),
+    fleetCache ? Promise.resolve(fleetCache) : fetch('/api/fleet').then(r => r.json()),
+  ]);
+  fleetCache = fleet;
+  const byMachine = {};
+  for (const s of fleet) {
+    const m = s.machine || 'unknown';
+    (byMachine[m] = byMachine[m] || { sessions: 0, agents: 0, cost: 0, kinds: {}, lastMs: 0 });
+    byMachine[m].sessions++; byMachine[m].agents += s.agents; byMachine[m].cost += s.cost;
+    byMachine[m].kinds[s.kind] = (byMachine[m].kinds[s.kind] || 0) + 1;
+    byMachine[m].lastMs = Math.max(byMachine[m].lastMs, s.mtime);
+  }
+  const known = new Set(machinesData.map(m => m.name));
+  for (const m of Object.keys(byMachine)) if (!known.has(m)) machinesData.push({ name: m, ips: [], lastSeen: byMachine[m].lastMs, remote: true });
+  $('machines').innerHTML =
+    `<div class="fleet-head"><h2>Machines — ${machinesData.length}</h2></div>` +
+    `<div class="machine-grid">` + machinesData.map(m => {
+      const st = byMachine[m.name] || { sessions: 0, agents: 0, cost: 0, kinds: {} };
+      const fresh = Date.now() - m.lastSeen < 120000;
+      const kindDots = Object.entries(st.kinds).map(([k, n]) => `<span class="mkind" style="color:${kindColor(k)}">● ${(AGENT_KIND[k] || AGENT_KIND.claude).label} ${n}</span>`).join('');
+      return `<div class="mcard ${fresh ? 'fresh' : ''}">
+        <h3>${m.remote ? '⇄' : '★'} ${esc(m.name)} <span class="mstatus ${fresh ? 'on' : ''}">${fresh ? 'live' : 'idle'}</span></h3>
+        <div class="mips">${(m.ips || []).map(ip => `<span class="ip">${esc(ip)}</span>`).join('') || '<span class="ip dim">no IPs reported</span>'}</div>
+        <div class="mstats"><span><b>${st.sessions}</b> sessions</span><span><b>${st.agents}</b> agents</span><span class="fcost"><b>~${fmtUsd(st.cost)}</b></span></div>
+        <div class="mkinds">${kindDots}</div>
+        <div class="fdate">last seen ${new Date(m.lastSeen).toLocaleString()}</div>
+      </div>`;
+    }).join('') + `</div>`;
+}
+
+// ---------- CONSTELLATION view (force-directed galaxy) ----------
+let constAnim = null;
+function stopConstellation() { if (constAnim) { cancelAnimationFrame(constAnim); constAnim = null; } }
+async function loadConstellation() {
+  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  const cv = $('constCanvas'), wrap = $('constellation');
+  const DPR = window.devicePixelRatio || 1;
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  cv.width = W * DPR; cv.height = H * DPR; cv.style.width = W + 'px'; cv.style.height = H + 'px';
+  const ctx = cv.getContext('2d'); ctx.scale(DPR, DPR);
+
+  // nodes: one sun per machine, one star per session (bound to its machine)
+  const machineNames = [...new Set(fleetCache.map(s => s.machine || 'local'))];
+  const suns = new Map();
+  machineNames.forEach((m, i) => {
+    const ang = (i / machineNames.length) * Math.PI * 2;
+    suns.set(m, { id: 'm:' + m, machine: m, sun: true, x: W / 2 + Math.cos(ang) * 180, y: H / 2 + Math.sin(ang) * 140, vx: 0, vy: 0, r: 16, label: m });
+  });
+  const maxCost = Math.max(...fleetCache.map(s => s.cost), 1);
+  const stars = fleetCache.map(s => {
+    const sun = suns.get(s.machine || 'local');
+    return {
+      id: s.file, sun: false, file: s.file, machine: s.machine,
+      x: sun.x + (Math.random() - 0.5) * 120, y: sun.y + (Math.random() - 0.5) * 120, vx: 0, vy: 0,
+      r: 3 + Math.sqrt(s.cost / maxCost) * 14, color: kindColor(s.kind), sunNode: sun,
+      active: Date.now() - s.mtime < 6 * 3600e3, title: s.title || s.session.slice(0, 8), kind: s.kind,
+    };
+  });
+  const nodes = [...suns.values(), ...stars];
+
+  let tx = 0, ty = 0, scale = 1, dragging = null, hover = null, panning = false, lastM = null;
+  cv.onwheel = e => { e.preventDefault(); const f = e.deltaY < 0 ? 1.1 : 0.9; scale = Math.max(0.3, Math.min(4, scale * f)); };
+  cv.onmousedown = e => {
+    const p = toWorld(e); const n = pick(p);
+    if (n && !n.sun) dragging = n; else { panning = true; lastM = { x: e.clientX, y: e.clientY }; }
   };
+  cv.onmousemove = e => {
+    const p = toWorld(e); hover = pick(p);
+    cv.style.cursor = hover ? 'pointer' : (panning ? 'grabbing' : 'grab');
+    if (dragging) { dragging.x = p.x; dragging.y = p.y; dragging.vx = dragging.vy = 0; }
+    else if (panning) { tx += e.clientX - lastM.x; ty += e.clientY - lastM.y; lastM = { x: e.clientX, y: e.clientY }; }
+  };
+  cv.onmouseup = e => {
+    if (!dragging && !panning) { const n = pick(toWorld(e)); if (n && !n.sun) openSession(n.file); }
+    dragging = null; panning = false;
+  };
+  function toWorld(e) { const r = cv.getBoundingClientRect(); return { x: (e.clientX - r.left - tx) / scale, y: (e.clientY - r.top - ty) / scale }; }
+  function pick(p) { let best = null, bd = 1e9; for (const n of nodes) { const d = Math.hypot(n.x - p.x, n.y - p.y); if (d < n.r + 6 && d < bd) { bd = d; best = n; } } return best; }
+
+  function step() {
+    // repulsion between all, spring stars to their sun, mild gravity to center
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      if (a === dragging) continue;
+      for (let j = i + 1; j < nodes.length; j++) {
+        const b = nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y; let d2 = dx * dx + dy * dy || 1;
+        if (d2 < 40000) { const f = (a.sun || b.sun ? 900 : 260) / d2; const d = Math.sqrt(d2); a.vx += dx / d * f; a.vy += dy / d * f; b.vx -= dx / d * f; b.vy -= dy / d * f; }
+      }
+      if (!a.sun) { const s = a.sunNode; const dx = s.x - a.x, dy = s.y - a.y, d = Math.hypot(dx, dy) || 1; const f = (d - 90) * 0.006; a.vx += dx / d * f; a.vy += dy / d * f; }
+      a.vx += (W / 2 - a.x) * 0.0008; a.vy += (H / 2 - a.y) * 0.0008;
+    }
+    for (const n of nodes) { if (n === dragging) continue; n.vx *= 0.85; n.vy *= 0.85; n.x += n.vx; n.y += n.vy; }
+  }
+  let t = 0;
+  function draw() {
+    step(); t++;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = '#080b11'; ctx.fillRect(0, 0, W, H);
+    ctx.setTransform(DPR * scale, 0, 0, DPR * scale, tx * DPR, ty * DPR);
+    // edges
+    ctx.lineWidth = 0.6 / scale;
+    for (const s of stars) { ctx.strokeStyle = s.color + '22'; ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(s.sunNode.x, s.sunNode.y); ctx.stroke(); }
+    // suns
+    for (const m of suns.values()) {
+      ctx.fillStyle = '#e5e9f0'; ctx.beginPath(); ctx.arc(m.x, m.y, m.r, 0, 7); ctx.fill();
+      ctx.fillStyle = 'rgba(229,233,240,0.12)'; ctx.beginPath(); ctx.arc(m.x, m.y, m.r + 8, 0, 7); ctx.fill();
+      ctx.fillStyle = '#cfd6e4'; ctx.font = `${12 / scale}px Segoe UI`; ctx.textAlign = 'center'; ctx.fillText(m.label, m.x, m.y - m.r - 6 / scale);
+    }
+    // stars
+    for (const s of stars) {
+      if (s.active) { const pulse = 0.5 + 0.5 * Math.sin(t * 0.08 + s.x); ctx.fillStyle = s.color + '33'; ctx.beginPath(); ctx.arc(s.x, s.y, s.r + 4 + pulse * 4, 0, 7); ctx.fill(); }
+      ctx.fillStyle = s.color; ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 7); ctx.fill();
+    }
+    if (hover && !hover.sun) {
+      ctx.fillStyle = '#e5e9f0'; ctx.font = `${12 / scale}px Segoe UI`; ctx.textAlign = 'left';
+      ctx.fillText(hover.title, hover.x + hover.r + 4 / scale, hover.y + 4 / scale);
+    }
+    constAnim = requestAnimationFrame(draw);
+  }
+  stopConstellation(); draw();
 }
 
 function openSession(file) {
@@ -145,18 +349,23 @@ const fmtDur = ms => {
 };
 
 // ---------- render ----------
+const OVERVIEW = ['fleet', 'table', 'constellation', 'machines'];
 function setTabs() {
-  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewBoard', 'board'], ['viewTimeline', 'timeline']]) {
-    $(btn).classList.toggle('on', state.view === v);
+  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewTimeline', 'timeline']]) {
+    const el = $(btn); if (el) el.classList.toggle('on', state.view === v);
   }
-  const inSession = state.view !== 'fleet';
-  document.querySelector('main').classList.toggle('no-feed', !inSession);
-  $('fleet').style.display = inSession ? 'none' : '';
-  if (!inSession) { $('board').style.display = 'none'; $('timeline').style.display = 'none'; $('empty').style.display = 'none'; }
-  $('feed').style.display = inSession ? '' : 'none';
-  document.querySelector('footer').style.display = inSession ? '' : 'none';
-  $('statbar').style.display = inSession ? '' : 'none';
-  if (!inSession) loadFleet();
+  const overview = OVERVIEW.includes(state.view);
+  document.querySelector('main').classList.toggle('no-feed', overview);
+  for (const id of ['fleet', 'tableView', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
+  if (overview) { $('board').style.display = 'none'; $('timeline').style.display = 'none'; $('empty').style.display = 'none'; }
+  $('feed').style.display = overview ? 'none' : '';
+  document.querySelector('footer').style.display = overview ? 'none' : '';
+  $('statbar').style.display = overview ? 'none' : '';
+  stopConstellation();
+  if (state.view === 'fleet') loadFleet();
+  else if (state.view === 'table') loadTable();
+  else if (state.view === 'constellation') loadConstellation();
+  else if (state.view === 'machines') loadMachines();
 }
 
 function render() {
@@ -394,6 +603,9 @@ $('liveBtn').onclick = () => {
   state.scrub = state.data.events.length; render();
 };
 $('viewFleet').onclick = () => { if (!BAKED) { state.view = 'fleet'; setTabs(); } };
+$('viewTable').onclick = () => { if (!BAKED) { state.view = 'table'; setTabs(); } };
+$('viewConstellation').onclick = () => { if (!BAKED) { state.view = 'constellation'; setTabs(); } };
+$('viewMachines').onclick = () => { if (!BAKED) { state.view = 'machines'; setTabs(); } };
 $('viewBoard').onclick = () => { if (state.data.events.length || state.file) { state.view = 'board'; setTabs(); render(); } };
 $('viewTimeline').onclick = () => { if (state.data.events.length || state.file) { state.view = 'timeline'; setTabs(); render(); } };
 $('exportBtn').onclick = () => {
@@ -425,7 +637,7 @@ if (BAKED) {
   state.scrub = state.data.events.length;
   document.title = 'Replay — ' + BAKED.title;
   $('sessionSel').style.display = 'none';
-  $('viewFleet').style.display = 'none';
+  for (const id of ['viewFleet', 'viewTable', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
   $('exportBtn').style.display = 'none';
   $('liveBtn').style.display = 'none';
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'replay';
