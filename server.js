@@ -648,17 +648,68 @@ function otelList() {
 // Remote machines run `--relay http://hub:4173 --token <secret>`: they tail
 // their own transcripts and POST parsed sessions here. Stored in memory,
 // keyed "relay:<machine>:<file>", and shown in the fleet like local sessions.
-const relaySessions = new Map(); // id -> {id, meta, version, result}
-const BOOT_ID = Math.random().toString(36).slice(2); // relay store is in-memory; clients resend when this changes
+const relaySessions = new Map(); // id -> {id, meta, version, result, machine, ips, at}
+const BOOT_ID = Math.random().toString(36).slice(2); // hub identity; new relays resend when this changes
+
+// Relayed sessions are cached to disk so a hub restart does NOT lose them.
+// This decouples RECEPTION from the relay's version/behavior: even an old relay
+// that never resends after a restart keeps its last-delivered data visible.
+// Bounded: newest RELAY_KEEP sessions, each trimmed to RELAY_EVENT_CAP events.
+const RELAY_DIR = () => path.join(STATE_DIR, 'relay');
+const RELAY_KEEP = 400;
+const RELAY_EVENT_CAP = 4000;
+function relayFileFor(id) { return path.join(RELAY_DIR(), crypto.createHash('sha1').update(id).digest('hex') + '.json'); }
+
+const RELAY_MAX_BYTES = 4 * 1024 * 1024; // per cached session file
+function persistRelay(rec) {
+  try {
+    fs.mkdirSync(RELAY_DIR(), { recursive: true });
+    let events = rec.result.events.length > RELAY_EVENT_CAP ? rec.result.events.slice(-RELAY_EVENT_CAP) : rec.result.events;
+    let payload = JSON.stringify({ id: rec.id, machine: rec.machine, meta: rec.meta, ips: rec.ips, at: rec.at, result: { ...rec.result, events } });
+    while (payload.length > RELAY_MAX_BYTES && events.length > 200) { // keep the disk cache bounded
+      events = events.slice(Math.ceil(events.length / 2));
+      payload = JSON.stringify({ id: rec.id, machine: rec.machine, meta: rec.meta, ips: rec.ips, at: rec.at, result: { ...rec.result, events } });
+    }
+    const tmp = relayFileFor(rec.id) + '.tmp';
+    fs.writeFileSync(tmp, payload);
+    fs.renameSync(tmp, relayFileFor(rec.id));
+    // enforce count cap: evict oldest files
+    const dir = RELAY_DIR();
+    const files = fs.readdirSync(dir).filter(f => f.endsWith('.json')).map(f => ({ f, m: fs.statSync(path.join(dir, f)).mtimeMs }));
+    if (files.length > RELAY_KEEP) {
+      files.sort((a, b) => a.m - b.m);
+      for (const { f } of files.slice(0, files.length - RELAY_KEEP)) { try { fs.unlinkSync(path.join(dir, f)); } catch { /* ignore */ } }
+    }
+  } catch (e) { console.error('relay persist failed:', e.message); }
+}
+
+function loadRelayCache() {
+  let files = [];
+  try { files = fs.readdirSync(RELAY_DIR()).filter(f => f.endsWith('.json')); } catch { return; }
+  let n = 0;
+  for (const f of files) {
+    try {
+      const r = JSON.parse(fs.readFileSync(path.join(RELAY_DIR(), f), 'utf8'));
+      if (!r.id || !r.result) continue;
+      relaySessions.set(r.id, { id: r.id, machine: r.machine, meta: r.meta || {}, version: 1, result: r.result, ips: r.ips, at: r.at });
+      if (r.machine) machines.set(r.machine, { name: r.machine, ips: Array.isArray(r.ips) ? r.ips : [], lastSeen: r.at || Date.now(), remote: true, cached: true });
+      n++;
+    } catch { /* skip bad file */ }
+  }
+  if (n) console.log(`Restored ${n} relayed sessions from cache (${RELAY_DIR()})`);
+}
 
 function ingestRelay(body) {
   const id = 'relay:' + body.machine + ':' + body.file;
   const prev = relaySessions.get(id);
-  relaySessions.set(id, {
+  const rec = {
     id, machine: body.machine, meta: body.meta || {},
     version: (prev ? prev.version : 0) + 1, result: body.result,
-  });
-  machines.set(body.machine, { name: body.machine, ips: Array.isArray(body.ips) ? body.ips : [], lastSeen: Date.now(), remote: true });
+    ips: Array.isArray(body.ips) ? body.ips : [], at: Date.now(),
+  };
+  relaySessions.set(id, rec);
+  machines.set(body.machine, { name: body.machine, ips: rec.ips, lastSeen: Date.now(), remote: true });
+  persistRelay(rec);
   return id;
 }
 
@@ -1206,6 +1257,7 @@ if (process.argv.includes('--install')) {
   runRelay(RELAY_TO.replace(/\/$/, ''), argValue('--name') || os.hostname());
 } else {
   loadState();
+  loadRelayCache(); // restore relayed sessions from disk so a restart keeps them
   server.listen(PORT, () => {
     console.log(`Agent Mission Control → http://localhost:${PORT}`);
     console.log(`Watching transcripts in ${PROJECTS_DIR}`);
