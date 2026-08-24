@@ -1473,10 +1473,12 @@ const server = http.createServer((req, res) => {
   // app icon: serve the local personal icon if present (gitignored), else the
   // neutral committed default — keeps the public repo free of the photo
   if (url.pathname === '/app-icon' || url.pathname === '/favicon.ico') {
-    const mullet = path.join(PUBLIC_DIR, 'mullet.png');
-    if (fs.existsSync(mullet)) {
+    // default: the satellite logo. Drop a public/icon-override.png to swap it
+    // locally (e.g. the mullet); gitignored, never in the public repo.
+    const override = path.join(PUBLIC_DIR, 'icon-override.png');
+    if (fs.existsSync(override)) {
       res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
-      return res.end(fs.readFileSync(mullet));
+      return res.end(fs.readFileSync(override));
     }
     res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' });
     return res.end(fs.readFileSync(path.join(PUBLIC_DIR, 'favicon.svg')));

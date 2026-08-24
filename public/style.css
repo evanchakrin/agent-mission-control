@@ -16,7 +16,7 @@ body { background: var(--bg); color: var(--text); height: 100vh; display: flex; 
 
 header { display: flex; align-items: center; gap: 12px; padding: 9px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
 header h1 { font-size: 14px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--accent); white-space: nowrap; }
-header h1::before { content: "◉ "; color: var(--accent2); }
+.hlogo { display: block; flex-shrink: 0; }
 select { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12px; max-width: 380px; }
 
 /* session picker */
