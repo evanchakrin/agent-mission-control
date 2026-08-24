@@ -1,0 +1,7 @@
+node_modules/
+# personal local icons — never publish (real-person photo); repo ships a neutral default
+public/mullet.png
+public/mullet.ico
+public/fable.png
+public/fable.ico
+public/*.local.*

@@ -1470,6 +1470,18 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // app icon: serve the local personal icon if present (gitignored), else the
+  // neutral committed default — keeps the public repo free of the photo
+  if (url.pathname === '/app-icon' || url.pathname === '/favicon.ico') {
+    const mullet = path.join(PUBLIC_DIR, 'mullet.png');
+    if (fs.existsSync(mullet)) {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
+      return res.end(fs.readFileSync(mullet));
+    }
+    res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' });
+    return res.end(fs.readFileSync(path.join(PUBLIC_DIR, 'favicon.svg')));
+  }
+
   // static files
   const rel = url.pathname === '/' ? '/index.html' : url.pathname;
   const file = path.resolve(PUBLIC_DIR, '.' + rel);
