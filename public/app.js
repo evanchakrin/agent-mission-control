@@ -903,16 +903,119 @@ function renderPlaybooks() {
   $('pbNew').onclick = () => openPlaybookEditor(null);
   $('playbooks').querySelectorAll('.pb-lib-item').forEach(el => {
     const p = playbookLib.items.find(x => x.id === el.dataset.id);
+    el.onclick = () => openPlaybookEditor(p); // whole card opens the editor
+    el.style.cursor = 'pointer';
     el.querySelector('.pli-copy').onclick = e => { e.stopPropagation(); navigator.clipboard.writeText(p.body); e.target.textContent = '✓'; setTimeout(() => { e.target.textContent = '📋'; }, 1200); };
     el.querySelector('.pli-edit').onclick = e => { e.stopPropagation(); openPlaybookEditor(p); };
     el.querySelector('.pli-del').onclick = async e => { e.stopPropagation(); if (!confirm(`Delete "${p.name}"?`)) return; await fetch('/api/playbooks', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'delete', id: p.id }) }).then(r => r.json()).then(j => { playbookLib = j; renderPlaybooks(); }); };
   });
 }
+// Common directive phrases you can drop into a playbook with one click.
+const PB_SNIPPETS = [
+  { g: 'Structure', items: [
+    ['GOAL block', 'GOAL: <describe the task in one or two sentences>\n\n'],
+    ['Success criteria', 'DONE WHEN:\n- [ ] <criterion>\n- [ ] <criterion>\n\n'],
+    ['Constraints', 'CONSTRAINTS:\n- Do not <forbidden action>.\n- Stay within <scope>.\n\n'],
+    ['Report format', 'REPORT: when finished, give me: (1) what changed, (2) per-agent results, (3) anything unverified.\n\n'],
+  ] },
+  { g: 'Orchestration', items: [
+    ['Parallel workers', 'Split the goal into independent workstreams; spawn one subagent per stream in parallel; a final integrator merges results and runs a consistency check.\n'],
+    ['Adversarial review', 'Have each reviewer attack the work independently through a different lens, then merge only confirmed findings. Reviewers must not see each other before verdicts.\n'],
+    ['Tiered (save tokens)', 'Orchestrator = premium model (plan + integrate only). Workers = Sonnet. Pure fetch/grep/summarize = Haiku. Reserve premium tokens for judgment; report a per-tier cost breakdown.\n'],
+    ['Loop until dry', 'Keep spawning finders until 2 consecutive rounds surface nothing new; dedup against everything already found.\n'],
+  ] },
+  { g: 'Guardrails', items: [
+    ['Budget cap', 'Keep total spend under ~$<N>. Stop and report if you approach it.\n'],
+    ['Read-only', 'READ-ONLY: do not edit, write, commit, or run migrations.\n'],
+    ['Ground in data', 'Ground every finding in live data or a cited file:line. Default to "this is wrong" and try to break it before calling it correct.\n'],
+    ['Ask before destructive', 'Confirm with me before any irreversible action (delete, deploy, send, overwrite).\n'],
+  ] },
+  { g: 'Checklists', items: [
+    ['Checkbox item', '- [ ] '],
+    ['Numbered step', '1. '],
+    ['Section heading', '\n## Section\n\n'],
+  ] },
+];
+let pbEditorState = null;
 function openPlaybookEditor(pb) {
-  const name = prompt('Playbook name:', pb ? pb.name : 'My play'); if (name === null) return;
-  const body = prompt('Playbook body (or edit later):', pb ? pb.body : '# Playbook\n\nGOAL: ...\n'); if (body === null) return;
-  fetch('/api/playbooks', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'save', id: pb ? pb.id : undefined, name, body, kind: pb ? pb.kind : 'custom', source: pb ? pb.source : 'manual' }) })
-    .then(r => r.json()).then(j => { if (j.items) { playbookLib = j; renderPlaybooks(); } });
+  pbEditorState = { id: pb?.id || null, source: pb?.source || 'manual' };
+  const ov = document.createElement('div');
+  ov.className = 'pb-editor-ov'; ov.id = 'pbEditorOv';
+  ov.innerHTML = `
+    <div class="pb-editor">
+      <div class="pbe-head">
+        <input id="pbeName" class="pbe-name" placeholder="Directive / playbook name" value="${esc(pb?.name || '')}">
+        <input id="pbeKind" class="pbe-kind" placeholder="tag (e.g. review, build, tiered)" value="${esc(pb?.kind || 'custom')}">
+        <button id="pbeClose" class="mini-btn">✕</button>
+      </div>
+      <div class="pbe-body">
+        <div class="pbe-palette">
+          <div class="pbe-pal-title">Insert common phrases</div>
+          ${PB_SNIPPETS.map(sec => `<div class="pbe-pal-g">${esc(sec.g)}</div>` +
+            sec.items.map((it, i) => `<button class="pbe-snip" data-g="${esc(sec.g)}" data-i="${i}">${esc(it[0])}</button>`).join('')).join('')}
+        </div>
+        <div class="pbe-edit">
+          <div class="pbe-toolbar">
+            <button class="pbe-tool" data-ins="- [ ] ">☐ checkbox</button>
+            <button class="pbe-tool" data-ins="\\n## ">H heading</button>
+            <button class="pbe-tool" data-wrap="**">B</button>
+            <button class="pbe-tool" data-wrap="\`">code</button>
+            <span class="pbe-count" id="pbeCount"></span>
+          </div>
+          <textarea id="pbeBody" spellcheck="false" placeholder="Write your directive package here, or click phrases on the left to build it.">${esc(pb?.body || '# Playbook\n\nGOAL: \n')}</textarea>
+        </div>
+        <div class="pbe-preview" id="pbePreview"></div>
+      </div>
+      <div class="pbe-foot">
+        ${pb ? '<button id="pbeDelete" class="mini-btn pbe-del">🗑 Delete</button>' : '<span></span>'}
+        <div>
+          <button id="pbeSaveAs" class="mini-btn">Save as new</button>
+          <button id="pbeSave" class="mini-btn pbe-save">💾 Save</button>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  const ta = ov.querySelector('#pbeBody');
+  const insertAtCursor = (text) => {
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    ta.value = ta.value.slice(0, s) + text + ta.value.slice(e);
+    ta.selectionStart = ta.selectionEnd = s + text.length;
+    ta.focus(); syncPreview();
+  };
+  const wrapSelection = (mark) => {
+    const s = ta.selectionStart, e = ta.selectionEnd;
+    const sel = ta.value.slice(s, e) || 'text';
+    ta.value = ta.value.slice(0, s) + mark + sel + mark + ta.value.slice(e);
+    ta.selectionStart = s + mark.length; ta.selectionEnd = s + mark.length + sel.length;
+    ta.focus(); syncPreview();
+  };
+  const syncPreview = () => {
+    ov.querySelector('#pbePreview').innerHTML = renderMD(ta.value);
+    ov.querySelector('#pbeCount').textContent = ta.value.length + ' chars';
+  };
+  ta.oninput = syncPreview; syncPreview();
+  ov.querySelectorAll('.pbe-snip').forEach(b => b.onclick = () => {
+    const sec = PB_SNIPPETS.find(x => x.g === b.dataset.g); insertAtCursor(sec.items[+b.dataset.i][1]);
+  });
+  ov.querySelectorAll('.pbe-tool').forEach(b => b.onclick = () => { if (b.dataset.ins) insertAtCursor(b.dataset.ins.replace(/\\n/g, '\n')); else wrapSelection(b.dataset.wrap); });
+  ov.querySelector('#pbeClose').onclick = () => ov.remove();
+  ov.onclick = e => { if (e.target === ov) ov.remove(); };
+  const doSave = async (asNew) => {
+    const name = ov.querySelector('#pbeName').value.trim() || 'Untitled directive';
+    const kind = ov.querySelector('#pbeKind').value.trim() || 'custom';
+    const body = ta.value;
+    const j = await fetch('/api/playbooks', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'save', id: asNew ? undefined : pbEditorState.id, name, kind, body, source: pbEditorState.source }) }).then(r => r.json()).catch(() => null);
+    if (j && j.items) { playbookLib = j; ov.remove(); if (state.view === 'playbooks') renderPlaybooks(); }
+    else alert('Save failed');
+  };
+  ov.querySelector('#pbeSave').onclick = () => doSave(false);
+  ov.querySelector('#pbeSaveAs').onclick = () => doSave(true);
+  if (pb) ov.querySelector('#pbeDelete').onclick = async () => {
+    if (!confirm(`Delete "${pb.name}"?`)) return;
+    const j = await fetch('/api/playbooks', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'delete', id: pb.id }) }).then(r => r.json()).catch(() => null);
+    if (j && j.items) { playbookLib = j; ov.remove(); renderPlaybooks(); }
+  };
+  ta.focus();
 }
 
 // ---------- BRAIN view (memories, hooks, agent configs on this machine) ----------
