@@ -428,6 +428,21 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .hm-machine { border: 1px solid var(--line); border-radius: 9px; margin: 12px 0; overflow: hidden; }
 .hm-m-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px; background: var(--panel2); font-size: 13px; }
 .hm-paste { padding: 11px 13px; font-size: 11px; font-family: Consolas, monospace; color: var(--dim); white-space: pre-wrap; max-height: 200px; overflow-y: auto; }
+/* standing orders (directives) */
+.dir-item { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: var(--panel2); margin-bottom: 8px; }
+.dir-head { display: flex; align-items: center; gap: 4px; font-size: 13px; }
+.dir-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.dir-chip { font-size: 10px; color: var(--accent2); background: rgba(129,140,248,.12); border: 1px solid rgba(129,140,248,.25); border-radius: 7px; padding: 2px 8px; }
+.dir-chip.st-ok { color: var(--green); background: rgba(52,211,153,.1); border-color: rgba(52,211,153,.3); }
+.dir-chip.st-drifted, .dir-chip.st-missing-file { color: var(--amber, #fbbf24); background: rgba(251,191,36,.1); border-color: rgba(251,191,36,.3); }
+.dir-impact { font-size: 11px; margin-top: 7px; }
+.dir-status { font-size: 11px; margin-top: 5px; display: flex; flex-wrap: wrap; gap: 5px; }
+.dir-targets { max-height: 200px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; padding: 6px 4px; margin-top: 6px; background: var(--panel); }
+.dir-target { display: flex; align-items: baseline; gap: 7px; padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.dir-target:hover { background: var(--panel2); }
+.dir-target .dim { font-size: 10.5px; }
+.dc-body { width: 100%; min-height: 180px; margin-top: 4px; background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 10px 12px; font-size: 12px; font-family: Consolas, monospace; line-height: 1.5; resize: vertical; }
+
 .arch-browse { width: 100%; margin-top: 8px; text-align: left; }
 .arch-item { padding: 8px 11px; border-radius: 7px; background: var(--panel2); margin-bottom: 4px; cursor: pointer; }
 .arch-item:hover { background: #1b2231; }

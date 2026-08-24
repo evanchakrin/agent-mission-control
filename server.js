@@ -990,6 +990,91 @@ function savePlaybooks(next) {
   fs.renameSync(tmp, PLAYBOOK_FILE);
 }
 
+// ---------- directive registry (standing orders planted into guidance files) ----------
+// A "directive" is a marker-wrapped block AMC appends to a project's CLAUDE.md
+// or AGENTS.md — a standing rule every future agent session in that repo reads.
+// The registry remembers what was planted where, so drift is detectable and any
+// directive is retirable (the block is removed cleanly, never the whole file).
+// Targets come from a server-side allowlist; the client only ever sends ids.
+const DIRECTIVE_FILE = path.join(STATE_DIR, 'directives.json');
+function loadDirectives() {
+  try { return JSON.parse(fs.readFileSync(DIRECTIVE_FILE, 'utf8')); } catch { return { v: 1, items: [] }; }
+}
+function saveDirectives(next) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const tmp = DIRECTIVE_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+  fs.renameSync(tmp, DIRECTIVE_FILE);
+}
+// Plantable guidance files: one CLAUDE.md per known Claude project cwd
+// (creatable if absent), the global CLAUDE.md, plus any existing AGENTS.md.
+function directiveTargets() {
+  const home = os.homedir();
+  const targets = [];
+  const seen = new Set();
+  const add = (label, p, name) => {
+    if (seen.has(p)) return; seen.add(p);
+    let exists = false, size = 0;
+    try { const st = fs.statSync(p); exists = st.isFile(); size = st.size; } catch { /* creatable */ }
+    if (exists && size > BRAIN_MAX) return; // refuse to touch oversized files
+    targets.push({ id: enc(p), label, name, path: p, exists });
+  };
+  add('Global — every session on this machine', path.join(home, '.claude', 'CLAUDE.md'), 'CLAUDE.md');
+  try {
+    for (const proj of fs.readdirSync(PROJECTS_DIR)) {
+      const cwd = claudeProjectCwd(path.join(PROJECTS_DIR, proj));
+      if (!cwd) continue;
+      const label = proj.replace(/^[Cc]--Users-[^-]+-/, '').slice(0, 40);
+      add(label, path.join(cwd, 'CLAUDE.md'), 'CLAUDE.md');
+      try { if (fs.statSync(path.join(cwd, 'AGENTS.md')).isFile()) add(label + ' (Codex)', path.join(cwd, 'AGENTS.md'), 'AGENTS.md'); } catch { /* absent */ }
+    }
+  } catch { /* ignore */ }
+  return targets;
+}
+const dirMarker = id => ({ start: `<!-- mission-control:directive:${id} -->`, end: `<!-- /mission-control:directive:${id} -->` });
+function directiveBlock(d) {
+  const m = dirMarker(d.id);
+  return `\n\n${m.start}\n## 🛰 Standing order: ${d.title}\n_Planted by Agent Mission Control on ${new Date(d.createdAt).toISOString().slice(0, 10)}. Retire it from the dashboard rather than hand-editing this block._\n\n${d.body.trim()}\n${m.end}\n`;
+}
+function plantIntoFile(p, d) {
+  let cur = '';
+  try { cur = fs.readFileSync(p, 'utf8'); } catch { /* new file */ }
+  const m = dirMarker(d.id);
+  if (cur.includes(m.start)) return { status: 'already' };
+  const next = cur + directiveBlock(d);
+  if (Buffer.byteLength(next) > BRAIN_MAX) return { status: 'too-big' };
+  try {
+    if (cur) { fs.copyFileSync(p, p + '.mc-backup'); snapshotBrain({ path: p, name: path.basename(p) }); }
+    else fs.mkdirSync(path.dirname(p), { recursive: true });
+    const tmp = p + '.mc-tmp';
+    fs.writeFileSync(tmp, next);
+    fs.renameSync(tmp, p);
+    return { status: 'planted' };
+  } catch (e) { return { status: 'error', error: e.message }; }
+}
+function retireFromFile(p, id) {
+  const m = dirMarker(id);
+  let cur;
+  try { cur = fs.readFileSync(p, 'utf8'); } catch { return { status: 'missing-file' }; }
+  const i = cur.indexOf(m.start), j = cur.indexOf(m.end);
+  if (i < 0 || j < 0) return { status: 'not-present' };
+  try {
+    fs.copyFileSync(p, p + '.mc-backup');
+    snapshotBrain({ path: p, name: path.basename(p) });
+    const next = cur.slice(0, i).replace(/\n+$/, '\n') + cur.slice(j + m.end.length).replace(/^\n+/, '\n');
+    const tmp = p + '.mc-tmp';
+    fs.writeFileSync(tmp, next);
+    fs.renameSync(tmp, p);
+    return { status: 'retired' };
+  } catch (e) { return { status: 'error', error: e.message }; }
+}
+function checkDirective(d) {
+  return (d.targets || []).map(t => {
+    try { return { path: t.path, label: t.label, status: fs.readFileSync(t.path, 'utf8').includes(dirMarker(d.id).start) ? 'ok' : 'drifted' }; }
+    catch { return { path: t.path, label: t.label, status: 'missing-file' }; }
+  });
+}
+
 // ---------- brain version history ----------
 // Every Brain save snapshots the PRIOR content, so config/memory/hooks edits
 // are recoverable — real version control, not a single .mc-backup.
@@ -1403,6 +1488,59 @@ const server = http.createServer((req, res) => {
           store.items = store.items.filter(x => x.id !== b.id);
           savePlaybooks(store);
           appendAudit({ kind: 'playbook-delete', id: b.id });
+          return json(res, { ok: true, items: store.items });
+        }
+        throw new Error('bad op');
+      } catch (e) { metaErr(res, e); }
+    });
+  }
+
+  // ---- directive registry (gated CRUD; plants standing orders into guidance files) ----
+  if (url.pathname === '/api/directives' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    return json(res, { items: loadDirectives().items, targets: directiveTargets() });
+  }
+  if (url.pathname === '/api/directives' && req.method === 'POST') {
+    if (!writeGate(req, res)) return;
+    return readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        const store = loadDirectives();
+        if (b.op === 'plant') {
+          const title = clean(b.title, 100) || 'Untitled directive';
+          if (typeof b.body !== 'string' || !b.body.trim() || b.body.length > 20000) throw new Error('bad body');
+          if (!Array.isArray(b.targets) || !b.targets.length || b.targets.length > 40) throw new Error('pick at least one target');
+          if (store.items.length >= 200) throw new Error('registry full');
+          const allowed = new Map(directiveTargets().map(t => [t.id, t]));
+          const d = { id: 'dir_' + crypto.randomBytes(5).toString('hex'), title, body: String(b.body), insightKey: clean(b.insightKey, 200) || null, createdAt: Date.now(), targets: [] };
+          const results = [];
+          for (const id of b.targets) {
+            const t = allowed.get(String(id));
+            if (!t) { results.push({ id: String(id).slice(0, 60), status: 'unknown-target' }); continue; }
+            const r = plantIntoFile(t.path, d);
+            results.push({ label: t.label, ...r });
+            if (r.status === 'planted') d.targets.push({ path: t.path, label: t.label, name: t.name, plantedAt: Date.now() });
+          }
+          if (d.targets.length) { store.items.push(d); saveDirectives(store); }
+          appendAudit({ kind: 'directive-plant', title, targets: d.targets.length });
+          return json(res, { ok: true, items: store.items, results });
+        }
+        if (b.op === 'check') {
+          const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
+          return json(res, { ok: true, statuses: checkDirective(d) });
+        }
+        if (b.op === 'retire') {
+          const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
+          const results = (d.targets || []).map(t => ({ label: t.label, ...retireFromFile(t.path, d.id) }));
+          store.items = store.items.filter(x => x.id !== b.id);
+          saveDirectives(store);
+          appendAudit({ kind: 'directive-retire', title: d.title });
+          return json(res, { ok: true, items: store.items, results });
+        }
+        if (b.op === 'delete') { // forget the record without touching any file
+          store.items = store.items.filter(x => x.id !== b.id);
+          saveDirectives(store);
+          appendAudit({ kind: 'directive-forget', id: b.id });
           return json(res, { ok: true, items: store.items });
         }
         throw new Error('bad op');

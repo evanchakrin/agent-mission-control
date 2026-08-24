@@ -729,7 +729,7 @@ async function setTriageSilent(key, status) {
 function classifyInsight(i) {
   if (i.sev === 'good') return 'info';
   if (i.key.startsWith('failrole:') || i.key.startsWith('envrole:')) return 'failure';
-  if (i.key.startsWith('hoard:') || i.key.startsWith('tier:')) return 'cost';
+  if (i.key.startsWith('hoard:') || i.key.startsWith('tier:') || i.key.startsWith('flatdeleg:')) return 'cost';
   return 'other';
 }
 function insightMachine(i) {
@@ -781,7 +781,7 @@ async function handleTriageForMe(insights, mined) {
 
       ${costs.length ? `<h4 class="hm-h">💸 ${costs.length} cost / efficiency finding${costs.length !== 1 ? 's' : ''} — not prompt bugs</h4>
         <p class="dim">These are spend, not failures. The fix is architectural: let the orchestrator plan and delegate the grunt work to cheaper models. Copy the tiered playbook and use it going forward.</p>
-        <div class="hm-machine"><div class="hm-m-head"><b>The findings</b><button class="mini-btn hm-copy" data-t="tiered" style="margin-left:auto">📋 copy tiered playbook</button></div><pre class="hm-paste">${esc(costLines.join('\n'))}\n\n— Apply the Tiered token-saving playbook (copies with the button) —</pre></div>` : ''}
+        <div class="hm-machine"><div class="hm-m-head"><b>The findings</b><span style="margin-left:auto;display:flex;gap:6px"><button class="mini-btn" id="hmDirective" title="make it permanent: plant the tiering rule into repo guidance files">🛰 make it a rule</button><button class="mini-btn hm-copy" data-t="tiered">📋 copy tiered playbook</button></span></div><pre class="hm-paste">${esc(costLines.join('\n'))}\n\n— Best fix: 🛰 plant the tiering rule (permanent), or copy the playbook (one session) —</pre></div>` : ''}
 
       ${!failures.length && !costs.length ? '<p class="dim">Nothing action-needed — you\'re clear. 🎉</p>' : ''}
     </div>
@@ -791,6 +791,8 @@ async function handleTriageForMe(insights, mined) {
     </div></div>`;
   document.body.appendChild(ov);
   ov.querySelector('#hmClose').onclick = () => { ov.remove(); loadPlaybooks(); };
+  const hmDir = ov.querySelector('#hmDirective');
+  if (hmDir) hmDir.onclick = () => openDirectiveComposer(directiveTemplate({ key: 'tier:handle' }));
   ov.querySelectorAll('.hm-copy').forEach(b => b.onclick = () => {
     const txt = b.dataset.t === 'tiered' ? tieredPaste : machineActions[+b.dataset.i].paste;
     navigator.clipboard.writeText(txt); const o = b.textContent; b.textContent = '✓ copied'; setTimeout(() => { b.textContent = o; }, 1500);
@@ -801,6 +803,104 @@ async function handleTriageForMe(insights, mined) {
   };
   triageState = (await (await fetch('/api/triage')).json()).triage || {};
 }
+// ---------- standing orders (directives planted into repo guidance files) ----------
+let directiveReg = { items: [], targets: [] };
+let directivesLoaded = false;
+async function loadDirectiveReg() {
+  try { directiveReg = await (await fetch('/api/directives')).json(); } catch { directiveReg = { items: [], targets: [] }; }
+}
+// prefill the composer with the right standing order for each insight type
+function directiveTemplate(i) {
+  const k = (i && i.key) || '';
+  if (k.startsWith('tier:') || k.startsWith('flatdeleg:') || k.startsWith('hoard:')) return {
+    title: 'Tier your models — premium only where judgment matters',
+    body: [
+      'When orchestrating multi-agent work in this project:',
+      '- Orchestrator / final synthesis / adversarial verdict → premium (Opus 5); flagship (Fable 5) only for the hardest long-horizon planning.',
+      '- Review / research / accuracy-check workers → claude-sonnet-5.',
+      '- Pure fetch / grep / read / summarize helpers → claude-haiku-4-5.',
+      '- Delegation only saves money when workers run a CHEAPER tier than the orchestrator — never let subagents silently inherit the premium model.',
+      '',
+      'Reserve premium tokens for planning and the final judgment gate. Report a per-tier cost breakdown when a workflow finishes so the savings are visible.',
+    ].join('\n') };
+  if (k.startsWith('failrole:')) {
+    const role = i.detail?.role || 'this role';
+    const failPct = i.detail?.runs ? Math.round((1 - i.detail.clean / i.detail.runs) * 100) : null;
+    return { title: `Fix before reuse: the failing "${role}" agent`, body: [
+      `Fleet history: the subagent role "${role}" fails ${failPct != null ? failPct + '% of' : 'many of'} its runs in this project.`,
+      'Before spawning it again:',
+      "- State the environment facts it keeps guessing wrong (real paths, schemas, access patterns) IN its prompt — don't make it rediscover them.",
+      '- Give it one narrow task and an explicit output contract.',
+      '- If it fails, read its transcript and fix the prompt or the shared scaffolding it inherits — never just retry.',
+    ].join('\n') };
+  }
+  if (k.startsWith('envrole:')) return {
+    title: `Pin the environment for "${i.detail?.role || 'this role'}"`,
+    body: `Fleet history: "${i.detail?.role || 'this role'}" succeeds on one machine and fails on another — the difference is environment, not the model. Before delegating this role, state which machine and tools it needs, and don't spawn it where its dependencies are missing.\n\nContext: ${i.text}` };
+  return { title: 'Fleet learning', body: (i && i.text) || '' };
+}
+// honest before/after: top-tier share of spend in sessions since the plant date
+function directiveImpact(d, mined) {
+  const before = { top: 0, total: 0, n: 0 }, after = { top: 0, total: 0, n: 0 };
+  for (const x of mined.sessions) {
+    const t = x.mainCost + x.subCost; if (t <= 0) continue;
+    const b = (x.s.mtime || 0) >= d.createdAt ? after : before;
+    b.top += x.topCost; b.total += t; b.n++;
+  }
+  if (after.n < 5) return `${after.n} costed session${after.n === 1 ? '' : 's'} since planted — too early to judge impact.`;
+  if (!before.total) return `${after.n} sessions since planted; no before-data to compare against.`;
+  const bp = Math.round(before.top / before.total * 100), ap = Math.round(after.top / after.total * 100);
+  const dir = ap < bp ? '↓ improving' : ap > bp ? '↑ not helping yet' : '→ flat';
+  return `Top-tier spend share: ${bp}% before → ${ap}% after (${after.n} sessions) ${dir}. Small samples drift — treat as a trend, not proof.`;
+}
+function openDirectiveComposer(pre) {
+  pre = pre || {};
+  const ov = document.createElement('div');
+  ov.className = 'pb-editor-ov'; ov.onclick = e => { if (e.target === ov) ov.remove(); };
+  const targets = directiveReg.targets || [];
+  ov.innerHTML = `<div class="handle-modal">
+    <div class="hm-head"><b>🛰 Plant a standing order</b><button class="mini-btn" id="dcClose">✕</button></div>
+    <div class="hm-body">
+      <p class="dim">This appends a marked block to the guidance file (CLAUDE.md / AGENTS.md) of each repo you pick — every future agent session there reads it automatically. Fully reversible: retire it later and the block is removed. Every file is snapshotted before it's touched.</p>
+      <label class="dim">Title</label>
+      <input id="dcTitle" class="pbe-name" style="width:100%;margin:4px 0 8px" value="${esc(pre.title || '')}" placeholder="e.g. Tier your models">
+      <label class="dim">The order (markdown)</label>
+      <textarea id="dcBody" class="dc-body">${esc(pre.body || '')}</textarea>
+      <div class="hm-m-head" style="margin-top:10px"><b>Where to plant it</b><button class="mini-btn" id="dcAll" style="margin-left:auto">toggle all</button></div>
+      <div class="dir-targets">${targets.map(t => `
+        <label class="dir-target"><input type="checkbox" data-id="${esc(t.id)}"> <b>${esc(t.label)}</b> <span class="dim">${esc(t.name)}${t.exists ? '' : ' · will be created'}</span></label>`).join('') || '<div class="dim">No known repos yet — open some sessions first so I can learn where your projects live.</div>'}
+      </div>
+      <div id="dcResult" class="dim" style="margin-top:8px"></div>
+    </div>
+    <div class="hm-foot">
+      <span class="dim">Local machine only. Every plant is snapshotted + audited.</span>
+      <button class="mini-btn pbe-save" id="dcPlant">🛰 Plant</button>
+    </div></div>`;
+  document.body.appendChild(ov);
+  ov.querySelector('#dcClose').onclick = () => ov.remove();
+  ov.querySelector('#dcAll').onclick = () => { const cbs = [...ov.querySelectorAll('.dir-target input')]; const on = cbs.some(c => !c.checked); cbs.forEach(c => { c.checked = on; }); };
+  ov.querySelector('#dcPlant').onclick = async () => {
+    const ids = [...ov.querySelectorAll('.dir-target input:checked')].map(c => c.dataset.id);
+    const title = ov.querySelector('#dcTitle').value.trim();
+    const body = ov.querySelector('#dcBody').value.trim();
+    const out = ov.querySelector('#dcResult');
+    if (!title || !body) { out.textContent = 'Give it a title and a body first.'; return; }
+    if (!ids.length) { out.textContent = 'Pick at least one repo to plant it in.'; return; }
+    out.textContent = 'Planting…';
+    try {
+      const r = await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'plant', title, body, targets: ids, insightKey: pre.insightKey || null }) });
+      const j = await r.json();
+      if (!r.ok || j.error) throw new Error(j.error || 'failed');
+      directiveReg.items = j.items;
+      const ok = (j.results || []).filter(x => x.status === 'planted').length;
+      const skipped = (j.results || []).filter(x => x.status !== 'planted');
+      out.textContent = `Planted into ${ok} file${ok === 1 ? '' : 's'}.` + (skipped.length ? ' Skipped: ' + skipped.map(x => `${x.label || '?'} (${x.status})`).join(', ') : '');
+      if (pre.insightKey && ok) await setTriageSilent(pre.insightKey, 'resolved');
+      setTimeout(() => { ov.remove(); if (state.view === 'playbooks') renderPlaybooks(); }, 1400);
+    } catch (e) { out.textContent = 'Failed: ' + e.message; }
+  };
+}
+
 loadFlows.fetchOnly = async function () {
   // study the whole track record, archived included — history is the teacher
   const picks = (fleetCache || []).slice(0, 60);
@@ -830,11 +930,15 @@ function mineFleet() {
   const roles = new Map();
   const sessions = [];
   const models = new Map(); // model -> {agents, cost, outTok, roles:Set}
+  const isTop = t => t === 'flagship' || t === 'premium';
   for (const { s, d } of data) {
     const main = d.agents.find(a => a.id === 'main');
-    const subCost = d.agents.filter(a => a.id !== 'main').reduce((n, a) => n + (a.cost || 0), 0);
+    const subs = d.agents.filter(a => a.id !== 'main');
+    const subCost = subs.reduce((n, a) => n + (a.cost || 0), 0);
+    const subTopCost = subs.reduce((n, a) => n + (isTop(modelTier(a.model)) ? (a.cost || 0) : 0), 0);
     const mainCost = main ? (main.cost || 0) : 0;
-    sessions.push({ s, agents: d.agents.length, errors: d.events.filter(e => e.error).length, mainCost, subCost, roles: d.agents.filter(a => a.id !== 'main').map(a => norm(a.name)) });
+    const topCost = subTopCost + (main && isTop(modelTier(main.model)) ? mainCost : 0);
+    sessions.push({ s, agents: d.agents.length, errors: d.events.filter(e => e.error).length, mainCost, subCost, subTopCost, topCost, roles: subs.map(a => norm(a.name)) });
     for (const a of d.agents) {
       if (a.model) {
         const mm = models.get(a.model) || { agents: 0, cost: 0, outTok: 0, roles: new Set(), tier: modelTier(a.model) };
@@ -865,10 +969,24 @@ function mineFleet() {
       if (rates[0].rate - rates[rates.length - 1].rate > 0.3) insights.push({ key: 'envrole:' + name, sev: 'warn', icon: '🖥', text: `"${name}" succeeds ${Math.round(rates[0].rate * 100)}% on ${rates[0].m} but only ${Math.round(rates[rates.length - 1].rate * 100)}% on ${rates[rates.length - 1].m} — the environment matters for this role.`, file: r.example?.file, detail: { role: name, byMachine: r.byMachine } });
     }
   }
+  // Delegation economics — honest version. Delegating is NOT automatically cheaper:
+  // if the subagents run the same premium tier as the orchestrator, delegation saved
+  // nothing. So we flag two distinct problems: (a) work that never got delegated at
+  // all, and (b) work that was delegated but to equally-expensive models.
   for (const x of sessions.filter(x => x.mainCost + x.subCost > 20)) {
-    const share = x.mainCost / (x.mainCost + x.subCost);
-    if (share > 0.6 && x.agents > 5) insights.push({ key: 'hoard:' + x.s.session, sev: 'warn', icon: '💸', text: `"${(x.s.title || '').slice(0, 40)}" spent ${Math.round(share * 100)}% of ~${fmtUsd(x.mainCost + x.subCost)} in the orchestrator itself despite having ${x.agents} agents — more delegation would likely be cheaper.`, file: x.s.file, detail: { mainCost: x.mainCost, subCost: x.subCost, agents: x.agents } });
+    const total = x.mainCost + x.subCost;
+    const share = x.mainCost / total;
+    if (x.subCost > 10 && x.subTopCost / x.subCost > 0.7) {
+      const wouldCost = x.subTopCost * (TIER_RATE.mid / TIER_RATE.premium);
+      insights.push({ key: 'flatdeleg:' + x.s.session, sev: 'warn', icon: '🪙', text: `"${(x.s.title || '').slice(0, 40)}" delegated ~${fmtUsd(x.subCost)} to ${x.agents - 1} agents — but ${Math.round(x.subTopCost / x.subCost * 100)}% of that ran on the same premium tier as the orchestrator, so the delegation saved nothing. The same subagent work one tier down (Sonnet) ≈ ${fmtUsd(wouldCost)} instead of ${fmtUsd(x.subTopCost)}.`, file: x.s.file, detail: { subCost: x.subCost, subTopCost: x.subTopCost, agents: x.agents } });
+    } else if (share > 0.6 && x.agents > 5) {
+      insights.push({ key: 'hoard:' + x.s.session, sev: 'warn', icon: '💸', text: `"${(x.s.title || '').slice(0, 40)}" spent ${Math.round(share * 100)}% of ~${fmtUsd(total)} in the orchestrator itself despite having ${x.agents} agents. Delegating more only saves money if the workers run a CHEAPER tier — pair delegation with the tiering directive.`, file: x.s.file, detail: { mainCost: x.mainCost, subCost: x.subCost, agents: x.agents } });
+    }
   }
+  // fleet-wide: is delegation actually saving money?
+  const fleetSub = sessions.reduce((n, x) => n + x.subCost, 0);
+  const fleetSubTop = sessions.reduce((n, x) => n + x.subTopCost, 0);
+  if (fleetSub > 20 && fleetSubTop / fleetSub < 0.4) insights.push({ key: 'goodtier', sev: 'good', icon: '🎯', text: `Delegation economics are healthy: ${Math.round((1 - fleetSubTop / fleetSub) * 100)}% of your ~${fmtUsd(fleetSub)} subagent spend runs on cheaper tiers than the orchestrator — that's where real savings come from.` });
   const cleanRoles = [...roles.entries()].filter(([, r]) => r.n >= 3 && r.clean / r.n >= 0.85).sort((a, b) => b[1].n - a[1].n);
   if (cleanRoles.length >= 2) insights.push({ key: 'reliable', sev: 'good', icon: '🏆', text: `Your most reliable roles: ${cleanRoles.slice(0, 3).map(([n]) => `"${n}"`).join(', ')} — proven building blocks for new playbooks below.` });
 
@@ -878,13 +996,18 @@ function mineFleet() {
   const totalModelCost = Object.values(tierCost).reduce((a, b) => a + b, 0);
   const topCost = tierCost.flagship + tierCost.premium; // apex + premium both burn expensive tokens
   if (totalModelCost > 20 && topCost / totalModelCost > 0.6) {
-    // roles that ran ONLY on premium models but succeed reliably = downgrade candidates
+    // roles that ran ONLY on top-tier models (premium/flagship) but succeed
+    // reliably = downgrade candidates. Savings = counterfactual: same work at
+    // mid-tier rates, not a flat guess.
     const downgradable = [...roles.entries()].filter(([, r]) => {
-      const ms = Object.keys(r.models); return r.n >= 3 && r.clean / r.n >= 0.85 && ms.length && ms.every(m => modelTier(m) === 'premium');
+      const ms = Object.keys(r.models); return r.n >= 3 && r.clean / r.n >= 0.85 && ms.length && ms.every(m => modelTier(m) === 'premium' || modelTier(m) === 'flagship');
     }).sort((a, b) => b[1].cost - a[1].cost).slice(0, 3);
     if (downgradable.length) {
-      const save = downgradable.reduce((n, [, r]) => n + r.cost * 0.6, 0);
-      insights.push({ key: 'tier:premium', sev: 'warn', icon: '⚖️', text: `${Math.round(tierCost.premium / totalModelCost * 100)}% of your model spend is premium-tier (Opus/GPT-5). Reliable roles like ${downgradable.slice(0, 2).map(([n]) => `"${n}"`).join(', ')} run only on premium models but rarely fail — moving them to a mid tier (Sonnet) could save ~${fmtUsd(save)}. Use a tiered playbook below.`, file: downgradable[0][1].example?.file, detail: { downgradable: downgradable.map(([n, r]) => ({ role: n, cost: r.cost })) } });
+      const save = downgradable.reduce((n, [, r]) => {
+        const rate = Math.max(...Object.keys(r.models).map(m => TIER_RATE[modelTier(m)] || TIER_RATE.premium));
+        return n + r.cost * (1 - TIER_RATE.mid / rate);
+      }, 0);
+      insights.push({ key: 'tier:premium', sev: 'warn', icon: '⚖️', text: `${Math.round(topCost / totalModelCost * 100)}% of your model spend is top-tier (Opus/Fable/GPT-5). Reliable roles like ${downgradable.slice(0, 2).map(([n]) => `"${n}"`).join(', ')} run only on those models but rarely fail — the same tokens at mid tier (Sonnet) would cost ~${fmtUsd(save)} less. Plant the tiering directive to make every future session do this.`, file: downgradable[0][1].example?.file, detail: { downgradable: downgradable.map(([n, r]) => ({ role: n, cost: r.cost })) } });
     }
   }
   const tierBreak = Object.entries(tierCost).filter(([, c]) => c > 0.01).map(([t, c]) => `${t} ~${fmtUsd(c)}`).join(' · ');
@@ -949,6 +1072,7 @@ const PB_GEN = [
   { k: 'tiered', label: '⚖️ Tiered token-saving team' },
 ];
 function renderPlaybooks() {
+  if (!directivesLoaded) { directivesLoaded = true; loadDirectiveReg().then(() => { if (state.view === 'playbooks') renderPlaybooks(); }); }
   const mined = mineFleet();
   const { insights, tierBreak } = mined;
   const sevOrder = { bad: 0, warn: 1, good: 2 };
@@ -958,7 +1082,7 @@ function renderPlaybooks() {
       <span class="dim">${(flowsCache || []).length} sessions studied${tierBreak ? ' · model spend: ' + tierBreak : ''}</span>
       <button id="pbRefresh" class="mini-btn">↻ re-study</button></div>
 
-    <div class="pb-method dim">How this is computed: I aggregate every subagent across your recent sessions by role (name with the run-number stripped), tracking success rate, cost, model tier, and which machine it ran on — then flag failing roles, environment-dependent roles, premium-model overuse, and orchestrators that hoard spend. All rule-based and local; no session content leaves your machine.</div>
+    <div class="pb-method dim">How this is computed: I aggregate every subagent across your recent sessions by role (name with the run-number stripped), tracking success rate, cost, model tier, and which machine it ran on — then flag failing roles, environment-dependent roles, and dishonest delegation economics (top-tier overuse, and workers running the same premium tier as the orchestrator, where delegating saves nothing). All rule-based and local; recomputed on demand, no schedule, and no session content leaves your machine.</div>
 
     <div class="flows-grid">
       <div class="flows-panel">
@@ -989,13 +1113,31 @@ function renderPlaybooks() {
                 ${i.detail ? `<button class="pbi-btn pbi-expand">${open ? '▴ less' : '▾ detail'}</button>` : ''}
                 ${i.file ? `<button class="pbi-btn pbi-open">↗ session</button>` : ''}
                 ${st ? `<button class="pbi-btn pbi-reopen">↺ reopen</button><span class="pbi-status st-${st}">${st}</span>`
-                     : `<button class="pbi-btn pbi-resolve">✓ resolve</button><button class="pbi-btn pbi-dismiss">✕ dismiss</button>`}
+                     : `${i.sev !== 'good' ? `<button class="pbi-btn pbi-directive" title="plant this learning as a standing order in repo guidance files — future sessions obey it automatically">🛰 make it a rule</button>` : ''}<button class="pbi-btn pbi-resolve">✓ resolve</button><button class="pbi-btn pbi-dismiss">✕ dismiss</button>`}
               </div>
               ${open && i.detail ? `<div class="pbi-detail">${insightDetailHTML(i)}</div>` : ''}
             </div>`;
           }).join('') : `<div class="dim" style="padding:14px">Nothing ${triageFilter === 'open' ? 'open' : 'here'} — ${triageFilter === 'open' ? 'you\'ve triaged everything. 🎉' : 'switch filters above.'}</div>`;
         })()}
       </div>
+    </div>
+
+    <div class="flows-panel" style="margin-top:16px">
+      <h3>🛰 Standing orders <span class="dim">(${(directiveReg.items || []).length} planted)</span>
+        <button id="dirNew" class="mini-btn" style="float:right">＋ new order</button></h3>
+      <div class="dim" style="margin-bottom:10px">Rules this dashboard has planted into repo guidance files (CLAUDE.md / AGENTS.md). Every future agent session in those repos reads them automatically — this is how a learning becomes permanent instead of a prompt you have to remember. <b>Check</b> verifies each is still in place; <b>retire</b> removes the block cleanly.</div>
+      ${(directiveReg.items || []).length ? directiveReg.items.map(d => `
+        <div class="dir-item" data-id="${esc(d.id)}">
+          <div class="dir-head"><b>🛰 ${esc(d.title)}</b><span class="dim" style="margin-left:8px">planted ${fmtAgo(d.createdAt)}</span>
+            <span style="margin-left:auto;display:flex;gap:6px">
+              <button class="mini-btn dir-check" title="verify the block is still in every file">🔍 check</button>
+              <button class="mini-btn dir-copy" title="copy the order text">📋</button>
+              <button class="mini-btn dir-retire" title="remove the block from every file and forget it">🗑 retire</button>
+            </span></div>
+          <div class="dir-chips">${(d.targets || []).map(t => `<span class="dir-chip">${esc(t.label)}</span>`).join('')}</div>
+          <div class="dir-impact dim">${esc(directiveImpact(d, mined))}</div>
+          <div class="dir-status dim"></div>
+        </div>`).join('') : '<div class="dim">None yet — hit <b>🛰 make it a rule</b> on any insight above, or ＋ new order.</div>'}
     </div>
 
     <div class="flows-panel" style="margin-top:16px">
@@ -1019,6 +1161,7 @@ function renderPlaybooks() {
     const ins = insights.find(i => i.key === key);
     el.querySelector('.pbi-open')?.addEventListener('click', e => { e.stopPropagation(); openSession(ins.file); state.view = 'story'; setTabs(); render(); });
     el.querySelector('.pbi-expand')?.addEventListener('click', e => { e.stopPropagation(); if (triageExpanded.has(key)) triageExpanded.delete(key); else triageExpanded.add(key); renderPlaybooks(); });
+    el.querySelector('.pbi-directive')?.addEventListener('click', e => { e.stopPropagation(); openDirectiveComposer({ ...directiveTemplate(ins), insightKey: key }); });
     el.querySelector('.pbi-resolve')?.addEventListener('click', e => { e.stopPropagation(); setTriage(key, 'resolved'); });
     el.querySelector('.pbi-dismiss')?.addEventListener('click', e => { e.stopPropagation(); setTriage(key, 'dismissed'); });
     el.querySelector('.pbi-reopen')?.addEventListener('click', e => { e.stopPropagation(); setTriage(key, 'open'); });
@@ -1035,6 +1178,25 @@ function renderPlaybooks() {
     if (await savePlaybookToLib(name, b.dataset.kind, buildPlaybook(b.dataset.kind, mined), 'studio')) renderPlaybooks();
   });
   $('pbNew').onclick = () => openPlaybookEditor(null);
+  $('dirNew') && ($('dirNew').onclick = () => openDirectiveComposer(directiveTemplate({ key: 'tier:new' })));
+  $('playbooks').querySelectorAll('.dir-item').forEach(el => {
+    const d = (directiveReg.items || []).find(x => x.id === el.dataset.id); if (!d) return;
+    el.querySelector('.dir-copy').onclick = e => { navigator.clipboard.writeText(d.body); e.target.textContent = '✓'; setTimeout(() => { e.target.textContent = '📋'; }, 1200); };
+    el.querySelector('.dir-check').onclick = async () => {
+      const st = el.querySelector('.dir-status'); st.textContent = 'Checking…';
+      try {
+        const j = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'check', id: d.id }) })).json();
+        st.innerHTML = (j.statuses || []).map(s => `<span class="dir-chip st-${s.status}">${esc(s.label)} ${s.status === 'ok' ? '✓ in place' : s.status === 'drifted' ? '⚠ removed or edited away' : '⚠ file missing'}</span>`).join(' ') || 'No targets recorded.';
+      } catch { st.textContent = 'Check failed.'; }
+    };
+    el.querySelector('.dir-retire').onclick = async () => {
+      if (!confirm(`Retire "${d.title}"? The block is removed from ${(d.targets || []).length} file(s); each file is snapshotted first.`)) return;
+      try {
+        const j = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'retire', id: d.id }) })).json();
+        if (j.items) { directiveReg.items = j.items; renderPlaybooks(); }
+      } catch { /* leave as-is */ }
+    };
+  });
   $('playbooks').querySelectorAll('.pb-lib-item').forEach(el => {
     const p = playbookLib.items.find(x => x.id === el.dataset.id);
     el.onclick = () => openPlaybookEditor(p); // whole card opens the editor

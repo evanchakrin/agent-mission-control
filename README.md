@@ -117,6 +117,8 @@ A finding is worthless until a *future* session acts on it. Copy-pasting a promp
 
 **Copy-paste is the universal bridge** — it works across machines, stays watch-only, and carries no execution risk — so it's always available as the fallback. But the durable path is **① directives**, and the automatic path is **③ hooks**.
 
+Pathway ① is built in: every insight carries a **🛰 make it a rule** button that opens the composer, and planted rules live on the **Standing orders** board — each one drift-checkable (is it still in the file?), retirable in one click (the block is removed, never the file), snapshotted before every touch, and measured with an honest before/after top-tier-spend trend (small samples say so, instead of pretending). Local machine only, prose files only (`CLAUDE.md`/`AGENTS.md`, never settings or hooks), loopback + CSRF gated like everything else that writes.
+
 The worked example is model tiering. Playbook Studio flagged that reliable review/research roles were inheriting the premium orchestrator model and burning tokens they didn't need. The fix became a **directive** dropped into four repos' `CLAUDE.md`:
 
 ```
