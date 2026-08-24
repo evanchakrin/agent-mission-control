@@ -722,6 +722,62 @@ async function setTriage(key, status) {
   if (r.ok) { triageState = (await r.json()).triage || {}; renderPlaybooks(); }
 }
 const triageExpanded = new Set();
+async function setTriageSilent(key, status) {
+  try { await fetch('/api/triage', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ key, status }) }); } catch { /* ignore */ }
+}
+// "Handle it for me": clear the informational notes, and turn the real issues
+// into a plain-language, per-machine action plan the user can send as-is.
+async function handleTriageForMe(insights, mined) {
+  const open = insights.filter(i => i.key && !triageState[i.key]?.status);
+  const good = open.filter(i => i.sev === 'good');
+  const actionable = open.filter(i => i.sev !== 'good');
+  // auto-dismiss the informational ones (they aren't problems)
+  for (const i of good) await setTriageSilent(i.key, 'dismissed');
+  // group the real issues by the machine they live on
+  const byMachine = {};
+  for (const i of actionable) {
+    let machine = 'This machine';
+    if (i.detail && i.detail.byMachine) machine = Object.keys(i.detail.byMachine)[0] || machine;
+    else if (i.file && i.file.startsWith('relay:')) machine = i.file.split(':')[1];
+    (byMachine[machine] = byMachine[machine] || []).push(i);
+  }
+  // build a paste per machine
+  const machineActions = Object.entries(byMachine).map(([machine, list]) => {
+    const roleIssues = list.filter(i => i.key.startsWith('failrole:') || i.key.startsWith('envrole:'));
+    const lines = [`Agent Mission Control flagged these issues on ${machine}. Please fix each:`, ''];
+    for (const i of list) lines.push('- ' + i.text.replace(/\s+/g, ' '));
+    lines.push('', 'For each failing role: read its failed sessions, find the top 2-3 recurring failure causes, rewrite that role\'s prompt to prevent them, and reply with the causes + the before/after prompt. Don\'t apply changes without showing me first.');
+    return { machine, count: list.length, paste: lines.join('\n') };
+  });
+  // show the plan
+  const ov = document.createElement('div');
+  ov.className = 'pb-editor-ov'; ov.onclick = e => { if (e.target === ov) ov.remove(); };
+  ov.innerHTML = `<div class="handle-modal">
+    <div class="hm-head"><b>✨ Here's what I did</b><button class="mini-btn" id="hmClose">✕</button></div>
+    <div class="hm-body">
+      <p>I closed <b>${good.length}</b> informational note${good.length !== 1 ? 's' : ''} that weren't problems.</p>
+      <p><b>${actionable.length}</b> real issue${actionable.length !== 1 ? 's' : ''} need a fix, grouped by machine below. Since agents run on their own machines, the fix happens there — copy each block and paste it to that machine's Claude/Codex session. That's the whole job.</p>
+      ${machineActions.map((m, i) => `
+        <div class="hm-machine">
+          <div class="hm-m-head"><b>🖥 ${esc(m.machine)}</b><span class="dim">${m.count} issue${m.count !== 1 ? 's' : ''}</span>
+            <button class="mini-btn hm-copy" data-i="${i}" style="margin-left:auto">📋 copy the fix</button></div>
+          <pre class="hm-paste">${esc(m.paste)}</pre>
+        </div>`).join('') || '<p class="dim">No action-needed issues — you\'re clear. 🎉</p>'}
+    </div>
+    <div class="hm-foot">
+      <span class="dim">Mark these resolved once you've sent them (or now, to clear the list):</span>
+      <button class="mini-btn pbe-save" id="hmResolve">✓ Mark all handled</button>
+    </div></div>`;
+  document.body.appendChild(ov);
+  ov.querySelector('#hmClose').onclick = () => { ov.remove(); loadPlaybooks(); };
+  ov.querySelectorAll('.hm-copy').forEach(b => b.onclick = () => { navigator.clipboard.writeText(machineActions[+b.dataset.i].paste); b.textContent = '✓ copied'; setTimeout(() => { b.textContent = '📋 copy the fix'; }, 1500); });
+  ov.querySelector('#hmResolve').onclick = async () => {
+    for (const i of actionable) await setTriageSilent(i.key, 'resolved');
+    ov.remove(); loadPlaybooks();
+  };
+  // refresh underlying counts (good ones already dismissed)
+  triageState = (await (await fetch('/api/triage')).json()).triage || {};
+}
 loadFlows.fetchOnly = async function () {
   // study the whole track record, archived included — history is the teacher
   const picks = (fleetCache || []).slice(0, 60);
@@ -743,7 +799,7 @@ function modelTier(model) {
   if (/haiku|mini|flash|gpt-3/.test(m)) return 'cheap';
   return 'unknown';
 }
-const TIER_RATE = { premium: 25, mid: 15, cheap: 5 }; // rough $/Mtok output, for savings math
+const TIER_RATE = { flagship: 50, premium: 25, mid: 15, cheap: 5 }; // rough $/Mtok output, for savings math
 
 function mineFleet() {
   const data = flowsCache || [];
@@ -794,10 +850,11 @@ function mineFleet() {
   if (cleanRoles.length >= 2) insights.push({ key: 'reliable', sev: 'good', icon: '🏆', text: `Your most reliable roles: ${cleanRoles.slice(0, 3).map(([n]) => `"${n}"`).join(', ')} — proven building blocks for new playbooks below.` });
 
   // model-tier / token-saving analysis: are premium models doing cheap work?
-  const tierCost = { premium: 0, mid: 0, cheap: 0, unknown: 0 };
+  const tierCost = { flagship: 0, premium: 0, mid: 0, cheap: 0, unknown: 0 };
   for (const [, mm] of models) tierCost[mm.tier] += mm.cost;
   const totalModelCost = Object.values(tierCost).reduce((a, b) => a + b, 0);
-  if (totalModelCost > 20 && tierCost.premium / totalModelCost > 0.6) {
+  const topCost = tierCost.flagship + tierCost.premium; // apex + premium both burn expensive tokens
+  if (totalModelCost > 20 && topCost / totalModelCost > 0.6) {
     // roles that ran ONLY on premium models but succeed reliably = downgrade candidates
     const downgradable = [...roles.entries()].filter(([, r]) => {
       const ms = Object.keys(r.models); return r.n >= 3 && r.clean / r.n >= 0.85 && ms.length && ms.every(m => modelTier(m) === 'premium');
@@ -882,7 +939,7 @@ function renderPlaybooks() {
 
     <div class="flows-grid">
       <div class="flows-panel">
-        <h3>What your fleet is telling you — triage</h3>
+        <h3>What your fleet is telling you — triage <button id="handleAll" class="mini-btn" style="float:right" title="I'll clear the informational ones and give you a plain-language action list for the rest">✨ Handle it for me</button></h3>
         <div class="dim" style="margin-bottom:8px">Issues found across ${(flowsCache || []).length} sessions. Expand for detail, open the session to read the conversation, or resolve / dismiss to close it out.</div>
         <div class="seg triage-seg" id="triageSeg">
           ${[['open', 'Open'], ['resolved', 'Resolved'], ['dismissed', 'Dismissed'], ['all', 'All']].map(([v, l]) => {
@@ -916,25 +973,20 @@ function renderPlaybooks() {
           }).join('') : `<div class="dim" style="padding:14px">Nothing ${triageFilter === 'open' ? 'open' : 'here'} — ${triageFilter === 'open' ? 'you\'ve triaged everything. 🎉' : 'switch filters above.'}</div>`;
         })()}
       </div>
-      <div class="flows-panel">
-        <h3>Generate a playbook</h3>
-        <div class="dim" style="margin-bottom:10px">Built from YOUR proven roles, real costs, and model tiers. Copy to paste now, or save to your Library.</div>
-        ${PB_GEN.map(g => `
-          <div class="pb-card">
-            <div class="pb-card-head"><b>${g.label}</b><span class="pb-actions"><button class="mini-btn pb-copy" data-kind="${g.k}">📋 copy</button><button class="mini-btn pb-save" data-kind="${g.k}">＋ save</button></span></div>
-            <pre class="pb-preview">${esc(buildPlaybook(g.k, mined).split('\n').slice(0, 8).join('\n'))}\n…</pre>
-          </div>`).join('')}
-      </div>
     </div>
 
     <div class="flows-panel" style="margin-top:16px">
-      <h3>📚 Your Playbook Library <span class="dim">(${playbookLib.items.length} saved)</span> <button id="pbNew" class="mini-btn" style="float:right">＋ new blank</button></h3>
-      <div class="dim" style="margin-bottom:10px">Your durable collection — saved plays and agentic-doc snippets, editable, kept in <code>~/.claude/mission-control/playbooks.json</code>.</div>
+      <h3>📚 Your Playbook Library <span class="dim">(${playbookLib.items.length} saved)</span>
+        <span style="float:right;display:flex;gap:6px">
+          ${PB_GEN.map(g => `<button class="mini-btn pb-gen" data-kind="${g.k}" title="generate from your fleet, then edit">${esc(g.label.replace(/^\S+\s/, ''))}</button>`).join('')}
+          <button id="pbNew" class="mini-btn">＋ blank</button>
+        </span></h3>
+      <div class="dim" style="margin-bottom:10px">Your durable collection — starter plays, your own directives, and fleet-generated ones. Click any to open the editor. Kept in <code>~/.claude/mission-control/playbooks.json</code>.</div>
       ${playbookLib.items.length ? `<div class="pb-lib">` + playbookLib.items.map(p => `
         <div class="pb-lib-item" data-id="${esc(p.id)}">
           <div class="pli-head"><b>${esc(p.name)}</b><span class="pli-kind">${esc(p.kind)}</span><span class="dim">${fmtAgo(p.updatedAt)}</span></div>
           <div class="pli-actions"><button class="mini-btn pli-copy">📋</button><button class="mini-btn pli-edit">✎</button><button class="mini-btn pli-del">🗑</button></div>
-        </div>`).join('') + `</div>` : '<div class="dim">Empty. Save a generated play above, or start a blank one.</div>'}
+        </div>`).join('') + `</div>` : '<div class="dim">Empty. Generate one from your fleet (buttons above), or start blank.</div>'}
     </div>`;
 
   $('pbRefresh').onclick = () => { flowsCache = null; loadPlaybooks(); };
@@ -948,9 +1000,12 @@ function renderPlaybooks() {
     el.querySelector('.pbi-dismiss')?.addEventListener('click', e => { e.stopPropagation(); setTriage(key, 'dismissed'); });
     el.querySelector('.pbi-reopen')?.addEventListener('click', e => { e.stopPropagation(); setTriage(key, 'open'); });
   });
-  $('playbooks').querySelectorAll('.pb-copy').forEach(b => b.onclick = () => {
-    navigator.clipboard.writeText(buildPlaybook(b.dataset.kind, mined)).then(() => { b.textContent = '✓'; setTimeout(() => { b.textContent = '📋 copy'; }, 1200); });
+  $('playbooks').querySelectorAll('.pb-gen').forEach(b => b.onclick = () => {
+    // generate from the fleet, then hand it to the editor to save/tweak
+    const g = PB_GEN.find(x => x.k === b.dataset.kind);
+    openPlaybookEditor({ id: null, name: g.label.replace(/^\S+\s/, '') + ' (from my fleet)', kind: b.dataset.kind, body: buildPlaybook(b.dataset.kind, mined), source: 'studio' });
   });
+  $('handleAll').onclick = () => handleTriageForMe(insights, mined);
   $('playbooks').querySelectorAll('.pb-save').forEach(b => b.onclick = async () => {
     const g = PB_GEN.find(x => x.k === b.dataset.kind);
     const name = prompt('Save to library as:', g.label.replace(/^\S+\s/, '')); if (!name) return;
@@ -1074,6 +1129,48 @@ function openPlaybookEditor(pb) {
   ta.focus();
 }
 
+// ---------- AUDIT view (plain-language activity log of every change) ----------
+async function loadAudit() {
+  let entries = [];
+  try { entries = (await (await fetch('/api/audit')).json()).entries || []; } catch { /* empty */ }
+  renderAudit(entries);
+}
+function humanizeAudit(e) {
+  const k = e.kind;
+  if (k === 'brain-write') return { icon: e.hooks ? '⚠️' : '🧠', text: `Edited <b>${esc(e.name || 'a config file')}</b>${e.hooks ? ' (hooks — runs shell commands)' : ''}`, sub: e.path, file: e.path, kind: 'brain' };
+  if (k === 'triage') return { icon: e.status === 'resolved' ? '✓' : e.status === 'dismissed' ? '✕' : '↺', text: `${e.status === 'open' ? 'Reopened' : e.status === 'resolved' ? 'Resolved' : 'Dismissed'} an issue`, sub: e.key, kind: 'triage' };
+  if (k === 'playbook-save') return { icon: '💾', text: `Saved playbook <b>${esc(e.name || '')}</b>`, kind: 'playbook' };
+  if (k === 'playbook-delete') return { icon: '🗑', text: 'Deleted a playbook', kind: 'playbook' };
+  if (k === 'launch') return { icon: '🚀', text: `Launched a ${esc(e.agent || 'agent')} session`, sub: e.cwd, kind: 'control' };
+  if (k === 'launch-end') return { icon: '🏁', text: `A launched ${esc(e.agent || 'agent')} finished (exit ${e.code})`, kind: 'control' };
+  if (k === 'kill') return { icon: '🛑', text: `Stopped a running ${esc(e.agent || 'agent')} session`, kind: 'control' };
+  if (k === 'approval') return { icon: '☑', text: `${e.decision === 'approved' ? 'Approved' : 'Denied'} an agent request${e.tool ? ' (' + esc(e.tool) + ')' : ''}`, sub: e.machine, kind: 'control' };
+  if (k === 'enqueue') return { icon: '📤', text: `Queued a ${esc(e.cmd || 'command')} for ${esc(e.machine || 'a machine')}`, kind: 'control' };
+  return { icon: '•', text: esc(k), sub: JSON.stringify(e).slice(0, 80), kind: 'other' };
+}
+let auditFilter = 'all';
+function renderAudit(entries) {
+  const kinds = { all: 'All', brain: 'Config edits', triage: 'Triage', playbook: 'Playbooks', control: 'Control' };
+  const rows = entries.map(e => ({ e, h: humanizeAudit(e) })).filter(x => auditFilter === 'all' || x.h.kind === auditFilter);
+  $('audit').innerHTML =
+    `<div class="fleet-head"><h2>Activity log <span class="qi" title="Every change this dashboard made — config edits, triage decisions, saved playbooks, and any control actions — newest first. Nothing that changes state happens without an entry here.">ⓘ</span></h2>
+      <span class="dim">${entries.length} recorded</span></div>
+    <div class="seg" id="auditSeg" style="margin-bottom:14px">${Object.entries(kinds).map(([v, l]) => `<button data-a="${v}" class="${auditFilter === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+    <div class="audit-list">${rows.length ? rows.map(({ e, h }) => `
+      <div class="audit-row" ${h.file ? `data-brainpath="${esc(encodeURIComponent(h.file))}"` : ''}>
+        <span class="au-icon">${h.icon}</span>
+        <div class="au-body"><div class="au-text">${h.text}</div>${h.sub ? `<div class="au-sub">${esc(String(h.sub))}</div>` : ''}</div>
+        <span class="au-when">${fmtAgo(e.at)}</span>
+      </div>`).join('') : '<div class="dim" style="padding:16px">No activity yet. Edits, triage, and saves will appear here.</div>'}</div>`;
+  $('auditSeg').querySelectorAll('button').forEach(b => b.onclick = () => { auditFilter = b.dataset.a; renderAudit(entries); });
+  $('audit').querySelectorAll('.audit-row[data-brainpath]').forEach(el => el.onclick = async () => {
+    // jump into the Brain editor for the file this entry touched
+    state.view = 'brain'; setTabs(); await loadBrain();
+    const item = brainItems.find(i => i.id === el.dataset.brainpath);
+    if (item) { const r = await (await fetch('/api/brain/file?id=' + item.id)).json(); if (!r.error) { brainCurrent = r; brainDirty = false; brainMode = 'view'; renderBrain(); } }
+  });
+}
+
 // ---------- BRAIN view (memories, hooks, agent configs on this machine) ----------
 let brainItems = [], brainCurrent = null, brainDirty = false, brainMode = 'view';
 
@@ -1098,6 +1195,26 @@ const HOOK_EVENT_HELP = {
   Notification: 'Runs on notifications (e.g. permission prompts).',
 };
 // Render a structured, annotated view of settings.json with hook enable/disable toggles.
+// safe, cross-platform-ish starter hooks a non-technical user can add with one click
+const IS_WIN = /win/i.test(navigator.platform || navigator.userAgent || '');
+const HOOK_STARTERS = [
+  { label: 'Ping when a task finishes', desc: 'Desktop notification each time the agent stops.', event: 'Stop',
+    hook: { hooks: [{ type: 'command', command: IS_WIN ? 'powershell -c "[console]::beep(800,300)"' : 'printf "\\a"' }] } },
+  { label: 'Log every edit', desc: 'Append the file path to ~/.claude/edit-log.txt after each file edit.', event: 'PostToolUse',
+    hook: { matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'echo "$(date): edited a file" >> ~/.claude/edit-log.txt' }] } },
+  { label: 'Announce session start', desc: 'Writes a marker line when a session begins.', event: 'SessionStart',
+    hook: { hooks: [{ type: 'command', command: 'echo "session started $(date)" >> ~/.claude/session-log.txt' }] } },
+];
+function addStarterHook(i) {
+  const s = HOOK_STARTERS[i]; if (!s) return;
+  let cfg; try { cfg = JSON.parse(brainCurrent.content); } catch { return; }
+  cfg.hooks = cfg.hooks || {};
+  cfg.hooks[s.event] = cfg.hooks[s.event] || [];
+  cfg.hooks[s.event].push(JSON.parse(JSON.stringify(s.hook)));
+  brainCurrent.content = JSON.stringify(cfg, null, 2);
+  brainDirty = true;
+  renderBrain();
+}
 function renderHooksExplainer(content) {
   let cfg;
   try { cfg = JSON.parse(content); } catch { return '<div class="dim" style="padding:16px">This file isn\'t valid JSON right now — fix it in Edit mode first.</div>'; }
@@ -1113,7 +1230,13 @@ function renderHooksExplainer(content) {
   const disabled = cfg._disabledHooks || {};
   html += '<div class="he-sec"><h4>Hooks — enable / disable</h4><div class="dim" style="margin-bottom:8px">Toggling moves a hook between the live <code>hooks</code> block and a parked <code>_disabledHooks</code> block (Claude Code ignores unknown keys), so you can turn one off without deleting it. Save to apply.</div>';
   const allEvents = [...new Set([...Object.keys(hooks), ...Object.keys(disabled)])];
-  if (!allEvents.length) html += '<div class="dim">No hooks defined.</div>';
+  if (!allEvents.length) html += `<div class="hooks-empty">
+      <p>This file has no hooks yet. Hooks are little commands that run automatically at moments in a session — like a desktop ping when a task finishes, or auto-formatting after an edit.</p>
+      <p class="dim">Add a ready-made one below (you can turn it off or tweak it anytime). It saves into this file when you hit Save.</p>
+      <div class="hook-starters">
+        ${HOOK_STARTERS.map((s, i) => `<button class="hook-starter" data-i="${i}"><b>＋ ${esc(s.label)}</b><span>${esc(s.desc)}</span></button>`).join('')}
+      </div>
+    </div>`;
   for (const ev of allEvents) {
     html += `<div class="he-event"><div class="he-event-h">${esc(ev)} <span class="dim">— ${esc(HOOK_EVENT_HELP[ev] || 'lifecycle event')}</span></div>`;
     const live = hooks[ev] || [];
@@ -1260,6 +1383,7 @@ function renderBrain() {
     brainMode = b.dataset.m; renderBrain();
   });
   $('brain').querySelectorAll('.he-toggle input').forEach(t => t.onchange = () => toggleHook(t.dataset.ev, Number(t.dataset.idx), t.dataset.on === 'true'));
+  $('brain').querySelectorAll('.hook-starter').forEach(b => b.onclick = () => addStarterHook(Number(b.dataset.i)));
   const hb = $('brainHist');
   if (hb) hb.onclick = async () => {
     const panel = $('brainHistPanel');
@@ -1303,26 +1427,6 @@ function renderBrain() {
 
 // ---------- AUDIT view (immutable record of state-changing actions) ----------
 const AUDIT_ICON = { 'brain-write': '✍️', launch: '🚀', 'launch-end': '🏁', kill: '🛑', approval: '✅', enqueue: '📤' };
-async function loadAudit() {
-  let entries = [];
-  try { entries = (await (await fetch('/api/audit')).json()).entries || []; } catch { /* ignore */ }
-  $('audit').innerHTML =
-    `<div class="fleet-head"><h2>Audit log <span class="qi" title="Every change this dashboard makes to disk is recorded here, append-only. Right now that's Brain file edits; control actions (launches, approvals) will log here too if a control tier is added.">ⓘ</span></h2><span class="dim">${entries.length} recent entries · append-only</span></div>` +
-    (entries.length ? `<div class="audit-list">` + entries.map(e => {
-      const desc = e.kind === 'brain-write' ? `edited <b>${esc(e.name || e.path || '')}</b> (${e.bytes || 0} bytes)${e.hooks ? ' <span class="ferr">— hooks/permissions file</span>' : ''}`
-        : e.kind === 'launch' ? `launched <b>${esc(e.agent)}</b> in ${esc(e.cwd || '')}`
-        : e.kind === 'kill' ? `killed launch <b>${esc(e.id)}</b>`
-        : e.kind === 'approval' ? `${esc(e.decision)} ${esc(e.tool || '')} on ${esc(e.machine || '')}`
-        : esc(e.kind);
-      return `<div class="audit-row">
-        <span class="au-ico">${AUDIT_ICON[e.kind] || '•'}</span>
-        <span class="au-when">${new Date(e.at).toLocaleString()}</span>
-        <span class="au-desc">${desc}</span>
-      </div>`;
-    }).join('') + `</div>`
-    : '<div class="dim" style="padding:20px">No changes recorded yet. Edit a Brain file and it will appear here.</div>');
-}
-
 // ---------- MACHINES view ----------
 async function loadMachines() {
   const [machinesData, fleet] = await Promise.all([
