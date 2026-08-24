@@ -749,6 +749,62 @@ function persistRelay(rec) {
   } catch (e) { console.error('relay persist failed:', e.message); }
 }
 
+// ---------- full-transcript archive (raw .jsonl from remote machines) ----------
+// Relays with --archive upload their raw session transcripts here so the hub
+// holds a complete copy — not just the trimmed relay payloads. Path-guarded,
+// per-file and total-size capped.
+const ARCHIVE_DIR = () => path.join(STATE_DIR, 'archive');
+const ARCHIVE_FILE_CAP = 120 * 1024 * 1024;   // skip any single file bigger than this
+const ARCHIVE_TOTAL_CAP = 6 * 1024 * 1024 * 1024; // ~6GB total budget
+function safeMachine(m) { return String(m || '').replace(/[^\w.-]+/g, '_').slice(0, 60); }
+function archiveMachineDir(machine) { return path.join(ARCHIVE_DIR(), safeMachine(machine)); }
+function archiveManifest(machine) {
+  const base = archiveMachineDir(machine);
+  const out = {};
+  function walk(dir, rel) {
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name), r = rel ? rel + '/' + e.name : e.name;
+      if (e.isDirectory()) walk(full, r);
+      else { try { out[r] = fs.statSync(full).size; } catch { /* skip */ } }
+    }
+  }
+  walk(base, '');
+  return out;
+}
+function archiveDirSize(dir) {
+  let total = 0;
+  function walk(d) { let en = []; try { en = fs.readdirSync(d, { withFileTypes: true }); } catch { return; } for (const e of en) { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else { try { total += fs.statSync(f).size; } catch { /* skip */ } } } }
+  walk(dir);
+  return total;
+}
+function storeArchiveFile(machine, relPath, buf) {
+  const base = path.resolve(archiveMachineDir(machine));
+  const dest = path.resolve(base, relPath.replace(/\\/g, '/'));
+  if (!dest.startsWith(base + path.sep) && dest !== base) throw new Error('path escape');
+  if (!/\.jsonl$/.test(dest)) throw new Error('only .jsonl');
+  if (buf.length > ARCHIVE_FILE_CAP) throw new Error('file too large');
+  if (archiveDirSize(ARCHIVE_DIR()) + buf.length > ARCHIVE_TOTAL_CAP) throw new Error('archive full');
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  const tmp = dest + '.tmp';
+  fs.writeFileSync(tmp, buf);
+  fs.renameSync(tmp, dest);
+  return dest;
+}
+function archiveSummary() {
+  const out = [];
+  let machines = [];
+  try { machines = fs.readdirSync(ARCHIVE_DIR()); } catch { return out; }
+  for (const m of machines) {
+    const dir = path.join(ARCHIVE_DIR(), m);
+    try { if (!fs.statSync(dir).isDirectory()) continue; } catch { continue; }
+    const man = archiveManifest(m);
+    out.push({ machine: m, files: Object.keys(man).length, bytes: Object.values(man).reduce((a, b) => a + b, 0) });
+  }
+  return out;
+}
+
 function loadRelayCache() {
   let files = [];
   try { files = fs.readdirSync(RELAY_DIR()).filter(f => f.endsWith('.json')); } catch { return; }
@@ -1195,6 +1251,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // full-transcript archive: manifest (what the hub already has) + upload
+  if (url.pathname === '/v1/archive/manifest' && req.method === 'GET') {
+    if (!authorized) return json(res, { error: 'bad token' }, 401);
+    return json(res, { manifest: archiveManifest(url.searchParams.get('machine') || '') });
+  }
+  if (url.pathname === '/v1/archive' && req.method === 'POST') {
+    if (!authorized) return json(res, { error: 'bad token' }, 401);
+    return readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        if (!b.machine || !b.relPath || typeof b.data !== 'string') throw new Error('need machine, relPath, data');
+        const buf = Buffer.from(b.data, 'base64');
+        storeArchiveFile(b.machine, b.relPath, buf);
+        json(res, { ok: true });
+      } catch (e) { json(res, { error: e.message }, 400); }
+    });
+  }
+  if (url.pathname === '/api/archive' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    return json(res, { archives: archiveSummary(), dir: ARCHIVE_DIR() });
+  }
+
   // lightweight identity ping — relays poll this every tick to detect a hub
   // restart (in-memory store wiped) and trigger a full resend
   if (url.pathname === '/v1/boot') {
@@ -1598,6 +1676,53 @@ async function runRelay(hub, machineName) {
   };
   await tick();
   setInterval(tick, 5000);
+
+  // --archive: upload raw .jsonl transcripts the hub doesn't have yet. Runs on a
+  // slower cadence than the live relay; skips oversized files; Codex rollouts
+  // included only with --archive-codex (they can be hundreds of MB each).
+  if (process.argv.includes('--archive')) {
+    const withCodex = process.argv.includes('--archive-codex');
+    const FILE_CAP = 120 * 1024 * 1024;
+    const collect = () => {
+      const files = [];
+      const walk = (dir, relBase) => {
+        let entries = [];
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const e of entries) {
+          const full = path.join(dir, e.name), rel = relBase ? relBase + '/' + e.name : e.name;
+          if (e.isDirectory()) walk(full, rel);
+          else if (e.name.endsWith('.jsonl')) { try { const st = fs.statSync(full); files.push({ full, rel, size: st.size }); } catch { /* skip */ } }
+        }
+      };
+      walk(PROJECTS_DIR, 'claude');
+      if (withCodex) walk(CODEX_DIR, 'codex');
+      return files;
+    };
+    const archiveTick = async () => {
+      let manifest = {};
+      try { manifest = (await fetch(hub + '/v1/archive/manifest?machine=' + encodeURIComponent(machineName), { headers: TOKEN ? { 'x-relay-token': TOKEN } : {} }).then(r => r.json())).manifest || {}; }
+      catch { return; }
+      let sent = 0;
+      for (const f of collect()) {
+        if (f.size > FILE_CAP) continue;
+        if (manifest[f.rel] === f.size) continue; // hub already has this exact file
+        try {
+          const data = fs.readFileSync(f.full).toString('base64');
+          const r = await fetch(hub + '/v1/archive', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
+            body: JSON.stringify({ machine: machineName, relPath: f.rel, data }),
+          });
+          if (r.ok) { sent++; if (sent % 10 === 0) console.log(`archived ${sent} transcripts…`); }
+          else if (r.status === 400) { const e = await r.json().catch(() => ({})); if (/archive full/.test(e.error || '')) { console.error('hub archive full — stopping'); return; } }
+        } catch (e) { console.error('archive upload failed', f.rel, e.message); }
+        await new Promise(r => setTimeout(r, 50)); // gentle pacing
+      }
+      if (sent) console.log(`archive pass done: ${sent} new/changed transcripts uploaded`);
+    };
+    console.log(`Archiving raw transcripts → ${hub}/v1/archive${withCodex ? ' (incl. Codex)' : ''}`);
+    setTimeout(archiveTick, 8000);          // first pass after startup
+    setInterval(archiveTick, 5 * 60 * 1000); // then every 5 min
+  }
 }
 
 // ---------- install as an always-on background service (Windows) ----------
@@ -1629,6 +1754,7 @@ function installWindows() {
     const v = argValue(f);
     if (v) extra.push(f, v);
   }
+  for (const flag of ['--archive', '--archive-codex', '--no-auto-update']) if (process.argv.includes(flag)) extra.push(flag);
   const inner = ['node', `"${path.join(dest, 'server.js')}"`, ...extra.map(x => x.startsWith('--') ? x : `"${x}"`)].join(' ');
   const vbs = `CreateObject("Wscript.Shell").Run "${inner.replace(/"/g, '""')}", 0\r\n`;
   fs.writeFileSync(path.join(dest, 'start.vbs'), vbs);
