@@ -725,57 +725,80 @@ const triageExpanded = new Set();
 async function setTriageSilent(key, status) {
   try { await fetch('/api/triage', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ key, status }) }); } catch { /* ignore */ }
 }
-// "Handle it for me": clear the informational notes, and turn the real issues
-// into a plain-language, per-machine action plan the user can send as-is.
+// classify an insight so each type gets the RIGHT action, not one template
+function classifyInsight(i) {
+  if (i.sev === 'good') return 'info';
+  if (i.key.startsWith('failrole:') || i.key.startsWith('envrole:')) return 'failure';
+  if (i.key.startsWith('hoard:') || i.key.startsWith('tier:')) return 'cost';
+  return 'other';
+}
+function insightMachine(i) {
+  if (i.detail && i.detail.byMachine) return Object.keys(i.detail.byMachine)[0] || 'This machine';
+  if (i.file && i.file.startsWith('relay:')) return i.file.split(':')[1];
+  return 'This machine';
+}
+// "Handle it for me": triage the noise, and give the right kind of action for
+// each remaining issue — failures get one SYSTEMIC per-machine investigation
+// (they usually share root causes), cost issues get the delegation/tier lever.
 async function handleTriageForMe(insights, mined) {
   const open = insights.filter(i => i.key && !triageState[i.key]?.status);
-  const good = open.filter(i => i.sev === 'good');
-  const actionable = open.filter(i => i.sev !== 'good');
-  // auto-dismiss the informational ones (they aren't problems)
-  for (const i of good) await setTriageSilent(i.key, 'dismissed');
-  // group the real issues by the machine they live on
+  const info = open.filter(i => classifyInsight(i) === 'info');
+  const failures = open.filter(i => classifyInsight(i) === 'failure');
+  const costs = open.filter(i => classifyInsight(i) === 'cost');
+  for (const i of info) await setTriageSilent(i.key, 'dismissed'); // not problems
+
+  // failures grouped by machine → ONE systemic investigation each (don't fix 75 roles one-by-one)
   const byMachine = {};
-  for (const i of actionable) {
-    let machine = 'This machine';
-    if (i.detail && i.detail.byMachine) machine = Object.keys(i.detail.byMachine)[0] || machine;
-    else if (i.file && i.file.startsWith('relay:')) machine = i.file.split(':')[1];
-    (byMachine[machine] = byMachine[machine] || []).push(i);
-  }
-  // build a paste per machine
+  for (const i of failures) (byMachine[insightMachine(i)] = byMachine[insightMachine(i)] || []).push(i);
   const machineActions = Object.entries(byMachine).map(([machine, list]) => {
-    const roleIssues = list.filter(i => i.key.startsWith('failrole:') || i.key.startsWith('envrole:'));
-    const lines = [`Agent Mission Control flagged these issues on ${machine}. Please fix each:`, ''];
-    for (const i of list) lines.push('- ' + i.text.replace(/\s+/g, ' '));
-    lines.push('', 'For each failing role: read its failed sessions, find the top 2-3 recurring failure causes, rewrite that role\'s prompt to prevent them, and reply with the causes + the before/after prompt. Don\'t apply changes without showing me first.');
+    const worst = [...list].sort((a, b) => (b.detail?.runs ? (1 - b.detail.clean / b.detail.runs) : 0) - (a.detail?.runs ? (1 - a.detail.clean / a.detail.runs) : 0));
+    const names = worst.map(i => (i.detail?.role || (i.text.match(/"([^"]+)"/) || [])[1] || '').trim()).filter(Boolean);
+    const lines = [
+      `Agent Mission Control flags ${list.length} failing agent role${list.length !== 1 ? 's' : ''} on ${machine}. Do NOT fix them one at a time — find the SHARED root causes.`, '',
+      `Worst offenders: ${names.slice(0, 8).join(', ')}${names.length > 8 ? ', …' : ''}.`, '',
+      `1. Read the errored tool calls from 8-12 of the worst roles.`,
+      `2. Cluster the failures by cause (e.g. wrong tool/DB access, path/permission errors, guessed schema, missing context). Most roles here likely share 2-4 root causes.`,
+      `3. Fix the SHARED scaffolding — the common RULES block / workflow template these roles inherit — not each role separately. Report: the clusters, how many roles each affects, and the before/after of the shared block.`,
+      `Don't apply anything without showing me the plan first.`,
+    ];
     return { machine, count: list.length, paste: lines.join('\n') };
   });
-  // show the plan
+
+  // cost issues → the delegation/tier lever (not a prompt fix)
+  const costLines = costs.map(i => '• ' + i.text.replace(/\s+/g, ' '));
+  const tieredPaste = buildPlaybook('tiered', mined);
+
   const ov = document.createElement('div');
   ov.className = 'pb-editor-ov'; ov.onclick = e => { if (e.target === ov) ov.remove(); };
   ov.innerHTML = `<div class="handle-modal">
     <div class="hm-head"><b>✨ Here's what I did</b><button class="mini-btn" id="hmClose">✕</button></div>
     <div class="hm-body">
-      <p>I closed <b>${good.length}</b> informational note${good.length !== 1 ? 's' : ''} that weren't problems.</p>
-      <p><b>${actionable.length}</b> real issue${actionable.length !== 1 ? 's' : ''} need a fix, grouped by machine below. Since agents run on their own machines, the fix happens there — copy each block and paste it to that machine's Claude/Codex session. That's the whole job.</p>
-      ${machineActions.map((m, i) => `
-        <div class="hm-machine">
-          <div class="hm-m-head"><b>🖥 ${esc(m.machine)}</b><span class="dim">${m.count} issue${m.count !== 1 ? 's' : ''}</span>
-            <button class="mini-btn hm-copy" data-i="${i}" style="margin-left:auto">📋 copy the fix</button></div>
-          <pre class="hm-paste">${esc(m.paste)}</pre>
-        </div>`).join('') || '<p class="dim">No action-needed issues — you\'re clear. 🎉</p>'}
+      <p>Closed <b>${info.length}</b> informational note${info.length !== 1 ? 's' : ''} (not problems). Sorted the rest into two kinds, each with the right fix:</p>
+
+      ${failures.length ? `<h4 class="hm-h">🛠 ${failures.length} failing role${failures.length !== 1 ? 's' : ''} — one investigation per machine</h4>
+        <p class="dim">Roles failing in the same repo almost always share a few root causes. Send each machine ONE systemic investigation, not a list of every role.</p>
+        ${machineActions.map((m, i) => `<div class="hm-machine"><div class="hm-m-head"><b>🖥 ${esc(m.machine)}</b><span class="dim">${m.count} role${m.count !== 1 ? 's' : ''}</span><button class="mini-btn hm-copy" data-t="fail" data-i="${i}" style="margin-left:auto">📋 copy</button></div><pre class="hm-paste">${esc(m.paste)}</pre></div>`).join('')}` : ''}
+
+      ${costs.length ? `<h4 class="hm-h">💸 ${costs.length} cost / efficiency finding${costs.length !== 1 ? 's' : ''} — not prompt bugs</h4>
+        <p class="dim">These are spend, not failures. The fix is architectural: let the orchestrator plan and delegate the grunt work to cheaper models. Copy the tiered playbook and use it going forward.</p>
+        <div class="hm-machine"><div class="hm-m-head"><b>The findings</b><button class="mini-btn hm-copy" data-t="tiered" style="margin-left:auto">📋 copy tiered playbook</button></div><pre class="hm-paste">${esc(costLines.join('\n'))}\n\n— Apply the Tiered token-saving playbook (copies with the button) —</pre></div>` : ''}
+
+      ${!failures.length && !costs.length ? '<p class="dim">Nothing action-needed — you\'re clear. 🎉</p>' : ''}
     </div>
     <div class="hm-foot">
-      <span class="dim">Mark these resolved once you've sent them (or now, to clear the list):</span>
+      <span class="dim">Clear these from the Open list once sent:</span>
       <button class="mini-btn pbe-save" id="hmResolve">✓ Mark all handled</button>
     </div></div>`;
   document.body.appendChild(ov);
   ov.querySelector('#hmClose').onclick = () => { ov.remove(); loadPlaybooks(); };
-  ov.querySelectorAll('.hm-copy').forEach(b => b.onclick = () => { navigator.clipboard.writeText(machineActions[+b.dataset.i].paste); b.textContent = '✓ copied'; setTimeout(() => { b.textContent = '📋 copy the fix'; }, 1500); });
+  ov.querySelectorAll('.hm-copy').forEach(b => b.onclick = () => {
+    const txt = b.dataset.t === 'tiered' ? tieredPaste : machineActions[+b.dataset.i].paste;
+    navigator.clipboard.writeText(txt); const o = b.textContent; b.textContent = '✓ copied'; setTimeout(() => { b.textContent = o; }, 1500);
+  });
   ov.querySelector('#hmResolve').onclick = async () => {
-    for (const i of actionable) await setTriageSilent(i.key, 'resolved');
+    for (const i of [...failures, ...costs]) await setTriageSilent(i.key, 'resolved');
     ov.remove(); loadPlaybooks();
   };
-  // refresh underlying counts (good ones already dismissed)
   triageState = (await (await fetch('/api/triage')).json()).triage || {};
 }
 loadFlows.fetchOnly = async function () {
