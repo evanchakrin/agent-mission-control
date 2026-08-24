@@ -428,6 +428,11 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .hm-machine { border: 1px solid var(--line); border-radius: 9px; margin: 12px 0; overflow: hidden; }
 .hm-m-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px; background: var(--panel2); font-size: 13px; }
 .hm-paste { padding: 11px 13px; font-size: 11px; font-family: Consolas, monospace; color: var(--dim); white-space: pre-wrap; max-height: 200px; overflow-y: auto; }
+.arch-browse { width: 100%; margin-top: 8px; text-align: left; }
+.arch-item { padding: 8px 11px; border-radius: 7px; background: var(--panel2); margin-bottom: 4px; cursor: pointer; }
+.arch-item:hover { background: #1b2231; }
+.ai-t { font-size: 12.5px; font-weight: 600; }
+.ai-m { font-size: 10.5px; margin-top: 2px; }
 
 /* brain view */
 #brain { position: absolute; inset: 0; display: grid; grid-template-columns: 330px 1fr; }

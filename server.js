@@ -1161,6 +1161,17 @@ function getResult(fileParam) {
     return sess ? sess.result : null;
   }
   if (fileParam.startsWith('codex:')) return readCodexCached(fileParam.slice(6));
+  if (fileParam.startsWith('archive:')) {
+    // archive:<machine>:<relPath> — a full raw transcript pulled from a relay.
+    // The subagent tree is preserved alongside it, so readSession works as-is.
+    const rest = fileParam.slice(8);
+    const ci = rest.indexOf(':');
+    const machine = rest.slice(0, ci), rel = rest.slice(ci + 1);
+    const base = path.resolve(archiveMachineDir(machine));
+    const full = path.resolve(base, rel.replace(/\\/g, '/'));
+    if (!full.startsWith(base + path.sep) || !full.endsWith('.jsonl') || !fs.existsSync(full)) return null;
+    return readSession(full);
+  }
   const full = resolveSessionPath(fileParam);
   if (!full || !fs.existsSync(full)) return null;
   return readSession(full);
@@ -1271,6 +1282,27 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/api/archive' && req.method === 'GET') {
     if (!metaGate(req, res)) return;
     return json(res, { archives: archiveSummary(), dir: ARCHIVE_DIR() });
+  }
+  if (url.pathname === '/api/archive/list' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    const machine = url.searchParams.get('machine') || '';
+    const man = archiveManifest(machine);
+    // main transcripts only: claude/<slug>/<uuid>.jsonl (skip subagent/workflow files)
+    const items = Object.entries(man)
+      .filter(([rel]) => /^claude\/[^/]+\/[^/]+\.jsonl$/.test(rel) || /^codex\//.test(rel))
+      .map(([rel, size]) => {
+        const abs = path.join(archiveMachineDir(machine), rel);
+        let title = null, mtime = 0;
+        try { mtime = fs.statSync(abs).mtimeMs; } catch { /* skip */ }
+        try {
+          const fd = fs.openSync(abs, 'r'); const buf = Buffer.alloc(Math.min(8192, size));
+          fs.readSync(fd, buf, 0, buf.length, 0); fs.closeSync(fd);
+          for (const line of buf.toString('utf8').split('\n')) { const o = safeParse(line); if (o && (o.type === 'custom-title' || o.type === 'ai-title')) { title = o.customTitle || o.aiTitle; break; } }
+        } catch { /* skip */ }
+        return { file: 'archive:' + machine + ':' + rel, rel, size, mtime, title: title || rel.split('/').pop() };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    return json(res, { machine, items });
   }
 
   // lightweight identity ping — relays poll this every tick to detect a hub

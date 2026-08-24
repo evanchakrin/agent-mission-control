@@ -1467,6 +1467,8 @@ async function loadMachines() {
   }
   const known = new Set(machinesData.map(m => m.name));
   for (const m of Object.keys(byMachine)) if (!known.has(m)) machinesData.push({ name: m, ips: [], lastSeen: byMachine[m].lastMs, remote: true });
+  const archives = await (await fetch('/api/archive')).json().catch(() => ({ archives: [] }));
+  const archByMachine = {}; for (const a of (archives.archives || [])) archByMachine[a.machine] = a;
   $('machines').innerHTML =
     `<div class="fleet-head"><h2>Machines — ${machinesData.length}</h2></div>` +
     `<div class="machine-grid">` + machinesData.map(m => {
@@ -1475,14 +1477,42 @@ async function loadMachines() {
       const kindDots = Object.entries(st.kinds).map(([k, n]) => `<span class="mkind" style="color:${kindColor(k)}">● ${(AGENT_KIND[k] || AGENT_KIND.claude).label} ${n}</span>`).join('');
       const hubV = machinesData.find(x => !x.remote)?.version;
       const drift = m.version && hubV && m.version !== hubV;
+      const arch = archByMachine[safeName(m.name)] || archByMachine[m.name];
       return `<div class="mcard ${fresh ? 'fresh' : ''}">
         <h3>${m.remote ? '⇄' : '★'} ${esc(m.name)} ${m.version ? `<span class="mver ${drift ? 'drift' : ''}" title="${drift ? 'version differs from hub v' + esc(hubV) : 'app version'}">v${esc(m.version)}${drift ? ' ⚠' : ''}</span>` : ''} <span class="mstatus ${fresh ? 'on' : ''}">${fresh ? 'live' : 'idle'}</span></h3>
         <div class="mips">${(m.ips || []).map(ip => `<span class="ip">${esc(ip)}</span>`).join('') || '<span class="ip dim">no IPs reported</span>'}</div>
         <div class="mstats"><span><b>${st.sessions}</b> sessions</span><span><b>${st.agents}</b> agents</span><span class="fcost"><b>~${fmtUsd(st.cost)}</b></span></div>
         <div class="mkinds">${kindDots}</div>
+        ${arch && arch.files ? `<button class="mini-btn arch-browse" data-machine="${esc(arch.machine)}">📚 ${arch.files} archived transcripts · ${fmtBytes(arch.bytes)} — browse</button>` : ''}
         <div class="fdate">last seen ${new Date(m.lastSeen).toLocaleString()}</div>
       </div>`;
     }).join('') + `</div>`;
+  $('machines').querySelectorAll('.arch-browse').forEach(b => b.onclick = () => openArchiveBrowser(b.dataset.machine));
+}
+const fmtBytes = n => n >= 1e9 ? (n / 1e9).toFixed(1) + 'GB' : n >= 1e6 ? (n / 1e6).toFixed(0) + 'MB' : (n / 1e3).toFixed(0) + 'KB';
+function safeName(m) { return String(m || '').replace(/[^\w.-]+/g, '_').slice(0, 60); }
+async function openArchiveBrowser(machine) {
+  const data = await (await fetch('/api/archive/list?machine=' + encodeURIComponent(machine))).json();
+  const ov = document.createElement('div'); ov.className = 'pb-editor-ov'; ov.onclick = e => { if (e.target === ov) ov.remove(); };
+  ov.innerHTML = `<div class="handle-modal">
+    <div class="hm-head"><b>📚 Archived transcripts — ${esc(machine)}</b><input id="archSearch" placeholder="filter…" style="margin-left:12px;flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:6px;padding:5px 9px;font-size:12px"><button class="mini-btn" id="archClose">✕</button></div>
+    <div class="hm-body"><div class="dim" style="margin-bottom:8px">${data.items.length} full transcripts, pulled raw from ${esc(machine)}. Click one to open it in the session viewers (Board / Story / Waterfall).</div>
+      <div id="archList">${archListHTML(data.items)}</div></div></div>`;
+  document.body.appendChild(ov);
+  ov.querySelector('#archClose').onclick = () => ov.remove();
+  const wire = () => ov.querySelectorAll('.arch-item').forEach(el => el.onclick = () => { ov.remove(); openSession(el.dataset.file); state.view = 'story'; setTabs(); render(); });
+  wire();
+  ov.querySelector('#archSearch').oninput = e => {
+    const q = e.target.value.toLowerCase();
+    ov.querySelector('#archList').innerHTML = archListHTML(data.items.filter(i => (i.title + i.rel).toLowerCase().includes(q)));
+    wire();
+  };
+}
+function archListHTML(items) {
+  return items.map(i => `<div class="arch-item" data-file="${esc(i.file)}">
+    <div class="ai-t">${esc(i.title)}</div>
+    <div class="ai-m dim">${esc(i.rel)} · ${fmtBytes(i.size)} · ${i.mtime ? fmtAgo(i.mtime) : ''}</div>
+  </div>`).join('') || '<div class="dim" style="padding:12px">no matches</div>';
 }
 
 // ---------- CONSTELLATION view (force-directed galaxy) ----------
