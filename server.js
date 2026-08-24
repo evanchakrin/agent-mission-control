@@ -909,6 +909,16 @@ function readAudit(limit = 400) {
   } catch { return []; }
 }
 
+// ---------- insight triage (resolve/dismiss fleet issues, persisted) ----------
+const TRIAGE_FILE = path.join(STATE_DIR, 'triage.json');
+function loadTriage() { try { return JSON.parse(fs.readFileSync(TRIAGE_FILE, 'utf8')); } catch { return {}; } }
+function saveTriage(next) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const tmp = TRIAGE_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+  fs.renameSync(tmp, TRIAGE_FILE);
+}
+
 // ---------- playbook library (durable, editable) ----------
 // The long-term home for orchestration plays and agentic-doc snippets. JSON
 // store; gated CRUD; every change audited. Studio can save a generated play
@@ -1231,6 +1241,27 @@ const server = http.createServer((req, res) => {
     const content = brainSnapshotContent(item.path, url.searchParams.get('stamp'));
     if (content == null) return json(res, { error: 'no such snapshot' }, 404);
     return json(res, { content });
+  }
+
+  // ---- insight triage (gated) ----
+  if (url.pathname === '/api/triage' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    return json(res, { triage: loadTriage() });
+  }
+  if (url.pathname === '/api/triage' && req.method === 'POST') {
+    if (!writeGate(req, res)) return;
+    return readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        if (typeof b.key !== 'string' || !b.key) throw new Error('key required');
+        const t = loadTriage();
+        if (b.status === 'open') delete t[b.key];
+        else t[b.key] = { status: clean(b.status, 20) || 'resolved', at: Date.now(), note: clean(b.note, 500) };
+        saveTriage(t);
+        appendAudit({ kind: 'triage', key: b.key, status: b.status });
+        json(res, { ok: true, triage: t });
+      } catch (e) { metaErr(res, e); }
+    });
   }
 
   // ---- playbook library (gated CRUD, audited) ----

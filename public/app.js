@@ -709,12 +709,19 @@ function renderFlows() {
 // ---------- PLAYBOOK STUDIO (mine the fleet, generate reusable plays) ----------
 // Generation only — the studio designs plays from YOUR fleet's track record;
 // you paste them to an agent yourself. It never executes anything.
+let triageState = {}, triageFilter = 'open';
 async function loadPlaybooks() {
   if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
   if (!flowsCache) { $('playbooks').innerHTML = '<div class="fleet-loading">Studying your fleet’s track record…</div>'; await loadFlows.fetchOnly(); }
   await loadPlaybookLib();
+  try { triageState = (await (await fetch('/api/triage')).json()).triage || {}; } catch { triageState = {}; }
   renderPlaybooks();
 }
+async function setTriage(key, status) {
+  const r = await fetch('/api/triage', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ key, status }) });
+  if (r.ok) { triageState = (await r.json()).triage || {}; renderPlaybooks(); }
+}
+const triageExpanded = new Set();
 loadFlows.fetchOnly = async function () {
   // study the whole track record, archived included — history is the teacher
   const picks = (fleetCache || []).slice(0, 60);
@@ -771,20 +778,20 @@ function mineFleet() {
   // insights (rule-based, plain-language)
   const insights = [];
   for (const [name, r] of roles) {
-    if (r.n >= 3 && r.clean / r.n < 0.7) insights.push({ sev: 'bad', icon: '🛠', text: `"${name}" fails ${Math.round((1 - r.clean / r.n) * 100)}% of the time (${r.n} runs). Its prompt or task definition needs work — open a failed run and read what goes wrong.`, file: r.example?.file });
+    if (r.n >= 3 && r.clean / r.n < 0.7) insights.push({ key: 'failrole:' + name, sev: 'bad', icon: '🛠', text: `"${name}" fails ${Math.round((1 - r.clean / r.n) * 100)}% of the time (${r.n} runs). Its prompt or task definition needs work — open a failed run and read what goes wrong.`, file: r.example?.file, detail: { role: name, runs: r.n, clean: r.clean, byMachine: r.byMachine, models: r.models } });
     const machines = Object.entries(r.byMachine).filter(([, v]) => v.n >= 2);
     if (machines.length >= 2) {
       const rates = machines.map(([m, v]) => ({ m, rate: v.clean / v.n }));
       rates.sort((a, b) => b.rate - a.rate);
-      if (rates[0].rate - rates[rates.length - 1].rate > 0.3) insights.push({ sev: 'warn', icon: '🖥', text: `"${name}" succeeds ${Math.round(rates[0].rate * 100)}% on ${rates[0].m} but only ${Math.round(rates[rates.length - 1].rate * 100)}% on ${rates[rates.length - 1].m} — the environment matters for this role.`, file: r.example?.file });
+      if (rates[0].rate - rates[rates.length - 1].rate > 0.3) insights.push({ key: 'envrole:' + name, sev: 'warn', icon: '🖥', text: `"${name}" succeeds ${Math.round(rates[0].rate * 100)}% on ${rates[0].m} but only ${Math.round(rates[rates.length - 1].rate * 100)}% on ${rates[rates.length - 1].m} — the environment matters for this role.`, file: r.example?.file, detail: { role: name, byMachine: r.byMachine } });
     }
   }
   for (const x of sessions.filter(x => x.mainCost + x.subCost > 20)) {
     const share = x.mainCost / (x.mainCost + x.subCost);
-    if (share > 0.6 && x.agents > 5) insights.push({ sev: 'warn', icon: '💸', text: `"${(x.s.title || '').slice(0, 40)}" spent ${Math.round(share * 100)}% of ~${fmtUsd(x.mainCost + x.subCost)} in the orchestrator itself despite having ${x.agents} agents — more delegation would likely be cheaper.`, file: x.s.file });
+    if (share > 0.6 && x.agents > 5) insights.push({ key: 'hoard:' + x.s.session, sev: 'warn', icon: '💸', text: `"${(x.s.title || '').slice(0, 40)}" spent ${Math.round(share * 100)}% of ~${fmtUsd(x.mainCost + x.subCost)} in the orchestrator itself despite having ${x.agents} agents — more delegation would likely be cheaper.`, file: x.s.file, detail: { mainCost: x.mainCost, subCost: x.subCost, agents: x.agents } });
   }
   const cleanRoles = [...roles.entries()].filter(([, r]) => r.n >= 3 && r.clean / r.n >= 0.85).sort((a, b) => b[1].n - a[1].n);
-  if (cleanRoles.length >= 2) insights.push({ sev: 'good', icon: '🏆', text: `Your most reliable roles: ${cleanRoles.slice(0, 3).map(([n]) => `"${n}"`).join(', ')} — proven building blocks for new playbooks below.` });
+  if (cleanRoles.length >= 2) insights.push({ key: 'reliable', sev: 'good', icon: '🏆', text: `Your most reliable roles: ${cleanRoles.slice(0, 3).map(([n]) => `"${n}"`).join(', ')} — proven building blocks for new playbooks below.` });
 
   // model-tier / token-saving analysis: are premium models doing cheap work?
   const tierCost = { premium: 0, mid: 0, cheap: 0, unknown: 0 };
@@ -797,7 +804,7 @@ function mineFleet() {
     }).sort((a, b) => b[1].cost - a[1].cost).slice(0, 3);
     if (downgradable.length) {
       const save = downgradable.reduce((n, [, r]) => n + r.cost * 0.6, 0);
-      insights.push({ sev: 'warn', icon: '⚖️', text: `${Math.round(tierCost.premium / totalModelCost * 100)}% of your model spend is premium-tier (Opus/GPT-5). Reliable roles like ${downgradable.slice(0, 2).map(([n]) => `"${n}"`).join(', ')} run only on premium models but rarely fail — moving them to a mid tier (Sonnet) could save ~${fmtUsd(save)}. Use a tiered playbook below.`, file: downgradable[0][1].example?.file });
+      insights.push({ key: 'tier:premium', sev: 'warn', icon: '⚖️', text: `${Math.round(tierCost.premium / totalModelCost * 100)}% of your model spend is premium-tier (Opus/GPT-5). Reliable roles like ${downgradable.slice(0, 2).map(([n]) => `"${n}"`).join(', ')} run only on premium models but rarely fail — moving them to a mid tier (Sonnet) could save ~${fmtUsd(save)}. Use a tiered playbook below.`, file: downgradable[0][1].example?.file, detail: { downgradable: downgradable.map(([n, r]) => ({ role: n, cost: r.cost })) } });
     }
   }
   const tierBreak = Object.entries(tierCost).filter(([, c]) => c > 0.01).map(([t, c]) => `${t} ~${fmtUsd(c)}`).join(' · ');
@@ -843,6 +850,19 @@ async function savePlaybookToLib(name, kind, body, source) {
   if (r.ok) { playbookLib = await r.json(); return true; } return false;
 }
 
+function insightDetailHTML(i) {
+  const d = i.detail; if (!d) return '';
+  if (d.byMachine) {
+    const rows = Object.entries(d.byMachine).map(([m, v]) => `<tr><td>${esc(m)}</td><td class="num">${v.n} runs</td><td class="num ${v.clean / v.n < 0.6 ? 'bad' : ''}">${Math.round(v.clean / v.n * 100)}% clean</td></tr>`).join('');
+    const models = d.models ? '<div class="pbd-line">Models used: ' + Object.entries(d.models).map(([m, n]) => `${esc(m.replace(/^claude-|-\d+$/g, ''))} ×${n}`).join(', ') + '</div>' : '';
+    return `<div class="pbd-line">Role <b>${esc(d.role)}</b>${d.runs ? ` — ${d.runs} runs, ${d.clean} clean (${Math.round(d.clean / d.runs * 100)}%)` : ''}</div>
+      <table class="pbd-table"><tbody>${rows}</tbody></table>${models}
+      <div class="pbd-hint">To fix: open a failed session (↗) and read the Story tab for the actual error, then adjust this role's prompt. Save the fix as a playbook so it's reusable.</div>`;
+  }
+  if (d.mainCost != null) return `<div class="pbd-line">Orchestrator kept ~${fmtUsd(d.mainCost)}; subagents used ~${fmtUsd(d.subCost)} across ${d.agents} agents.</div><div class="pbd-hint">Delegate more of the reading/searching to subagents (Sonnet/Haiku) so premium orchestrator tokens go to planning + integration. Try the Tiered playbook.</div>`;
+  if (d.downgradable) return `<div class="pbd-line">Downgrade candidates (premium-only, reliable):</div><table class="pbd-table"><tbody>${d.downgradable.map(x => `<tr><td>${esc(x.role)}</td><td class="num fcost">~${fmtUsd(x.cost)}</td></tr>`).join('')}</tbody></table><div class="pbd-hint">Move these to Sonnet in a tiered playbook and re-measure.</div>`;
+  return '';
+}
 const PB_GEN = [
   { k: 'build', label: '🔨 Parallel build team' },
   { k: 'review', label: '⚔️ Adversarial review pass' },
@@ -862,12 +882,39 @@ function renderPlaybooks() {
 
     <div class="flows-grid">
       <div class="flows-panel">
-        <h3>What your fleet is telling you</h3>
-        <div class="dim" style="margin-bottom:10px">Findings from ${(flowsCache || []).length} sessions. Click one to read the actual conversation (Story tab).</div>
-        ${insights.slice(0, 14).map(i => `
-          <div class="pb-insight pb-${i.sev}" ${i.file ? `data-file="${esc(i.file)}"` : ''}>
-            <span class="pb-icon">${i.icon}</span><span class="pb-text">${esc(i.text)}</span>
-          </div>`).join('') || '<div class="dim">Not enough history yet — run more agent sessions and come back.</div>'}
+        <h3>What your fleet is telling you — triage</h3>
+        <div class="dim" style="margin-bottom:8px">Issues found across ${(flowsCache || []).length} sessions. Expand for detail, open the session to read the conversation, or resolve / dismiss to close it out.</div>
+        <div class="seg triage-seg" id="triageSeg">
+          ${[['open', 'Open'], ['resolved', 'Resolved'], ['dismissed', 'Dismissed'], ['all', 'All']].map(([v, l]) => {
+            const n = insights.filter(i => i.key && (v === 'all' || (v === 'open' ? !triageState[i.key] : triageState[i.key]?.status === v))).length;
+            return `<button data-t="${v}" class="${triageFilter === v ? 'on' : ''}">${l}${n ? ' ' + n : ''}</button>`;
+          }).join('')}
+        </div>
+        ${(() => {
+          const shown = insights.filter(i => {
+            const st = i.key ? triageState[i.key]?.status : null;
+            if (triageFilter === 'all') return true;
+            if (triageFilter === 'open') return !st;
+            return st === triageFilter;
+          });
+          return shown.length ? shown.map(i => {
+            const st = i.key ? triageState[i.key]?.status : null;
+            const open = i.key && triageExpanded.has(i.key);
+            return `<div class="pb-insight pb-${i.sev} ${st ? 'triaged' : ''}" data-key="${esc(i.key || '')}">
+              <div class="pbi-main">
+                <span class="pb-icon">${i.icon}</span>
+                <span class="pb-text">${esc(i.text)}</span>
+              </div>
+              <div class="pbi-actions">
+                ${i.detail ? `<button class="pbi-btn pbi-expand">${open ? '▴ less' : '▾ detail'}</button>` : ''}
+                ${i.file ? `<button class="pbi-btn pbi-open">↗ session</button>` : ''}
+                ${st ? `<button class="pbi-btn pbi-reopen">↺ reopen</button><span class="pbi-status st-${st}">${st}</span>`
+                     : `<button class="pbi-btn pbi-resolve">✓ resolve</button><button class="pbi-btn pbi-dismiss">✕ dismiss</button>`}
+              </div>
+              ${open && i.detail ? `<div class="pbi-detail">${insightDetailHTML(i)}</div>` : ''}
+            </div>`;
+          }).join('') : `<div class="dim" style="padding:14px">Nothing ${triageFilter === 'open' ? 'open' : 'here'} — ${triageFilter === 'open' ? 'you\'ve triaged everything. 🎉' : 'switch filters above.'}</div>`;
+        })()}
       </div>
       <div class="flows-panel">
         <h3>Generate a playbook</h3>
@@ -891,7 +938,16 @@ function renderPlaybooks() {
     </div>`;
 
   $('pbRefresh').onclick = () => { flowsCache = null; loadPlaybooks(); };
-  $('playbooks').querySelectorAll('.pb-insight[data-file]').forEach(el => el.onclick = () => { openSession(el.dataset.file); state.view = 'story'; setTabs(); render(); });
+  $('triageSeg')?.querySelectorAll('button').forEach(b => b.onclick = () => { triageFilter = b.dataset.t; renderPlaybooks(); });
+  $('playbooks').querySelectorAll('.pb-insight[data-key]').forEach(el => {
+    const key = el.dataset.key;
+    const ins = insights.find(i => i.key === key);
+    el.querySelector('.pbi-open')?.addEventListener('click', e => { e.stopPropagation(); openSession(ins.file); state.view = 'story'; setTabs(); render(); });
+    el.querySelector('.pbi-expand')?.addEventListener('click', e => { e.stopPropagation(); if (triageExpanded.has(key)) triageExpanded.delete(key); else triageExpanded.add(key); renderPlaybooks(); });
+    el.querySelector('.pbi-resolve')?.addEventListener('click', e => { e.stopPropagation(); setTriage(key, 'resolved'); });
+    el.querySelector('.pbi-dismiss')?.addEventListener('click', e => { e.stopPropagation(); setTriage(key, 'dismissed'); });
+    el.querySelector('.pbi-reopen')?.addEventListener('click', e => { e.stopPropagation(); setTriage(key, 'open'); });
+  });
   $('playbooks').querySelectorAll('.pb-copy').forEach(b => b.onclick = () => {
     navigator.clipboard.writeText(buildPlaybook(b.dataset.kind, mined)).then(() => { b.textContent = '✓'; setTimeout(() => { b.textContent = '📋 copy'; }, 1200); });
   });

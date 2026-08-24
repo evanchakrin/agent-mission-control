@@ -317,8 +317,22 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 
 /* playbook studio */
 #playbooks { position: absolute; inset: 0; overflow: auto; padding: 22px; }
-.pb-insight { display: flex; gap: 10px; align-items: flex-start; padding: 9px 11px; border-radius: 8px; margin-bottom: 6px; background: var(--panel2); font-size: 12.5px; line-height: 1.45; cursor: pointer; border-left: 3px solid var(--line); }
-.pb-insight:hover { background: #1b2231; }
+.triage-seg { margin-bottom: 10px; }
+.pb-insight { padding: 9px 11px; border-radius: 8px; margin-bottom: 6px; background: var(--panel2); font-size: 12.5px; line-height: 1.45; border-left: 3px solid var(--line); }
+.pb-insight.triaged { opacity: .6; }
+.pbi-main { display: flex; gap: 10px; align-items: flex-start; }
+.pbi-actions { display: flex; gap: 6px; align-items: center; margin-top: 7px; flex-wrap: wrap; }
+.pbi-btn { background: var(--panel); border: 1px solid var(--line); color: var(--dim); border-radius: 6px; padding: 2px 9px; font-size: 10.5px; cursor: pointer; }
+.pbi-btn:hover { color: var(--text); border-color: var(--accent); }
+.pbi-status { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 9px; margin-left: auto; }
+.pbi-status.st-resolved { background: rgba(52,211,153,.15); color: var(--green); }
+.pbi-status.st-dismissed { background: rgba(138,147,168,.15); color: var(--dim); }
+.pbi-detail { margin-top: 8px; padding: 9px 11px; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; font-size: 11.5px; }
+.pbd-line { margin-bottom: 5px; }
+.pbd-table { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 11px; }
+.pbd-table td { padding: 3px 6px; border-bottom: 1px solid var(--panel2); }
+.pbd-table td.num { text-align: right; } .pbd-table td.bad { color: var(--red); } .pbd-table td.fcost { color: var(--accent); }
+.pbd-hint { color: var(--dim); font-style: italic; margin-top: 6px; }
 .pb-insight.pb-bad { border-left-color: var(--red); }
 .pb-insight.pb-warn { border-left-color: var(--amber); }
 .pb-insight.pb-good { border-left-color: var(--green); cursor: default; }
