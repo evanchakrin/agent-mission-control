@@ -191,9 +191,13 @@ The overview has four lenses, all color-coded by agent type (Claude coral, Codex
 - **Galaxy** — a force-directed constellation: each machine is a sun, each session a star orbiting it, sized by cost and glowing when recently active. Drag stars, scroll to zoom, click to open.
 - **Machines** — one card per machine with its IP addresses, live/idle status, session and agent counts, cost, and agent-type breakdown.
 
-## Beyond Claude Code: OpenTelemetry ingestion
+## Beyond Claude Code: any agent that speaks OpenTelemetry
 
-The server is also an OTLP/HTTP trace receiver. Any OpenTelemetry-instrumented agent framework (CrewAI, LangGraph, AutoGen, OpenLIT, custom SDK code) can stream spans to it, and the session appears live in the Fleet view alongside your Claude Code sessions — same board, timeline, playback, and cost analytics.
+**A waterfall in one minute, with no setup.** No Docker, no collector config, no account, no signup.
+
+OpenTelemetry is the industry standard for software reporting what it just did — each step becomes a *span* (name, start, end, did it error), and a chain of spans is a *trace*. **OTLP** is the format those reports travel in. It's a standard plug, so anything already instrumented — CrewAI, LangGraph, AutoGen, OpenLIT, your own SDK code — can point its existing exporter here and show up live in the Fleet view with the same board, timeline, playback, and cost analytics as your Claude Code sessions. No integration written on either side.
+
+> **Honest positioning:** this is not an [Arize Phoenix](https://github.com/Arize-ai/phoenix) or Langfuse replacement. They own evals, datasets, and run-to-run experiments, and none of that exists here. Use them for *"was this answer any good?"*. Use this when you want a topology and a waterfall right now without standing anything up — or when you want your custom agents and the Claude Code session you wrote them in on one screen, which is the part nobody else does.
 
 Point your instrumentation at the dashboard with JSON protocol:
 
