@@ -1725,9 +1725,12 @@ function buildExport(result, title) {
   const js = fs.readFileSync(path.join(PUBLIC_DIR, 'app.js'), 'utf8');
   const data = { ...result, now: Date.now() };
   const baked = `<script>window.__BAKED__=${JSON.stringify({ title: title || 'Session replay', data }).replace(/</g, '\\u003c')}</script>`;
+  // Replacement FUNCTIONS, not strings: String.replace treats $$ $& $` $' and $1
+  // in a replacement string as patterns, and app.js contains `$'` inside fmtUsd —
+  // which silently mangled every exported replay into a dead page.
   return html
-    .replace('<link rel="stylesheet" href="/style.css">', `<style>\n${css}\n</style>`)
-    .replace('<script src="/app.js"></script>', `${baked}\n<script>\n${js}\n</script>`);
+    .replace('<link rel="stylesheet" href="/style.css">', () => `<style>\n${css}\n</style>`)
+    .replace('<script src="/app.js"></script>', () => `${baked}\n<script>\n${js}\n</script>`);
 }
 
 // ---------- http server ----------

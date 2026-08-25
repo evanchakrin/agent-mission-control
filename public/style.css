@@ -34,7 +34,11 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .sp-title { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sp-meta { display: flex; gap: 8px; align-items: center; margin-top: 3px; font-size: 10.5px; color: var(--dim); }
 .sp-empty { padding: 16px; text-align: center; color: var(--dim); font-size: 12px; }
-.tabs { display: flex; gap: 2px; background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; padding: 2px; }
+/* four candidate home views pushed this past the viewport; let it scroll on its
+   own rather than making the whole page slide sideways */
+.tabs { display: flex; gap: 2px; background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; padding: 2px; max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs button { flex: 0 0 auto; }
 .tabs button { background: none; border: none; color: var(--dim); font-size: 12px; padding: 4px 12px; border-radius: 5px; cursor: pointer; }
 .tabs button.on { background: var(--panel); color: var(--accent); }
 .live-pill { margin-left: auto; display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dim); white-space: nowrap; }
@@ -675,3 +679,74 @@ footer input[type=range] { flex: 1; accent-color: var(--accent); }
 footer button { background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
 footer button.on { border-color: var(--accent); color: var(--accent); }
 #speed { padding: 4px 6px; }
+
+/* small dim label — SCOPED to the new candidate home views. A global `.dim`
+   silently restyled ~30 pre-existing elements across Playbooks, Brain and Flows. */
+#calendar .dim, #rhythm .dim, #rings .dim, #fingerprints .dim { color: var(--dim); }
+
+/* "set as home" control shared by candidate home-screen views */
+.home-btn { background: var(--panel2); border: 1px solid var(--line); color: var(--dim); border-radius: 7px; padding: 6px 12px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.home-btn:hover { border-color: var(--accent); color: var(--accent); }
+.home-btn.is-home { border-color: var(--amber); color: var(--amber); background: rgba(251,191,36,.1); }
+
+/* ---------- fingerprints (wall of small-multiple session glyphs) ---------- */
+#fingerprints { position: absolute; inset: 0; overflow-y: auto; padding: 22px; }
+.fp-toolbar { display: flex; align-items: center; gap: 10px; margin: -2px 0 16px; flex-wrap: wrap; }
+.fp-wall { display: flex; flex-wrap: wrap; gap: 6px; }
+.fp-wall.sz-small { gap: 4px; }
+.fp-wall.sz-large { gap: 9px; }
+.fp-tile { cursor: pointer; border-radius: 4px; transition: transform .12s; }
+.fp-tile:hover { transform: translateY(-2px); }
+.fp-svg { display: block; }
+.fp-skel rect { animation: fp-pulse 1.4s ease-in-out infinite; }
+@keyframes fp-pulse { 0%, 100% { opacity: .4; } 50% { opacity: .85; } }
+.fp-empty { color: var(--dim); font-size: 13px; padding: 40px; text-align: center; }
+.fp-overflow { color: var(--dim); font-size: 11.5px; margin-top: 16px; text-align: center; }
+
+/* ---------- calendar (contribution-style heatmap) ---------- */
+#calendar { position: absolute; inset: 0; overflow-y: auto; padding: 22px; }
+.cal-summary { font-size: 13px; color: var(--text); margin-bottom: 14px; line-height: 1.5; }
+.cal-summary b { color: var(--accent); }
+.cal-wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+.cal-cell { cursor: pointer; }
+.cal-cell:hover { stroke: var(--text); stroke-width: 1.5; }
+.cal-cell.sel { stroke: var(--accent); stroke-width: 2; }
+.cal-month-label, .cal-wd-label { font-size: 9.5px; fill: var(--dim); }
+.cal-legend { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: var(--dim); margin-top: 10px; }
+.cal-legend .cal-lg-cell { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+.cal-day-panel { margin-top: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.cal-day-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.cal-day-head .mini-btn { margin-left: auto; }
+.cal-day-list { max-height: 320px; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 5px; }
+.cal-day-item { display: flex; flex-direction: column; gap: 2px; background: var(--panel2); border-radius: 7px; padding: 7px 10px; cursor: pointer; }
+.cal-day-item:hover { background: #1b2231; }
+.cdi-t { font-size: 12px; font-weight: 600; }
+.cdi-m { font-size: 10px; color: var(--dim); }
+
+/* ---------- shared small-sample legend line (rings + rhythm) ---------- */
+.rings-legend { font-size: 12px; color: var(--dim); line-height: 1.5; margin: -6px 0 18px; max-width: 900px; }
+.rings-legend span { font-weight: 600; }
+
+/* ---------- rings (one growth-ring disc per project) ---------- */
+#rings { position: absolute; inset: 0; overflow-y: auto; padding: 22px; }
+.rings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 16px; }
+.ring-card { display: flex; flex-direction: column; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 10px; cursor: pointer; text-align: center; transition: border-color .12s, transform .12s; }
+.ring-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.ring-svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+.ring-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.ring-summary { font-size: 11px; color: var(--dim); }
+
+/* ---------- rhythm (24h polar clock + weekday strip) ---------- */
+#rhythm { position: absolute; inset: 0; overflow-y: auto; padding: 22px; }
+.rhy-wrap { display: flex; gap: 32px; flex-wrap: wrap; align-items: flex-start; }
+.rhy-col { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+.rhy-clock { display: block; }
+.rhy-tick { font-size: 10.5px; fill: var(--dim); }
+.rhy-center-n { font-size: 20px; font-weight: 700; fill: var(--text); }
+.rhy-center-l { font-size: 9.5px; fill: var(--dim); }
+.rhy-h3 { font-size: 12px; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 12px; }
+.rhy-wd { display: block; margin-bottom: 14px; }
+.rhy-wd-label { font-size: 10px; fill: var(--dim); }
+.rhy-chrono { font-size: 12.5px; line-height: 1.55; max-width: 320px; }
+.rhy-chrono b { color: var(--accent); }
+.rhy-chrono.dim { color: var(--dim); }

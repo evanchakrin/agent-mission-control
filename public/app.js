@@ -16,11 +16,34 @@ const KINDS = ['user-text', 'user-queued', 'assistant-text', 'tool-call', 'tool-
 const KIND_LABEL = { 'user-text': 'user', 'user-queued': 'queued', 'assistant-text': 'reply', 'tool-call': 'tool', 'tool-result': 'result', 'spawn': 'spawn', 'spawn-result': 'return' };
 const KIND_COLOR = { 'user-text': '#f87171', 'user-queued': '#f87171', 'assistant-text': '#fbbf24', 'tool-call': '#818cf8', 'tool-result': '#60a5fa', 'spawn': '#5eead4', 'spawn-result': '#34d399' };
 
+// ---------- overview tabs ----------
+// Tabs that dispatch through setTabs() (own data load, no live feed/footer) rather
+// than render() (which drives the session-detail panes). Declared up top because
+// the home-view preference below needs it before `state` exists.
+const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines', 'fingerprints', 'calendar', 'rings', 'rhythm'];
+
+// ---------- home-view preference ----------
+// The owner is beta-testing which overview becomes his daily screen (Fingerprints,
+// Calendar, or the existing Fleet). Persisted locally; falls back to Fleet if the
+// stored view was removed in a later update. Each candidate view's header carries
+// a "set as home" button built with homeButton()/wireHomeButton() below.
+const HOME_KEY = 'mc-home-view';
+function getHomeView() { const v = localStorage.getItem(HOME_KEY); return v && OVERVIEW.includes(v) ? v : null; }
+function setHomeView(v) { if (v) localStorage.setItem(HOME_KEY, v); else localStorage.removeItem(HOME_KEY); }
+function homeButton(id) {
+  const isHome = getHomeView() === id;
+  return `<button class="home-btn${isHome ? ' is-home' : ''}" data-home="${id}" title="${isHome ? 'This is your home view — it loads first when you open the dashboard' : 'Make this the view that loads when you open the dashboard'}">${isHome ? '⌂ Home view' : '⌂ Set as home'}</button>`;
+}
+function wireHomeButton(root, id, rerender) {
+  const b = root.querySelector('[data-home="' + id + '"]');
+  if (b) b.onclick = () => { setHomeView(getHomeView() === id ? null : id); rerender(); };
+}
+
 const state = {
   data: { events: [], agents: [], now: 0 },
   es: null, live: !BAKED, scrub: 0, file: null,
   playing: false, speed: 4, playTimer: null,
-  view: BAKED ? 'board' : 'fleet',
+  view: BAKED ? 'board' : (getHomeView() || 'fleet'),
   filterText: '', kindsOn: new Set(KINDS),
   hot: new Map(), lastSeq: -1,
 };
@@ -704,6 +727,503 @@ function renderFlows() {
   // outliers & examples open straight into the readable Story view
   $('flows').querySelectorAll('.fc-eg, .rt-row').forEach(el => el.onclick = () => { if (el.dataset.file) { openSession(el.dataset.file); state.view = 'story'; setTabs(); render(); } });
   $('flows').querySelectorAll('.fc-arch').forEach(b => b.onclick = e => { e.stopPropagation(); setSessionMeta(b.dataset.sk, { archived: true }).then(() => { flowsCache = null; loadFlows(); }); });
+}
+
+// ---------- FINGERPRINTS view (candidate home screen #1) ----------
+// A wall of small multiples: one hand-drawn glyph per session, newest first. Each
+// glyph is a 24-bucket band of that session's tool-call activity over time — height
+// = intensity, red = a bucket that hit an error, the corner tick = duration, and a
+// faint tint by agent kind. The point isn't any one number, it's recognising SHAPE:
+// scan the wall and a bad run (spiky, red-flecked) looks different from a clean one
+// (smooth, quiet) before you've read a word. Reuses the fleet filters so the wall
+// narrows the same way Fleet/Table do.
+let fpCache = new Map();  // file -> {buckets[24], errB[24], kind, cost, dur, title, file, errors}
+let fpSize = 'medium';
+let fpLoading = false;
+const FP_CAP = 400;       // cap on sessions whose full event stream gets fetched at once
+const FP_DIMS = { small: { w: 54, h: 22 }, medium: { w: 92, h: 36 }, large: { w: 148, h: 54 } };
+
+async function loadFingerprints() {
+  // refetch every time: any of these can be the home screen, and a home screen
+  // that never updates is worse than no home screen at all
+  try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
+  renderFingerprints();
+  fetchMissingGlyphs();
+}
+function computeGlyph(s, d) {
+  const events = (d && d.events) || [];
+  const N = 24;
+  const buckets = new Array(N).fill(0), errB = new Array(N).fill(0);
+  const tsMs = events.map(e => e.ts && new Date(e.ts).getTime()).filter(Boolean);
+  const t0 = tsMs.length ? Math.min(...tsMs) : (s.mtime - (s.durationMs || 0));
+  const t1 = tsMs.length ? Math.max(...tsMs) : s.mtime;
+  const span = Math.max(t1 - t0, 1);
+  for (const e of events) {
+    if (!e.ts) continue;
+    const idx = Math.min(N - 1, Math.max(0, Math.floor((new Date(e.ts).getTime() - t0) / span * N)));
+    if (e.kind === 'tool-call' || e.kind === 'spawn' || e.kind === 'tool-result') buckets[idx]++;
+    if (e.error) errB[idx]++;
+  }
+  return { buckets, errB, kind: s.kind, cost: s.cost, dur: s.durationMs, title: s.title || s.session.slice(0, 8), file: s.file, errors: s.errors };
+}
+async function fetchMissingGlyphs() {
+  if (fpLoading) return;
+  const missing = filteredFleet().slice(0, FP_CAP).filter(s => !fpCache.has(s.file));
+  if (!missing.length) return;
+  fpLoading = true;
+  for (let i = 0; i < missing.length; i += 15) {
+    const chunk = missing.slice(i, i + 15);
+    await Promise.all(chunk.map(s =>
+      fetch('/api/session?file=' + encodeURIComponent(s.file)).then(r => r.json())
+        .then(d => fpCache.set(s.file, computeGlyph(s, d)))
+        .catch(() => fpCache.set(s.file, computeGlyph(s, { events: [] })))));
+    if (state.view === 'fingerprints') renderFingerprints(); // fill the wall in as data arrives
+  }
+  fpLoading = false;
+}
+function fpGlyphSvg(g, dims) {
+  const { w, h } = dims;
+  const N = g.buckets.length, bw = w / N;
+  const max = Math.max(...g.buckets, 1);
+  const col = kindColor(g.kind);
+  const padB = 2, plotH = h - padB - 2;
+  let bars = '';
+  for (let i = 0; i < N; i++) {
+    const v = g.buckets[i];
+    if (!v) continue;
+    const bh = Math.max((v / max) * plotH, 1);
+    const x = i * bw, y = h - padB - bh;
+    const err = g.errB[i] > 0;
+    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(bw - 0.6, 0.6).toFixed(1)}" height="${bh.toFixed(1)}" fill="${err ? 'var(--red)' : col}" opacity="${err ? .95 : .6}"/>`;
+  }
+  const durMin = (g.dur || 0) / 60000;
+  const durNorm = Math.max(0, Math.min(1, Math.log10(durMin + 1) / Math.log10(181))); // 0..~3h on a log scale
+  const tickLen = 3 + durNorm * (w * 0.4);
+  return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" class="fp-svg">
+    <rect x="0.5" y="0.5" width="${w - 1}" height="${h - 1}" rx="3" fill="var(--panel2)" stroke="var(--line)"/>
+    ${bars}
+    <line x1="${(w - tickLen).toFixed(1)}" y1="${(h - 0.75).toFixed(1)}" x2="${w.toFixed(1)}" y2="${(h - 0.75).toFixed(1)}" stroke="${col}" stroke-width="1.5" opacity=".85"/>
+    <title>${esc(g.title)}&#10;~${fmtUsd(g.cost)} · ${fmtDur(g.dur)}${g.errors ? ` · ${g.errors} error${g.errors === 1 ? '' : 's'}` : ''}</title>
+  </svg>`;
+}
+function fpSkeletonSvg(dims) {
+  return `<svg viewBox="0 0 ${dims.w} ${dims.h}" width="${dims.w}" height="${dims.h}" class="fp-svg fp-skel"><rect x="0.5" y="0.5" width="${dims.w - 1}" height="${dims.h - 1}" rx="3" fill="var(--panel2)" stroke="var(--line)"/></svg>`;
+}
+function renderFingerprints() {
+  const all = fleetCache || [];
+  const list = filteredFleet();
+  const shown = list.slice(0, FP_CAP);
+  const overflow = list.length - shown.length;
+  const totCost = shown.reduce((n, s) => n + s.cost, 0), totAgents = shown.reduce((n, s) => n + s.agents, 0);
+  const dims = FP_DIMS[fpSize];
+  $('fingerprints').innerHTML =
+    fleetControls(shown.length, all.length, totAgents, totCost) +
+    `<div class="fp-toolbar">
+      <div class="seg" id="fpSizeSeg">${['small', 'medium', 'large'].map(sz => `<button data-sz="${sz}" class="${fpSize === sz ? 'on' : ''}">${sz[0].toUpperCase() + sz.slice(1)}</button>`).join('')}</div>
+      ${homeButton('fingerprints')}
+      <button id="fpRefresh" class="mini-btn">↻ refresh</button>
+    </div>
+    <div class="rings-legend">One tile is one session, newest first. Taller bars = a busier stretch of that run, <span style="color:var(--red)">red</span> = a stretch that hit an error, and the tick along the bottom shows how long it ran. You are looking for the odd one out — hover any tile for its name and cost.</div>` +
+    (shown.length === 0
+      ? `<div class="fp-empty">${all.length === 0 ? 'No sessions yet — once you run something, each session gets its own little shape here.' : 'No sessions match these filters.'}</div>`
+      : `<div class="fp-wall sz-${fpSize}">` + shown.map(s => {
+        const g = fpCache.get(s.file);
+        return `<div class="fp-tile" data-file="${esc(s.file)}">${g ? fpGlyphSvg(g, dims) : fpSkeletonSvg(dims)}</div>`;
+      }).join('') + `</div>` +
+        (overflow > 0 ? `<div class="fp-overflow">+${overflow} more sessions — narrow with filters to bring them into view</div>` : ''));
+  wireFleetControls(() => { renderFingerprints(); fetchMissingGlyphs(); }, $('fingerprints'));
+  $('fingerprints').querySelectorAll('.fp-tile').forEach(t => t.onclick = () => openSession(t.dataset.file));
+  const sizeSeg = $('fingerprints').querySelector('#fpSizeSeg');
+  if (sizeSeg) sizeSeg.querySelectorAll('button').forEach(b => b.onclick = () => { fpSize = b.dataset.sz; renderFingerprints(); });
+  wireHomeButton($('fingerprints'), 'fingerprints', renderFingerprints);
+  const refresh = $('fingerprints').querySelector('#fpRefresh');
+  if (refresh) refresh.onclick = () => { fpCache.clear(); renderFingerprints(); fetchMissingGlyphs(); };
+}
+
+// ---------- CALENDAR view (candidate home screen #2) ----------
+// A GitHub-contributions-style heatmap of the last ~12 months, one cell per day.
+// Colour intensity follows whichever metric the owner picks (sessions/cost/errors/
+// agents). A plain-language line above states the busiest day in words, not just
+// color. Clicking a day opens a panel below listing that day's sessions.
+let calMetric = 'sessions', calSelectedDay = null;
+const CAL_METRIC_COLOR = { sessions: '#5eead4', cost: '#818cf8', agents: '#60a5fa', errors: '#f87171' };
+const CAL_METRIC_LABEL = { sessions: 'Sessions', cost: 'Cost', errors: 'Errors', agents: 'Agents' };
+
+async function loadCalendar() {
+  // refetch every time: any of these can be the home screen, and a home screen
+  // that never updates is worse than no home screen at all
+  try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
+  renderCalendar();
+}
+function calDayKey(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function calMetricVal(rec, metric) {
+  if (!rec) return 0;
+  if (metric === 'cost') return rec.cost;
+  if (metric === 'errors') return rec.errors;
+  if (metric === 'agents') return rec.agents;
+  return rec.sessions;
+}
+function calSummary(days) {
+  if (!days.size) return 'No sessions yet — this fills in as you work.';
+  let best = null;
+  for (const d of days.values()) if (!best || d.sessions > best.sessions) best = d;
+  const dateStr = best.date.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+  const lead = days.size === 1 ? 'Your only active day so far' : 'Your busiest day was';
+  return `${lead} <b>${esc(dateStr)}</b> — ${best.sessions} session${best.sessions === 1 ? '' : 's'}, ~${fmtUsd(best.cost)}${best.errors ? `, ${best.errors} error${best.errors === 1 ? '' : 's'}` : ''}.`;
+}
+function calDayPanelHtml(key, days) {
+  const rec = days.get(key);
+  const sessions = (fleetCache || []).filter(s => s.mtime && calDayKey(s.mtime) === key).sort((a, b) => b.mtime - a.mtime);
+  const dateStr = rec ? rec.date.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }) : key;
+  return `<div class="cal-day-panel">
+    <div class="cal-day-head"><b>${esc(dateStr)}</b><span class="dim">${sessions.length} session${sessions.length === 1 ? '' : 's'}${rec ? ` · ~${fmtUsd(rec.cost)}${rec.errors ? ` · ${rec.errors} errors` : ''}` : ''}</span><button id="calDayClose" class="mini-btn">close</button></div>
+    <div class="cal-day-list">${sessions.map(s => {
+      const c = kindColor(s.kind);
+      return `<div class="cal-day-item" data-file="${esc(s.file)}" style="border-left:3px solid ${c}">
+        <span class="cdi-t">${esc(s.title || s.session.slice(0, 8))}</span>
+        <span class="cdi-m">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label} · ${esc(s.machine || '')} · ~${fmtUsd(s.cost)}${s.errors ? ` · ${s.errors} err` : ''}</span>
+      </div>`;
+    }).join('') || '<div class="dim">no sessions this day</div>'}</div>
+  </div>`;
+}
+function renderCalendar() {
+  const data = fleetCache || [];
+  const days = new Map(); // 'YYYY-MM-DD' -> {sessions, cost, errors, agents, date}
+  // Match the other three views: archived sessions are hidden work, so they must
+  // not colour the grid or inflate the cost. And never count a day the grid cannot
+  // draw — a future mtime could otherwise be named "your busiest day" with no cell.
+  const calTodayEnd = new Date(); calTodayEnd.setHours(23, 59, 59, 999);
+  for (const s of data) {
+    if (!s.mtime || s.mtime > calTodayEnd.getTime()) continue;
+    if (metaOf(s).archived) continue;
+    const k = calDayKey(s.mtime);
+    if (!days.has(k)) days.set(k, { sessions: 0, cost: 0, errors: 0, agents: 0, date: new Date(s.mtime) });
+    const d = days.get(k);
+    d.sessions++; d.cost += s.cost || 0; d.errors += s.errors || 0; d.agents += s.agents || 0;
+  }
+
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const WEEKS = 53;
+  const gridStart = new Date(today);
+  gridStart.setDate(gridStart.getDate() - (WEEKS * 7 - 1));
+  gridStart.setDate(gridStart.getDate() - gridStart.getDay()); // back up to the preceding Sunday
+
+  const cells = [];
+  for (const cur = new Date(gridStart); cur <= today; cur.setDate(cur.getDate() + 1)) {
+    cells.push({ date: new Date(cur), key: calDayKey(cur), rec: days.get(calDayKey(cur)) });
+  }
+  const numWeeks = Math.ceil(cells.length / 7);
+  const maxVal = Math.max(...cells.map(c => calMetricVal(c.rec, calMetric)), 0);
+
+  const CELL = 11, GAP = 3, STEP = CELL + GAP, PAD_L = 26, PAD_T = 16;
+  const w = PAD_L + numWeeks * STEP, h = PAD_T + 7 * STEP;
+  const col = CAL_METRIC_COLOR[calMetric];
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const WD = ['', 'Mon', '', 'Wed', '', 'Fri', ''];
+
+  let svg = '', prevMonth = -1;
+  cells.forEach((c, i) => {
+    if (i % 7 === 0 && c.date.getMonth() !== prevMonth) {
+      svg += `<text class="cal-month-label" x="${PAD_L + Math.floor(i / 7) * STEP}" y="${PAD_T - 5}">${MONTHS[c.date.getMonth()]}</text>`;
+      prevMonth = c.date.getMonth();
+    }
+  });
+  for (let r = 0; r < 7; r++) if (WD[r]) svg += `<text class="cal-wd-label" x="0" y="${PAD_T + r * STEP + CELL - 1.5}">${WD[r]}</text>`;
+  cells.forEach((c, i) => {
+    const x = PAD_L + Math.floor(i / 7) * STEP, y = PAD_T + (i % 7) * STEP;
+    const val = calMetricVal(c.rec, calMetric);
+    let fill = 'var(--panel2)', op = 1;
+    if (val > 0 && maxVal > 0) {
+      const r2 = val / maxVal;
+      op = r2 > .75 ? 1 : r2 > .5 ? .75 : r2 > .25 ? .5 : .28;
+      fill = col;
+    }
+    const dStr = c.date.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+    const tip = c.rec ? `${dStr}: ${c.rec.sessions} session${c.rec.sessions === 1 ? '' : 's'}, ~${fmtUsd(c.rec.cost)}${c.rec.errors ? `, ${c.rec.errors} err` : ''}` : `${dStr}: no sessions`;
+    svg += `<rect class="cal-cell${calSelectedDay === c.key ? ' sel' : ''}" data-key="${c.key}" x="${x}" y="${y}" width="${CELL}" height="${CELL}" rx="2" fill="${fill}" fill-opacity="${op}"><title>${esc(tip)}</title></rect>`;
+  });
+
+  $('calendar').innerHTML =
+    `<div class="fleet-head"><h2>Calendar — last 12 months</h2>
+      <div class="seg" id="calMetricSeg">${Object.keys(CAL_METRIC_LABEL).map(m => `<button data-m="${m}" class="${calMetric === m ? 'on' : ''}">${CAL_METRIC_LABEL[m]}</button>`).join('')}</div>
+      ${homeButton('calendar')}
+    </div>
+    <div class="cal-summary">${calSummary(days)}</div>
+    <div class="cal-wrap"><svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${svg}</svg></div>
+    <div class="cal-legend">less ${[0, .28, .5, .75, 1].map(op => `<span class="cal-lg-cell" style="background:${op === 0 ? 'var(--panel2)' : col};opacity:${op || 1}"></span>`).join('')} more · colour = ${CAL_METRIC_LABEL[calMetric].toLowerCase()}</div>
+    ${calSelectedDay ? calDayPanelHtml(calSelectedDay, days) : ''}`;
+
+  $('calendar').querySelector('#calMetricSeg').querySelectorAll('button').forEach(b => b.onclick = () => { calMetric = b.dataset.m; renderCalendar(); });
+  wireHomeButton($('calendar'), 'calendar', renderCalendar);
+  $('calendar').querySelectorAll('.cal-cell').forEach(rect => rect.onclick = () => { const k = rect.dataset.key; calSelectedDay = calSelectedDay === k ? null : k; renderCalendar(); });
+  const close = $('calendar').querySelector('#calDayClose');
+  if (close) close.onclick = () => { calSelectedDay = null; renderCalendar(); };
+  $('calendar').querySelectorAll('.cal-day-item').forEach(el => el.onclick = () => openSession(el.dataset.file));
+}
+
+// ---------- RINGS view (candidate home screen #3) — one growth-ring disc per project ----------
+// Each project/repo becomes a disc, drawn like a cut tree trunk: the ring closest
+// to the center is that project's OLDEST week of activity (in a bounded window),
+// rings grow outward toward its most recent week. Ring thickness = how busy that
+// week was; ring colour = how it went — green calm, amber a retry happened, red
+// hit errors. A week with too few sessions to judge honestly renders as a thin
+// grey band instead of guessing a colour from one data point. Click a disc to
+// jump into Fleet filtered to that project.
+const RING_MIN_SAMPLE = 3;   // "a handful" — below this, a week's ring is neutral, not dramatic
+const RING_MAX_WEEKS = 10;   // ring cap per disc, so a years-old project doesn't sprawl off-screen
+const RING_BASE_R = 15, RING_STEP = 9;
+const RING_WEEK_MS = 6048e5; // 7 days
+
+async function loadRings() {
+  // refetch every time: any of these can be the home screen, and a home screen
+  // that never updates is worse than no home screen at all
+  try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
+  renderRings();
+}
+function ringWeekStart(ts) {
+  const d = new Date(ts); d.setHours(0, 0, 0, 0);
+  const day = (d.getDay() + 6) % 7; // Monday = 0
+  d.setDate(d.getDate() - day);
+  return d.getTime();
+}
+// Order matters: the old prefix strip ate the leading "C" that the Windows-path
+// pattern needs, so every local project rendered mangled. Try the path form first
+// and only fall through to the source-prefix strip when it does not match.
+function cleanProjLabel(raw) {
+  const s = String(raw || '');
+  const win = s.replace(/^[Cc]--Users-[^-]+-/, '');
+  return (win !== s ? win : s.replace(/^(⇄|Codex)\s*·?\s*/, '')) || 'Unknown';
+}
+function ringDiscSvg(sessions) {
+  const anchor = ringWeekStart(sessions[sessions.length - 1].mtime); // sessions pre-sorted ascending
+  const oldest = ringWeekStart(sessions[0].mtime);
+  const spanAll = Math.round((anchor - oldest) / RING_WEEK_MS) + 1;
+  const span = Math.max(1, Math.min(RING_MAX_WEEKS, spanAll));
+  const byWeek = new Map();
+  for (const s of sessions) {
+    const wk = ringWeekStart(s.mtime);
+    if (!byWeek.has(wk)) byWeek.set(wk, []);
+    byWeek.get(wk).push(s);
+  }
+  const weeksShown = [];
+  for (let i = 0; i < span; i++) weeksShown.push(byWeek.get(anchor - (span - 1 - i) * RING_WEEK_MS) || []);
+  const maxN = Math.max(...weeksShown.map(w => w.length), 1);
+  const R = RING_BASE_R + (span - 1) * RING_STEP + 6;
+  let rings = '';
+  weeksShown.forEach((wk, i) => {
+    const r = RING_BASE_R + i * RING_STEP;
+    const n = wk.length;
+    let color = 'var(--line)', op = .35, sw = 2;
+    // Same rule as the Rhythm clock: colour by the SHARE that went badly, never by
+    // "did any of them", which turns one bad run in seventeen into a red year.
+    const roughN = wk.filter(s => s.errors > 0 || s.retrying || s.stalled).length;
+    const rate = n ? Math.round(roughN / n * 100) : 0;
+    if (n > 0) {
+      sw = 2 + Math.round((n / maxN) * 6);
+      if (n < RING_MIN_SAMPLE) { color = 'var(--dim)'; op = .55; }
+      else {
+        color = rate > 30 ? 'var(--red)' : rate >= 10 ? 'var(--amber)' : 'var(--green)';
+        op = .92;
+      }
+    }
+    const weekStr = new Date(anchor - (span - 1 - i) * RING_WEEK_MS).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    const tip = n
+      ? `Week of ${weekStr}: ${n} session${n === 1 ? '' : 's'}` + (n < RING_MIN_SAMPLE ? ' (too few to judge)' : ` · ${roughN} of ${n} hit trouble (${rate}%)`)
+      : `Week of ${weekStr}: no runs`;
+    rings += `<circle cx="0" cy="0" r="${r}" fill="none" stroke="${color}" stroke-width="${sw}" opacity="${op}"><title>${esc(tip)}</title></circle>`;
+  });
+  return `<svg viewBox="${-R - 4} ${-R - 4} ${(R + 4) * 2} ${(R + 4) * 2}" width="${(R + 4) * 2}" height="${(R + 4) * 2}" class="ring-svg">
+    <circle cx="0" cy="0" r="${RING_BASE_R - 5}" fill="var(--panel2)" stroke="var(--line)"/>
+    ${rings}
+  </svg>`;
+}
+function renderRings() {
+  const all = (fleetCache || []).filter(s => !metaOf(s).archived && s.mtime);
+  const groups = new Map();
+  for (const s of all) {
+    if (!groups.has(s.project)) groups.set(s.project, []);
+    groups.get(s.project).push(s);
+  }
+  const discs = [...groups.entries()].map(([proj, sessions]) => {
+    sessions.sort((a, b) => a.mtime - b.mtime);
+    const cost = sessions.reduce((n, s) => n + s.cost, 0);
+    const rough = sessions.filter(s => s.errors > 0 || s.retrying || s.stalled).length;
+    return { proj, sessions, cost, rough };
+  }).sort((a, b) => b.sessions.length - a.sessions.length || b.sessions[b.sessions.length - 1].mtime - a.sessions[a.sessions.length - 1].mtime);
+
+  $('rings').innerHTML =
+    `<div class="fleet-head"><h2>Projects — rings — ${discs.length} project${discs.length === 1 ? '' : 's'}</h2>${homeButton('rings')}</div>
+    <div class="rings-legend">Each ring is a week — colour is the <b>share</b> of that week's runs that hit trouble: <span style="color:var(--green)">green</span> under 10%, <span style="color:var(--amber)">amber</span> 10–30%, <span style="color:var(--red)">red</span> over 30%, <span style="color:var(--dim)">grey</span> too few runs that week to judge. Thicker ring = busier week. Only the last ${RING_MAX_WEEKS} weeks are drawn: centre = ${RING_MAX_WEEKS} weeks ago, edge = most recent. Hover any ring for the real numbers; click a disc to see it in Fleet.</div>` +
+    (discs.length === 0
+      ? `<div class="fp-empty">No sessions yet — once you run something, its project gets a ring disc here.</div>`
+      : `<div class="rings-grid">` + discs.map(d => {
+        // A relayed session's "project" is its MACHINE name, so every remote repo
+        // collapses into one disc. Say that plainly rather than let it read as a repo.
+        const remote = d.sessions.every(s => /^(relay|otel|archive):/.test(s.file || ''));
+        const label = (remote ? '🖥 ' : '') + cleanProjLabel(d.proj) + (remote ? ' — all remote work' : '');
+        const n = d.sessions.length;
+        // The disc only draws the last RING_MAX_WEEKS weeks, so the caption has to
+        // describe that same window — an all-time total under a truncated picture
+        // reads as if every one of those sessions is shown.
+        const cutoff = ringWeekStart(d.sessions[d.sessions.length - 1].mtime) - (RING_MAX_WEEKS - 1) * RING_WEEK_MS;
+        const shown = d.sessions.filter(s => s.mtime >= cutoff);
+        const older = n - shown.length;
+        const sn = shown.length;
+        const sCost = shown.reduce((a, s) => a + (s.cost || 0), 0);
+        const sRough = shown.filter(s => s.errors > 0 || s.retrying || s.stalled).length;
+        const summary = (sn < RING_MIN_SAMPLE
+          ? `${sn} session${sn === 1 ? '' : 's'} shown — not enough runs to say yet`
+          : `${sn} sessions shown, ~${fmtUsd(sCost)}${sRough ? `, ${sRough} rough run${sRough === 1 ? '' : 's'}` : ', all clean'}`)
+          + (older ? ` · ${older} older not shown` : '');
+        return `<div class="ring-card" data-proj="${esc(d.proj)}" title="Click to see ${esc(label)} in Fleet">
+          ${ringDiscSvg(d.sessions)}
+          <div class="ring-name">${esc(label)}</div>
+          <div class="ring-summary">${esc(summary)}</div>
+        </div>`;
+      }).join('') + `</div>`);
+  wireHomeButton($('rings'), 'rings', renderRings);
+  $('rings').querySelectorAll('.ring-card').forEach(c => c.onclick = () => {
+    fleetFilter = c.dataset.proj; fleetKind = 'all'; fleetMachine = 'all'; fleetProject = 'all'; fleetArchived = 'hide';
+    state.view = 'fleet'; setTabs();
+  });
+}
+
+// ---------- RHYTHM view (candidate home screen #4) — 24h polar clock + weekday strip ----------
+// Wedge length = how many sessions started that hour, all-time, local clock time.
+// Wedge colour = how those runs went, same green/amber/red/grey health scale (and
+// same small-sample gate) as Rings. The weekday strip below is pure volume — no
+// judgement painted onto it. The one interpretive claim on this page — do sessions
+// that started overnight behave differently from the ones you were awake for —
+// only prints when BOTH sides have at least 15 sessions; below that it says so
+// plainly and shows the raw counts, nothing more. Small samples are exactly where
+// a solo operator's "chronotype" story would otherwise lie.
+const RHY_MIN_SAMPLE = 3;
+const RHY_CHRONO_MIN = 15;
+const RHY_WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+async function loadRhythm() {
+  // refetch every time: any of these can be the home screen, and a home screen
+  // that never updates is worse than no home screen at all
+  try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
+  renderRhythm();
+}
+function rhySessionStart(s) { return s.mtime - (s.durationMs || 0); }
+function polarWedgePath(cx, cy, rInner, rOuter, aStartDeg, aEndDeg) {
+  const rad = d => (d - 90) * Math.PI / 180;
+  const p = (r, a) => [cx + r * Math.cos(rad(a)), cy + r * Math.sin(rad(a))];
+  const [x1, y1] = p(rInner, aStartDeg), [x2, y2] = p(rOuter, aStartDeg);
+  const [x3, y3] = p(rOuter, aEndDeg), [x4, y4] = p(rInner, aEndDeg);
+  const large = aEndDeg - aStartDeg > 180 ? 1 : 0;
+  return `M${x1.toFixed(1)},${y1.toFixed(1)} L${x2.toFixed(1)},${y2.toFixed(1)} A${rOuter},${rOuter} 0 ${large} 1 ${x3.toFixed(1)},${y3.toFixed(1)} L${x4.toFixed(1)},${y4.toFixed(1)} A${rInner},${rInner} 0 ${large} 0 ${x1.toFixed(1)},${y1.toFixed(1)} Z`;
+}
+function rhyRoughRate(list) { return list.length ? Math.round(list.filter(s => s.errors > 0 || s.retrying || s.stalled).length / list.length * 100) : 0; }
+function renderRhythm() {
+  const all = (fleetCache || []).filter(s => !metaOf(s).archived && s.mtime);
+  const hours = Array.from({ length: 24 }, () => []);
+  const weekdays = Array.from({ length: 7 }, () => []);
+  for (const s of all) {
+    const d = new Date(rhySessionStart(s));
+    hours[d.getHours()].push(s);
+    weekdays[(d.getDay() + 6) % 7].push(s);
+  }
+  const maxHour = Math.max(...hours.map(h => h.length), 1);
+  const CX = 130, CY = 130, R_IN = 26, R_OUT = 118;
+  let wedges = '';
+  for (let h = 0; h < 24; h++) {
+    const list = hours[h], n = list.length;
+    const len = R_IN + (n / maxHour) * (R_OUT - R_IN);
+    // Colour from the SHARE of rough runs, never `some(...)`. A boolean OR over an
+    // all-time bucket is monotone in sample size: the hours you use most are the
+    // ones guaranteed to contain one bad run eventually, so they'd go red and stay
+    // red forever — telling you the exact opposite of the truth.
+    let color = 'var(--line)', op = .35;
+    const roughN = list.filter(s => s.errors > 0 || s.retrying || s.stalled).length;
+    const rate = n ? Math.round(roughN / n * 100) : 0;
+    if (n > 0) {
+      if (n < RHY_MIN_SAMPLE) { color = 'var(--dim)'; op = .55; }
+      else {
+        color = rate > 30 ? 'var(--red)' : rate >= 10 ? 'var(--amber)' : 'var(--green)';
+        op = .92;
+      }
+    }
+    const hourLabel = h === 0 ? '12am' : h < 12 ? `${h}am` : h === 12 ? '12pm' : `${h - 12}pm`;
+    const tip = n
+      ? `${hourLabel}: ${n} session${n === 1 ? '' : 's'}` + (n < RHY_MIN_SAMPLE ? ' (too few to judge)' : ` · ${roughN} of ${n} hit trouble (${rate}%)`)
+      : `${hourLabel}: no runs`;
+    wedges += `<path d="${polarWedgePath(CX, CY, R_IN, n > 0 ? len : R_IN + 4, h * 15 - 6.5, h * 15 + 6.5)}" fill="${color}" opacity="${op}"><title>${esc(tip)}</title></path>`;
+  }
+  let ticks = '';
+  [[0, '12am'], [6, '6am'], [12, '12pm'], [18, '6pm']].forEach(([h, label]) => {
+    const rad = (h * 15 - 90) * Math.PI / 180;
+    const lx = CX + (R_OUT + 15) * Math.cos(rad), ly = CY + (R_OUT + 15) * Math.sin(rad);
+    ticks += `<text x="${lx.toFixed(1)}" y="${(ly + 4).toFixed(1)}" text-anchor="middle" class="rhy-tick">${label}</text>`;
+  });
+  const clockSvg = `<svg viewBox="0 0 260 260" width="260" height="260" class="rhy-clock">
+    ${wedges}
+    <circle cx="${CX}" cy="${CY}" r="${R_IN - 4}" fill="var(--panel2)" stroke="var(--line)"/>
+    <text x="${CX}" y="${CY - 3}" text-anchor="middle" class="rhy-center-n">${all.length}</text>
+    <text x="${CX}" y="${CY + 13}" text-anchor="middle" class="rhy-center-l">sessions</text>
+    ${ticks}
+  </svg>`;
+
+  const maxWd = Math.max(...weekdays.map(w => w.length), 1);
+  const WD_W = 34, WD_GAP = 10, WD_H = 90;
+  let wdBars = '';
+  weekdays.forEach((list, i) => {
+    const n = list.length;
+    const rough = list.filter(s => s.errors > 0 || s.retrying || s.stalled).length;
+    const h = (n / maxWd) * WD_H;
+    const roughH = n ? (rough / n) * h : 0;
+    const x = i * (WD_W + WD_GAP);
+    // The red overlay is a rate too, so it obeys the same small-sample gate as the
+    // clock: below the threshold the bar is plain volume and the tooltip says why.
+    const judged = n >= RHY_MIN_SAMPLE;
+    const tip = `${RHY_WEEKDAYS[i]}: ${n} session${n === 1 ? '' : 's'}` + (judged ? `${rough ? `, ${rough} of ${n} hit trouble` : ', all clean'}` : n ? ' (too few to judge)' : '');
+    wdBars += `<g>
+      <rect x="${x}" y="${(WD_H - h).toFixed(1)}" width="${WD_W}" height="${h.toFixed(1)}" rx="3" fill="var(--accent2)" opacity=".55"><title>${esc(tip)}</title></rect>
+      ${rough && judged ? `<rect x="${x}" y="${(WD_H - h).toFixed(1)}" width="${WD_W}" height="${roughH.toFixed(1)}" rx="3" fill="var(--red)" opacity=".8"><title>${esc(tip)}</title></rect>` : ''}
+      <text x="${x + WD_W / 2}" y="${WD_H + 16}" text-anchor="middle" class="rhy-wd-label">${RHY_WEEKDAYS[i]}</text>
+    </g>`;
+  });
+  const wdSvg = `<svg viewBox="0 0 ${7 * (WD_W + WD_GAP) - WD_GAP} ${WD_H + 26}" width="${7 * (WD_W + WD_GAP) - WD_GAP}" height="${WD_H + 26}" class="rhy-wd">${wdBars}</svg>`;
+
+  // chronotype: sessions started overnight (12am-6am) vs everything else
+  const overnight = hours.slice(0, 6).flat();
+  const daytime = hours.slice(6).flat();
+  let chrono;
+  if (overnight.length >= RHY_CHRONO_MIN && daytime.length >= RHY_CHRONO_MIN) {
+    const rOv = rhyRoughRate(overnight), rDa = rhyRoughRate(daytime);
+    const diff = rOv - rDa;
+    // At 15 runs a side, a single extra bad session moves the rate ~7 points — so a
+    // fixed 10-point threshold let the verdict flip on one run. Only call a real
+    // difference when the gap clears the sampling error of BOTH samples.
+    const se = p => Math.sqrt((p / 100) * (1 - p / 100));
+    const band = 2 * 100 * Math.max(se(rOv) / Math.sqrt(overnight.length), se(rDa) / Math.sqrt(daytime.length));
+    const verdict = Math.abs(diff) <= Math.max(band, 10)
+      ? `too close to call — ${rOv}% vs ${rDa}% hit an error or retry, which is inside what ${overnight.length} and ${daytime.length} runs can actually tell you apart`
+      : diff > 0
+        ? `rougher: ${rOv}% hit an error or retry, vs ${rDa}% for the ones you started awake`
+        : `actually cleaner: ${rOv}% hit an error or retry, vs ${rDa}% for the ones you started awake`;
+    chrono = `<div class="rhy-chrono"><b>Overnight runs (started 12am–6am)</b> came out ${verdict}. Based on ${overnight.length} overnight and ${daytime.length} daytime/evening sessions.</div>`;
+  } else {
+    chrono = `<div class="rhy-chrono dim">Not enough overnight runs yet to say whether they behave differently — ${overnight.length} started 12am–6am so far, ${daytime.length} during the day/evening. Need at least ${RHY_CHRONO_MIN} on both sides before judging.</div>`;
+  }
+
+  $('rhythm').innerHTML =
+    `<div class="fleet-head"><h2>Rhythm — when you run, and how it goes</h2>${homeButton('rhythm')}</div>
+    <div class="rings-legend">Spoke length = sessions started that hour, all-time. Colour = how they went — <span style="color:var(--green)">green</span> calm, <span style="color:var(--amber)">amber</span> a retry happened, <span style="color:var(--red)">red</span> hit errors, <span style="color:var(--dim)">grey</span> too few runs that hour to judge.</div>
+    <div class="rhy-wrap">
+      <div class="rhy-col">${clockSvg}</div>
+      <div class="rhy-col">
+        <h3 class="rhy-h3">By day of week</h3>
+        ${wdSvg}
+        ${chrono}
+      </div>
+    </div>`;
+  wireHomeButton($('rhythm'), 'rhythm', renderRhythm);
 }
 
 // ---------- PLAYBOOK STUDIO (mine the fleet, generate reusable plays) ----------
@@ -2349,15 +2869,15 @@ function renderFailbar() {
 }
 
 // ---------- render ----------
-const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines'];
+// (OVERVIEW is declared near `state` above — the home-view preference needs it first)
 function setTabs() {
-  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewPlaybooks', 'playbooks'], ['viewBrain', 'brain'], ['viewAudit', 'audit'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewStory', 'story'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
+  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewFingerprints', 'fingerprints'], ['viewCalendar', 'calendar'], ['viewRings', 'rings'], ['viewRhythm', 'rhythm'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewPlaybooks', 'playbooks'], ['viewBrain', 'brain'], ['viewAudit', 'audit'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewStory', 'story'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
     const el = $(btn); if (el) el.classList.toggle('on', state.view === v);
   }
   const overview = OVERVIEW.includes(state.view);
   document.querySelector('main').classList.toggle('no-feed', overview);
   $('empty').style.display = 'none'; // only board/timeline turn it back on
-  for (const id of ['fleet', 'tableView', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
+  for (const id of ['fleet', 'tableView', 'fingerprints', 'calendar', 'rings', 'rhythm', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
   if (overview) for (const p of SESSION_PANES) $(p).style.display = 'none';
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
@@ -2367,6 +2887,10 @@ function setTabs() {
   stopConstellation();
   if (state.view === 'fleet') loadFleet();
   else if (state.view === 'table') loadTable();
+  else if (state.view === 'fingerprints') loadFingerprints();
+  else if (state.view === 'calendar') loadCalendar();
+  else if (state.view === 'rings') loadRings();
+  else if (state.view === 'rhythm') loadRhythm();
   else if (state.view === 'projects') loadProjects();
   else if (state.view === 'usage') loadUsage();
   else if (state.view === 'flows') loadFlows();
@@ -2880,6 +3404,10 @@ $('liveBtn').onclick = () => {
 };
 $('viewFleet').onclick = () => { if (!BAKED) { state.view = 'fleet'; setTabs(); } };
 $('viewTable').onclick = () => { if (!BAKED) { state.view = 'table'; setTabs(); } };
+$('viewFingerprints').onclick = () => { if (!BAKED) { state.view = 'fingerprints'; setTabs(); } };
+$('viewCalendar').onclick = () => { if (!BAKED) { state.view = 'calendar'; setTabs(); } };
+$('viewRings').onclick = () => { if (!BAKED) { state.view = 'rings'; setTabs(); } };
+$('viewRhythm').onclick = () => { if (!BAKED) { state.view = 'rhythm'; setTabs(); } };
 $('viewProjects').onclick = () => { if (!BAKED) { state.view = 'projects'; setTabs(); } };
 $('viewUsage').onclick = () => { if (!BAKED) { state.view = 'usage'; setTabs(); } };
 $('viewFlows').onclick = () => { if (!BAKED) { state.view = 'flows'; setTabs(); } };
@@ -2923,7 +3451,7 @@ if (BAKED) {
   state.scrub = state.data.events.length;
   document.title = 'Replay — ' + BAKED.title;
   $('spicker').style.display = 'none';
-  for (const id of ['viewFleet', 'viewTable', 'viewProjects', 'viewUsage', 'viewFlows', 'viewPlaybooks', 'viewBrain', 'viewAudit', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
+  for (const id of ['viewFleet', 'viewTable', 'viewFingerprints', 'viewCalendar', 'viewRings', 'viewRhythm', 'viewProjects', 'viewUsage', 'viewFlows', 'viewPlaybooks', 'viewBrain', 'viewAudit', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
   $('exportBtn').style.display = 'none';
   $('liveBtn').style.display = 'none';
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'replay';
