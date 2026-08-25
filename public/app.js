@@ -806,6 +806,11 @@ async function handleTriageForMe(insights, mined) {
 // ---------- standing orders (directives planted into repo guidance files) ----------
 let directiveReg = { items: [], targets: [] };
 let directivesLoaded = false;
+let ordersView = 'list'; // 'list' | 'coverage' — standing orders panel toggle
+let coverageChecks = {}; // directive id -> statuses array from the last "check" run (drives ⚠ in the coverage grid)
+let gitStates = {};      // directive id -> per-target git state; filled only when the owner asks, since each check runs real git commands
+let gitNotes = {};       // `${directive id}|${file path}` -> plain result of the last commit/send on that file
+const trunc = (s, n) => (s && s.length > n) ? s.slice(0, n - 1) + '…' : (s || '');
 async function loadDirectiveReg() {
   try { directiveReg = await (await fetch('/api/directives')).json(); } catch { directiveReg = { items: [], targets: [] }; }
 }
@@ -853,6 +858,99 @@ function directiveImpact(d, mined) {
   const dir = ap < bp ? '↓ improving' : ap > bp ? '↑ not helping yet' : '→ flat';
   return `Top-tier spend share: ${bp}% before → ${ap}% after (${after.n} sessions) ${dir}. Small samples drift — treat as a trend, not proof.`;
 }
+// a planted rule shouldn't live forever unquestioned — due when reviewEveryDays have
+// passed since it was last looked at (or since it was planted, if never reviewed)
+const DAY_MS = 86400000;
+function directiveDue(d) {
+  const every = d.reviewEveryDays || 30;
+  const since = d.lastReviewedAt || d.createdAt;
+  return Date.now() - since >= every * DAY_MS;
+}
+// ---- conflict sentry: two standing orders on the same topic can fight each other ----
+// Topic is derived deterministically from the insight key + title text — no LLM, same
+// answer every time. Small rule table; first match wins, else 'general'.
+const TOPIC_RULES = [
+  [/tier|model|premium|sonnet|haiku|opus/i, 'model-tiering'],
+  [/retry|fail|flaky/i, 'failure-handling'],
+  [/machine|environment/i, 'environment'],
+];
+function directiveTopic(insightKey, title) {
+  const s = `${insightKey || ''} ${title || ''}`;
+  for (const [re, topic] of TOPIC_RULES) if (re.test(s)) return topic;
+  return 'general';
+}
+const TOPIC_LABELS = { 'model-tiering': 'model tiering', 'failure-handling': 'failure handling', environment: 'machine/environment setup', general: 'this topic' };
+const topicLabel = t => TOPIC_LABELS[t] || t;
+// backward-compatible: old records planted before topics existed don't have d.topic
+const dirTopic = d => d.topic || directiveTopic(d.insightKey, d.title);
+// active orders sharing a topic AND at least one planted file with the given directive
+function overlappingDirectives(topic, targetPaths, excludeId) {
+  return (directiveReg.items || []).filter(o => o.id !== excludeId && dirTopic(o) === topic && (o.targets || []).some(t => targetPaths.has(t.path)));
+}
+// coverage matrix: rows = every plantable target, columns = active standing orders,
+// cells show whether that order reaches that file. Answers "where does each rule
+// actually reach?" at a glance instead of reading each dir-item card one at a time.
+function coverageGridHTML() {
+  const targets = directiveReg.targets || [];
+  const items = directiveReg.items || [];
+  if (!targets.length) return '<div class="dim">No known repos yet — open some sessions first so I can learn where your projects live.</div>';
+  if (!items.length) return '<div class="dim">None yet — hit <b>🛰 make it a rule</b> on any insight above, or ＋ new order.</div>';
+  const coveredTargets = targets.filter(t => items.some(d => (d.targets || []).some(x => x.path === t.path)));
+  return `
+    <div class="dim" style="margin-bottom:8px">${coveredTargets.length} of ${targets.length} places are covered by at least one rule. Click an empty cell to plant that order there too.</div>
+    <div class="cov-wrap">
+      <table class="cov-table">
+        <thead><tr><th class="cov-corner"></th>${items.map(d => `<th title="${esc(d.title)}">${esc(trunc(d.title, 16))}</th>`).join('')}</tr></thead>
+        <tbody>${targets.map(t => `<tr>
+            <th class="cov-row-label" title="${esc(t.path)}">${esc(t.label)}<div class="dim">${esc(t.name)}</div></th>
+            ${items.map(d => {
+              const planted = (d.targets || []).some(x => x.path === t.path);
+              const checked = (coverageChecks[d.id] || []).find(s => s.path === t.path);
+              const drifted = planted && checked && checked.status !== 'ok';
+              const cls = drifted ? 'warn' : planted ? 'on' : 'off';
+              const symbol = drifted ? '⚠' : planted ? '✓' : '·';
+              const label = drifted ? 'Drifted — removed or edited away since it was planted. "check all" to refresh.'
+                : planted ? 'Covered.' : `Not covered — click to plant "${d.title}" here too.`;
+              return `<td class="cov-cell ${cls}" data-target="${esc(t.id)}" data-dir="${esc(d.id)}" title="${esc(label)}">${symbol}</td>`;
+            }).join('')}
+          </tr>`).join('')}</tbody>
+      </table>
+    </div>
+    <button id="covCheckAll" class="mini-btn" style="margin-top:8px">🔍 check all, refresh drift</button>`;
+}
+// ---- share via git: the safe way a planted rule reaches your other machines ----
+// Nothing is written to another machine. The rule is committed into the repo it
+// already lives in; the other machines get it with git pull, and git revert takes
+// it back everywhere. Commit and send are deliberately two separate buttons —
+// send is the only step that leaves this computer, so it is never automatic.
+function gitRowsHTML(d) {
+  const states = gitStates[d.id];
+  if (!states) return '<button class="mini-btn dir-git-check">🔗 see where this can be shared</button>';
+  if (!states.length) return '<div class="dim">No files recorded for this order yet.</div>';
+  return states.map(s => {
+    if (s.truncated) return `<div class="dg-row dim">…and ${s.truncated} more place${s.truncated === 1 ? '' : 's'} not shown here.</div>`;
+    const note = gitNotes[d.id + '|' + s.path] || '';
+    if (!s.isRepo) return `<div class="dg-row"><div><b>${esc(s.label)}</b> <span class="dim">${esc(s.name)} — ${s.gitMissing ? 'git is not installed on this computer, so nothing can be shared from here.' : 'not a git repo, so there is nothing to commit.'}</span></div></div>`;
+    // .gitignore'd files are invisible to git: a clean `status` here means "never
+    // tracked", not "already saved". Say the true thing and offer no dead buttons.
+    if (s.ignored) return `<div class="dg-row"><div><b>${esc(s.label)}</b> <span class="dim">${esc(s.name)} — this file is listed in .gitignore, so git deliberately does not track it. It cannot be shared this way.</span></div></div>`;
+    const onBranch = !!s.branch;
+    const committed = s.committed === true;
+    const bits = [
+      onBranch ? `on branch ${s.branch}` : 'not on a branch right now — commit would be lost',
+      committed ? 'this rule is saved in the repo history' : 'this rule is not committed yet',
+      s.ahead == null ? 'no remote set up, so nothing can be sent' : s.ahead ? `${s.ahead} commit${s.ahead === 1 ? '' : 's'} waiting to be sent` : 'nothing waiting to be sent',
+    ];
+    return `<div class="dg-row">
+      <div><b>${esc(s.label)}</b> <span class="dim">${esc(s.name)} — ${esc(bits.join(' · '))}</span></div>
+      <div class="dg-btns">
+        <button class="mini-btn dg-commit" data-path="${esc(s.path)}"${(!onBranch || committed) ? ' disabled' : ''} title="${onBranch ? 'save this rule into the repo\'s history on this computer only' : 'switch to a branch first — a commit made here would be thrown away'}">💾 Commit it here</button>
+        <button class="mini-btn dg-push" data-path="${esc(s.path)}"${s.ahead ? '' : ' disabled'} title="send everything committed on this branch to the shared remote — this leaves your computer">⬆ Send to the remote</button>
+      </div>
+      ${note ? `<div class="dg-note dim">${esc(note)}</div>` : ''}
+    </div>`;
+  }).join('') + '<button class="mini-btn dir-git-check">↻ re-check</button>';
+}
 function openDirectiveComposer(pre) {
   pre = pre || {};
   const ov = document.createElement('div');
@@ -866,10 +964,12 @@ function openDirectiveComposer(pre) {
       <input id="dcTitle" class="pbe-name" style="width:100%;margin:4px 0 8px" value="${esc(pre.title || '')}" placeholder="e.g. Tier your models">
       <label class="dim">The order (markdown)</label>
       <textarea id="dcBody" class="dc-body">${esc(pre.body || '')}</textarea>
+      <label class="dim">Remind me to review this every <input id="dcReview" type="number" min="1" max="3650" value="${esc(pre.reviewEveryDays || 30)}" style="width:56px"> days</label>
       <div class="hm-m-head" style="margin-top:10px"><b>Where to plant it</b><button class="mini-btn" id="dcAll" style="margin-left:auto">toggle all</button></div>
       <div class="dir-targets">${targets.map(t => `
         <label class="dir-target"><input type="checkbox" data-id="${esc(t.id)}"> <b>${esc(t.label)}</b> <span class="dim">${esc(t.name)}${t.exists ? '' : ' · will be created'}</span></label>`).join('') || '<div class="dim">No known repos yet — open some sessions first so I can learn where your projects live.</div>'}
       </div>
+      <div id="dcConflict" class="dir-conflict" style="display:none"></div>
       <div id="dcResult" class="dim" style="margin-top:8px"></div>
     </div>
     <div class="hm-foot">
@@ -878,17 +978,53 @@ function openDirectiveComposer(pre) {
     </div></div>`;
   document.body.appendChild(ov);
   ov.querySelector('#dcClose').onclick = () => ov.remove();
-  ov.querySelector('#dcAll').onclick = () => { const cbs = [...ov.querySelectorAll('.dir-target input')]; const on = cbs.some(c => !c.checked); cbs.forEach(c => { c.checked = on; }); };
+  // NB: setting .checked in code fires no 'change' event, so re-arm the conflict
+  // check by hand — otherwise "toggle all" could smuggle unchecked repos past it.
+  ov.querySelector('#dcAll').onclick = () => { const cbs = [...ov.querySelectorAll('.dir-target input')]; const on = cbs.some(c => !c.checked); cbs.forEach(c => { c.checked = on; }); resetConfirm(); };
+  // conflict sentry: any edit after a warning invalidates the "plant anyway" confirmation
+  let overlapConfirmed = false;
+  const resetConfirm = () => { overlapConfirmed = false; ov.querySelector('#dcConflict').style.display = 'none'; ov.querySelector('#dcPlant').textContent = '🛰 Plant'; };
+  ov.querySelector('#dcTitle').addEventListener('input', resetConfirm);
+  ov.querySelectorAll('.dir-target input').forEach(c => c.addEventListener('change', resetConfirm));
   ov.querySelector('#dcPlant').onclick = async () => {
     const ids = [...ov.querySelectorAll('.dir-target input:checked')].map(c => c.dataset.id);
     const title = ov.querySelector('#dcTitle').value.trim();
     const body = ov.querySelector('#dcBody').value.trim();
+    const reviewEveryDays = parseInt(ov.querySelector('#dcReview').value, 10) || 30;
     const out = ov.querySelector('#dcResult');
+    const conflictBox = ov.querySelector('#dcConflict');
     if (!title || !body) { out.textContent = 'Give it a title and a body first.'; return; }
     if (!ids.length) { out.textContent = 'Pick at least one repo to plant it in.'; return; }
+    const topic = directiveTopic(pre.insightKey, title);
+    if (!overlapConfirmed) {
+      const idToPath = new Map(targets.map(t => [t.id, t.path]));
+      const chosenPaths = new Set(ids.map(id => idToPath.get(id)).filter(Boolean));
+      const overlaps = overlappingDirectives(topic, chosenPaths, null);
+      if (overlaps.length) {
+        overlapConfirmed = true;
+        conflictBox.style.display = '';
+        conflictBox.innerHTML = overlaps.map(o => {
+          const sharedLabel = (o.targets || []).find(t => chosenPaths.has(t.path))?.label || 'a shared repo';
+          return `<div>Heads up — you already have a rule about <b>${esc(topicLabel(topic))}</b> planted in ${esc(sharedLabel)}: <b>${esc(o.title)}</b>. Two rules on the same topic can contradict each other. <button type="button" class="mini-btn dc-view-overlap" data-id="${esc(o.id)}">see it</button></div>`;
+        }).join('');
+        conflictBox.querySelectorAll('.dc-view-overlap').forEach(b => b.onclick = () => {
+          const id = b.dataset.id;
+          ov.remove();
+          // the card only exists in list view — coverage view renders a grid instead
+          if (ordersView !== 'list') { ordersView = 'list'; if (state.view === 'playbooks') renderPlaybooks(); }
+          if (state.view !== 'playbooks') { state.view = 'playbooks'; setTabs(); render(); }
+          setTimeout(() => {
+            const card = document.querySelector(`.dir-item[data-id="${CSS.escape(id)}"]`);
+            if (card) { card.scrollIntoView({ behavior: 'smooth', block: 'center' }); card.classList.add('dir-flash'); setTimeout(() => card.classList.remove('dir-flash'), 2000); }
+          }, 60);
+        });
+        ov.querySelector('#dcPlant').textContent = '🛰 Plant anyway';
+        return; // don't plant yet — owner has to see the warning and click again
+      }
+    }
     out.textContent = 'Planting…';
     try {
-      const r = await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'plant', title, body, targets: ids, insightKey: pre.insightKey || null }) });
+      const r = await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'plant', title, body, reviewEveryDays, targets: ids, insightKey: pre.insightKey || null, topic }) });
       const j = await r.json();
       if (!r.ok || j.error) throw new Error(j.error || 'failed');
       directiveReg.items = j.items;
@@ -1124,20 +1260,39 @@ function renderPlaybooks() {
 
     <div class="flows-panel" style="margin-top:16px">
       <h3>🛰 Standing orders <span class="dim">(${(directiveReg.items || []).length} planted)</span>
-        <button id="dirNew" class="mini-btn" style="float:right">＋ new order</button></h3>
-      <div class="dim" style="margin-bottom:10px">Rules this dashboard has planted into repo guidance files (CLAUDE.md / AGENTS.md). Every future agent session in those repos reads them automatically — this is how a learning becomes permanent instead of a prompt you have to remember. <b>Check</b> verifies each is still in place; <b>retire</b> removes the block cleanly.</div>
-      ${(directiveReg.items || []).length ? directiveReg.items.map(d => `
-        <div class="dir-item" data-id="${esc(d.id)}">
+        <span style="float:right;display:flex;gap:8px;align-items:center">
+          <span class="seg" id="ordersSeg"><button data-v="list" class="${ordersView === 'list' ? 'on' : ''}">list</button><button data-v="coverage" class="${ordersView === 'coverage' ? 'on' : ''}">coverage</button></span>
+          <button id="dirNew" class="mini-btn">＋ new order</button>
+        </span></h3>
+      <div class="dim" style="margin-bottom:10px">Rules this dashboard has planted into repo guidance files (CLAUDE.md / AGENTS.md). Every future agent session in those repos reads them automatically — this is how a learning becomes permanent instead of a prompt you have to remember. ${ordersView === 'list' ? '<b>Check</b> verifies each is still in place; <b>retire</b> removes the block cleanly. To reach your <b>other computers</b>, use <b>share via git</b> on a card: the rule travels with the code, so they pick it up on their next <code>git pull</code> — and one <code>git revert</code> takes it back off every machine at once.' : 'This view shows where each rule does and doesn’t reach yet — click an empty cell to plant it somewhere new.'}</div>
+      ${(() => {
+        const dueCount = (directiveReg.items || []).filter(directiveDue).length;
+        return dueCount ? `<div class="dir-due-summary">⏰ ${dueCount} order${dueCount === 1 ? ' is' : 's are'} up for review.</div>` : '';
+      })()}
+      ${ordersView === 'coverage' ? coverageGridHTML() : ((directiveReg.items || []).length ? [...directiveReg.items].sort((a, b) => directiveDue(b) - directiveDue(a)).map(d => {
+        const due = directiveDue(d);
+        const myPaths = new Set((d.targets || []).map(t => t.path));
+        const overlaps = overlappingDirectives(dirTopic(d), myPaths, d.id);
+        return `
+        <div class="dir-item${due ? ' dir-due' : ''}" data-id="${esc(d.id)}">
           <div class="dir-head"><b>🛰 ${esc(d.title)}</b><span class="dim" style="margin-left:8px">planted ${fmtAgo(d.createdAt)}</span>
+            ${due ? '<span class="dir-chip st-drifted" style="margin-left:8px">⏰ up for review</span>' : ''}
             <span style="margin-left:auto;display:flex;gap:6px">
+              ${due ? `<button class="mini-btn dir-reviewed" title="mark this order reviewed and reset the review clock">👍 Still good — keep it</button>` : ''}
               <button class="mini-btn dir-check" title="verify the block is still in every file">🔍 check</button>
               <button class="mini-btn dir-copy" title="copy the order text">📋</button>
               <button class="mini-btn dir-retire" title="remove the block from every file and forget it">🗑 retire</button>
             </span></div>
           <div class="dir-chips">${(d.targets || []).map(t => `<span class="dir-chip">${esc(t.label)}</span>`).join('')}</div>
-          <div class="dir-impact dim">${esc(directiveImpact(d, mined))}</div>
+          <div class="dir-impact dim">${esc(directiveImpact(d, mined))} Reviewed ${fmtAgo(d.lastReviewedAt || d.createdAt)}, every ${d.reviewEveryDays || 30} days.</div>
+          ${overlaps.length ? `<div class="dir-overlap">⚠ overlaps: ${overlaps.map(o => esc(o.title)).join(', ')}</div>` : ''}
           <div class="dir-status dim"></div>
-        </div>`).join('') : '<div class="dim">None yet — hit <b>🛰 make it a rule</b> on any insight above, or ＋ new order.</div>'}
+          <div class="dir-git">
+            <div class="dg-head dim">🔗 Share via git — commit the rule where it lives, then send it when you're ready.</div>
+            ${gitRowsHTML(d)}
+          </div>
+        </div>`;
+      }).join('') : '<div class="dim">None yet — hit <b>🛰 make it a rule</b> on any insight above, or ＋ new order.</div>')}
     </div>
 
     <div class="flows-panel" style="margin-top:16px">
@@ -1179,20 +1334,95 @@ function renderPlaybooks() {
   });
   $('pbNew').onclick = () => openPlaybookEditor(null);
   $('dirNew') && ($('dirNew').onclick = () => openDirectiveComposer(directiveTemplate({ key: 'tier:new' })));
+  $('ordersSeg')?.querySelectorAll('button').forEach(b => b.onclick = () => { ordersView = b.dataset.v; renderPlaybooks(); });
+  if (ordersView === 'coverage') {
+    $('covCheckAll')?.addEventListener('click', async () => {
+      const btn = $('covCheckAll'); btn.textContent = 'Checking…'; btn.disabled = true;
+      await Promise.all((directiveReg.items || []).map(async d => {
+        try {
+          const j = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'check', id: d.id }) })).json();
+          coverageChecks[d.id] = j.statuses || [];
+        } catch { /* leave stale */ }
+      }));
+      renderPlaybooks();
+    });
+    $('playbooks').querySelectorAll('.cov-cell.off').forEach(td => td.onclick = async () => {
+      const d = (directiveReg.items || []).find(x => x.id === td.dataset.dir);
+      const t = (directiveReg.targets || []).find(x => x.id === td.dataset.target);
+      if (!d || !t) return;
+      if (!confirm(`Plant "${d.title}" into ${t.label} (${t.name}) too?`)) return;
+      td.textContent = '…';
+      try {
+        const j = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'plant-existing', id: d.id, targets: [t.id] }) })).json();
+        if (!j.ok) throw new Error(j.error || 'failed');
+        directiveReg.items = j.items;
+        renderPlaybooks();
+      } catch (e) { alert('Failed: ' + e.message); renderPlaybooks(); }
+    });
+  }
   $('playbooks').querySelectorAll('.dir-item').forEach(el => {
     const d = (directiveReg.items || []).find(x => x.id === el.dataset.id); if (!d) return;
     el.querySelector('.dir-copy').onclick = e => { navigator.clipboard.writeText(d.body); e.target.textContent = '✓'; setTimeout(() => { e.target.textContent = '📋'; }, 1200); };
+    el.querySelector('.dir-reviewed')?.addEventListener('click', async () => {
+      try {
+        const j = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'reviewed', id: d.id }) })).json();
+        if (j.items) { directiveReg.items = j.items; renderPlaybooks(); }
+      } catch { /* leave as-is */ }
+    });
     el.querySelector('.dir-check').onclick = async () => {
       const st = el.querySelector('.dir-status'); st.textContent = 'Checking…';
       try {
         const j = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'check', id: d.id }) })).json();
+        coverageChecks[d.id] = j.statuses || [];
         st.innerHTML = (j.statuses || []).map(s => `<span class="dir-chip st-${s.status}">${esc(s.label)} ${s.status === 'ok' ? '✓ in place' : s.status === 'drifted' ? '⚠ removed or edited away' : '⚠ file missing'}</span>`).join(' ') || 'No targets recorded.';
       } catch { st.textContent = 'Check failed.'; }
     };
+    // share via git — each button runs real git commands, so none of this fires on its own
+    el.querySelectorAll('.dir-git-check').forEach(b => b.onclick = async () => {
+      b.textContent = 'Looking…'; b.disabled = true;
+      try {
+        const j = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'git-status', id: d.id }) })).json();
+        if (j.error) throw new Error(j.error);
+        gitStates[d.id] = j.states || [];
+        renderPlaybooks();
+      } catch (e) { b.textContent = 'Could not read git: ' + e.message; b.disabled = false; }
+    });
+    el.querySelectorAll('.dg-commit').forEach(b => b.onclick = async () => {
+      const p = b.dataset.path;
+      b.textContent = 'Committing…'; b.disabled = true;
+      try {
+        const j = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'git-commit', id: d.id, path: p }) })).json();
+        gitNotes[d.id + '|' + p] = j.error ? 'Failed: ' + j.error : j.note;
+      } catch (e) { gitNotes[d.id + '|' + p] = 'Failed: ' + e.message; }
+      // re-read git afterwards so the row tells the truth about what is left to send
+      try {
+        const s = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'git-status', id: d.id }) })).json();
+        if (s.states) gitStates[d.id] = s.states;
+      } catch { /* keep the older state */ }
+      renderPlaybooks();
+    });
+    el.querySelectorAll('.dg-push').forEach(b => b.onclick = async () => {
+      const p = b.dataset.path;
+      const s = (gitStates[d.id] || []).find(x => x.path === p) || {};
+      if (!confirm(`Send to the remote?\n\nThis pushes everything already committed on ${s.branch ? `branch "${s.branch}"` : 'this branch'} in this repo — not only this rule — to wherever that repo sends to. Your other computers pick it up with git pull.\n\nThis is the one step that leaves this computer.`)) return;
+      b.textContent = 'Sending…'; b.disabled = true;
+      try {
+        const j = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'git-push', id: d.id, path: p }) })).json();
+        gitNotes[d.id + '|' + p] = j.error ? 'Failed: ' + j.error : j.note;
+      } catch (e) { gitNotes[d.id + '|' + p] = 'Failed: ' + e.message; }
+      try {
+        const st = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'git-status', id: d.id }) })).json();
+        if (st.states) gitStates[d.id] = st.states;
+      } catch { /* keep the older state */ }
+      renderPlaybooks();
+    });
     el.querySelector('.dir-retire').onclick = async () => {
       if (!confirm(`Retire "${d.title}"? The block is removed from ${(d.targets || []).length} file(s); each file is snapshotted first.`)) return;
       try {
         const j = await (await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'retire', id: d.id }) })).json();
+        // Retiring edits files here. If the rule was ever committed and sent, other
+        // machines keep it until the REMOVAL is committed too — say so, don't imply gone.
+        if ((j.needsCommit || []).length) alert(`Removed here.\n\nBut ${j.needsCommit.join(', ')} ${j.needsCommit.length === 1 ? 'is a git repo' : 'are git repos'} — if you ever sent this rule to a remote, other computers keep following it until you commit and send the removal too.`);
         if (j.items) { directiveReg.items = j.items; renderPlaybooks(); }
       } catch { /* leave as-is */ }
     };

@@ -1075,6 +1075,115 @@ function checkDirective(d) {
   });
 }
 
+// ---------- git as transport (how a planted rule reaches other machines) ----------
+// AMC never writes to a remote machine. Instead, when a guidance file lives in a
+// git repo, the owner commits the planted block and pushes it — the other machines
+// receive it the normal way, with `git pull`, and `git revert` undoes it everywhere.
+// Rules for everything below: execFile with an explicit argv array (never a shell
+// string, never shell:true), cwd pinned to the repo root, a hard timeout, and every
+// failure returned as text instead of thrown. The only paths ever handed to git are
+// ones already recorded in a directive's own targets — the client sends ids, and a
+// path it sends is only accepted after matching a recorded target exactly.
+const { execFile } = require('child_process');
+const GIT_TIMEOUT = 15000;
+function git(cwd, args) {
+  return new Promise(resolve => {
+    execFile('git', args, {
+      cwd, timeout: GIT_TIMEOUT, windowsHide: true, maxBuffer: 1024 * 1024,
+      // never let git stop and wait for a password: no credential handling here, ever
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' },
+    }, (err, stdout, stderr) => {
+      if (!err) return resolve({ ok: true, out: String(stdout).trim(), error: null });
+      const raw = err.code === 'ENOENT' ? 'git is not installed on this machine'
+        : err.killed ? 'git took longer than 15 seconds and was stopped'
+          : (stderr || err.message || 'git failed');
+      resolve({ ok: false, out: String(stdout || '').trim(), error: clean(String(raw).replace(/\s+/g, ' ').trim(), 400) });
+    });
+  });
+}
+// Repo root for a planted file. Returns the REASON on failure too — "git isn't
+// installed" and "this folder isn't a repo" are very different sentences to show
+// someone, and collapsing both to null told owners their repos were broken.
+async function gitRepoRootInfo(filePath) {
+  const dir = path.dirname(filePath);
+  try { if (!fs.statSync(dir).isDirectory()) return { root: null, gitMissing: false }; } catch { return { root: null, gitMissing: false }; }
+  const r = await git(dir, ['rev-parse', '--show-toplevel']);
+  if (r.ok && r.out) return { root: path.normalize(r.out.split('\n')[0].trim()), gitMissing: false };
+  return { root: null, gitMissing: /not installed/i.test(r.error || '') };
+}
+async function gitRepoRoot(filePath) { return (await gitRepoRootInfo(filePath)).root; }
+// Read-only picture of one target: is it a repo, which branch, is the rule
+// uncommitted, and how many commits are sitting here unsent.
+async function gitTargetState(t, d) {
+  const base = { path: t.path, label: t.label, name: t.name };
+  const { root, gitMissing } = await gitRepoRootInfo(t.path);
+  if (!root) return { ...base, isRepo: false, gitMissing };
+  const [branch, st, ahead, ignored] = await Promise.all([
+    // --show-current, not rev-parse: it still answers on a repo with no commits yet,
+    // and returns empty (rather than the literal "HEAD") when the repo is detached
+    git(root, ['branch', '--show-current']),
+    git(root, ['status', '--porcelain', '--', t.path]),
+    git(root, ['rev-list', '--count', '@{upstream}..HEAD']),
+    git(root, ['check-ignore', '-q', '--', t.path]), // exit 0 = git deliberately ignores this file
+  ]);
+  // Whether THIS order is committed, not whether the file is clean. Two orders
+  // commonly share one CLAUDE.md, so a file-level check mislabels both of them.
+  let planted = null;
+  const rel = path.relative(root, t.path).split(path.sep).join('/');
+  const show = await git(root, ['show', 'HEAD:' + rel]);
+  if (show.ok && d) planted = show.out.includes(dirMarker(d.id).start);
+  return {
+    ...base, isRepo: true, root, gitMissing: false,
+    ignored: ignored.ok,                                    // true = in .gitignore, can never be shared
+    branch: (branch.ok && branch.out) ? branch.out : null,  // null = detached, i.e. not on a branch
+    fileDirty: st.ok ? st.out !== '' : false,               // the file differs from the last commit
+    committed: planted,                                     // null = unknown (no commits yet / new file)
+    ahead: ahead.ok ? (parseInt(ahead.out, 10) || 0) : null, // null = no remote branch set up
+  };
+}
+async function gitStatesFor(d) {
+  const list = (d.targets || []).slice(0, 40);
+  const out = [];
+  // small batches: a 40-target order shouldn't spawn 160 git processes at once
+  for (let i = 0; i < list.length; i += 4) out.push(...await Promise.all(list.slice(i, i + 4).map(t => gitTargetState(t, d))));
+  if ((d.targets || []).length > list.length) out.push({ truncated: (d.targets || []).length - list.length });
+  return out;
+}
+// Stage ONLY this one guidance file and commit ONLY that path (the `-- <path>`
+// pathspec means anything else the owner had staged stays staged, untouched).
+async function gitCommitDirective(d, t) {
+  const { root, gitMissing } = await gitRepoRootInfo(t.path);
+  if (gitMissing) return { done: false, note: 'git is not installed on this computer, so nothing can be shared from here.' };
+  if (!root) return { done: false, note: 'Not a git repo — nothing to commit.' };
+  // A commit made while not on a branch is unreachable: the next branch switch
+  // silently throws it away, taking the rule with it. Refuse rather than report success.
+  const br = await git(root, ['branch', '--show-current']);
+  if (br.ok && !br.out) return { done: false, note: 'This repo is not on a branch right now, so a commit here would be lost the moment you switch branches. Switch to a branch first, then commit.' };
+  const add = await git(root, ['add', '--', t.path]);
+  if (!add.ok) {
+    if (/ignored by/i.test(add.error)) return { done: false, note: 'This file is listed in .gitignore, so git deliberately does not track it — it cannot be shared this way.' };
+    return { done: false, note: 'Could not stage the file: ' + add.error };
+  }
+  const staged = await git(root, ['diff', '--cached', '--name-only', '--', t.path]);
+  if (staged.ok && !staged.out) return { done: false, note: 'Nothing to commit — this file already matches the last commit.' };
+  const subject = 'AMC standing order: ' + clean(d.title, 72);
+  // Careful wording: one guidance file can hold several orders, so this commit may
+  // carry more than the one named in the subject. Say that rather than misattribute.
+  const body = `Updates ${path.basename(t.path)} with standing orders planted by Agent Mission Control, including: ${clean(d.title, 200)}.\nEvery agent session in this repo reads them. To undo this change everywhere: git revert this commit.\n\nMission-Control-Directive: ${clean(d.id, 40)}`;
+  const c = await git(root, ['commit', '-m', subject, '-m', body, '--', t.path]);
+  if (!c.ok) return { done: false, note: 'Commit failed: ' + c.error };
+  const sha = await git(root, ['rev-parse', '--short', 'HEAD']);
+  return { done: true, note: `Committed${sha.ok && sha.out ? ' as ' + sha.out : ''} on this machine. Nothing has been sent anywhere yet.` };
+}
+// The one outward step. Deliberate, separate, never bundled into plant or commit.
+async function gitPushRepo(t) {
+  const root = await gitRepoRoot(t.path);
+  if (!root) return { done: false, note: 'Not a git repo — nothing to send.' };
+  const r = await git(root, ['push']);
+  if (!r.ok) return { done: false, note: 'Sending failed: ' + r.error };
+  return { done: true, note: 'Sent. Your other machines get it the next time they run git pull.' };
+}
+
 // ---------- brain version history ----------
 // Every Brain save snapshots the PRIOR content, so config/memory/hooks edits
 // are recoverable — real version control, not a single .mc-backup.
@@ -1512,7 +1621,13 @@ const server = http.createServer((req, res) => {
           if (!Array.isArray(b.targets) || !b.targets.length || b.targets.length > 40) throw new Error('pick at least one target');
           if (store.items.length >= 200) throw new Error('registry full');
           const allowed = new Map(directiveTargets().map(t => [t.id, t]));
-          const d = { id: 'dir_' + crypto.randomBytes(5).toString('hex'), title, body: String(b.body), insightKey: clean(b.insightKey, 200) || null, createdAt: Date.now(), targets: [] };
+          let reviewEveryDays = parseInt(b.reviewEveryDays, 10);
+          if (!Number.isFinite(reviewEveryDays) || reviewEveryDays < 1) reviewEveryDays = 30;
+          reviewEveryDays = Math.min(reviewEveryDays, 3650);
+          // topic is computed deterministically on the client (from insight key + title,
+          // no LLM) so the conflict sentry can warn before planting — we just clean & store it.
+          const topic = clean(b.topic, 40) || 'general';
+          const d = { id: 'dir_' + crypto.randomBytes(5).toString('hex'), title, body: String(b.body), insightKey: clean(b.insightKey, 200) || null, topic, createdAt: Date.now(), reviewEveryDays, lastReviewedAt: Date.now(), targets: [] };
           const results = [];
           for (const id of b.targets) {
             const t = allowed.get(String(id));
@@ -1525,17 +1640,77 @@ const server = http.createServer((req, res) => {
           appendAudit({ kind: 'directive-plant', title, targets: d.targets.length });
           return json(res, { ok: true, items: store.items, results });
         }
+        if (b.op === 'plant-existing') { // coverage matrix: plant an already-existing order into more targets
+          const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
+          if (!Array.isArray(b.targets) || !b.targets.length || b.targets.length > 40) throw new Error('pick at least one target');
+          const allowed = new Map(directiveTargets().map(t => [t.id, t]));
+          const already = new Set((d.targets || []).map(t => t.path));
+          const results = [];
+          for (const id of b.targets) {
+            const t = allowed.get(String(id));
+            if (!t) { results.push({ id: String(id).slice(0, 60), status: 'unknown-target' }); continue; }
+            if (already.has(t.path)) { results.push({ label: t.label, status: 'already' }); continue; }
+            // same ceiling the 'plant' op enforces — the git panel only reports 40
+            if ((d.targets || []).length >= 40) { results.push({ label: t.label, status: 'full' }); continue; }
+            const r = plantIntoFile(t.path, d);
+            results.push({ label: t.label, ...r });
+            if (r.status === 'planted') d.targets.push({ path: t.path, label: t.label, name: t.name, plantedAt: Date.now() });
+          }
+          saveDirectives(store);
+          appendAudit({ kind: 'directive-plant', title: d.title, targets: d.targets.length });
+          return json(res, { ok: true, items: store.items, results });
+        }
         if (b.op === 'check') {
           const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
           return json(res, { ok: true, statuses: checkDirective(d) });
         }
+        if (b.op === 'reviewed') { // owner looked it over and it's still good — resets the review clock
+          const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
+          d.lastReviewedAt = Date.now();
+          saveDirectives(store);
+          appendAudit({ kind: 'directive-reviewed', title: d.title });
+          return json(res, { ok: true, items: store.items });
+        }
+        // ---- git transport: commit/push a planted rule so other machines pull it ----
+        // Only paths already recorded in this directive's targets are ever passed to
+        // git; b.path is matched against them and rejected otherwise.
+        if (b.op === 'git-status') { // read-only look at each repo — runs nothing that changes anything
+          const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
+          return gitStatesFor(d).then(states => {
+            appendAudit({ kind: 'directive-git-status', title: d.title, targets: states.length });
+            json(res, { ok: true, states });
+          }).catch(e => metaErr(res, e));
+        }
+        if (b.op === 'git-commit') {
+          const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
+          const t = (d.targets || []).find(x => x.path === b.path); if (!t) throw new Error('that file is not one of this order\'s targets');
+          return gitCommitDirective(d, t).then(r => {
+            appendAudit({ kind: 'directive-git-commit', title: d.title, path: t.path, done: r.done, note: r.note });
+            json(res, { ok: true, ...r });
+          }).catch(e => metaErr(res, e));
+        }
+        if (b.op === 'git-push') { // the only outward action in the whole registry
+          const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
+          const t = (d.targets || []).find(x => x.path === b.path); if (!t) throw new Error('that file is not one of this order\'s targets');
+          return gitPushRepo(t).then(r => {
+            appendAudit({ kind: 'directive-git-push', title: d.title, path: t.path, done: r.done, note: r.note });
+            json(res, { ok: true, ...r });
+          }).catch(e => metaErr(res, e));
+        }
         if (b.op === 'retire') {
           const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
-          const results = (d.targets || []).map(t => ({ label: t.label, ...retireFromFile(t.path, d.id) }));
-          store.items = store.items.filter(x => x.id !== b.id);
-          saveDirectives(store);
-          appendAudit({ kind: 'directive-retire', title: d.title });
-          return json(res, { ok: true, items: store.items, results });
+          const targets = d.targets || [];
+          const results = targets.map(t => ({ label: t.label, ...retireFromFile(t.path, d.id) }));
+          // Removing the block is a local edit. If the rule was ever committed and
+          // sent, other machines keep obeying it until the REMOVAL is committed too —
+          // so name those repos instead of letting "retired" imply "gone everywhere".
+          return Promise.all(targets.map(t => gitRepoRoot(t.path).then(r => (r ? t.label : null)).catch(() => null)))
+            .then(inGit => {
+              store.items = store.items.filter(x => x.id !== b.id);
+              saveDirectives(store);
+              appendAudit({ kind: 'directive-retire', title: d.title });
+              json(res, { ok: true, items: store.items, results, needsCommit: inGit.filter(Boolean) });
+            }).catch(e => metaErr(res, e));
         }
         if (b.op === 'delete') { // forget the record without touching any file
           store.items = store.items.filter(x => x.id !== b.id);

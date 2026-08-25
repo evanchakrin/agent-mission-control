@@ -1,7 +1,9 @@
 {
   "name": "@thepleasureman/agent-mission-control",
-  "publishConfig": { "access": "public" },
-  "version": "7.9.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "version": "7.10.0",
   "description": "Live dashboard visualizing Claude Code agent sessions — orchestrator, subagents, and workflow fleets from JSONL transcripts",
   "bin": {
     "agent-mission-control": "./server.js"
@@ -18,7 +20,15 @@
     "public/",
     "demo/"
   ],
-  "keywords": ["claude", "claude-code", "agents", "observability", "dashboard", "visualization", "multi-agent"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "agents",
+    "observability",
+    "dashboard",
+    "visualization",
+    "multi-agent"
+  ],
   "author": "Evan Chakrin",
   "license": "MIT",
   "repository": {
