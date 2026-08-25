@@ -1475,10 +1475,101 @@ function readBody(req, cb) {
   req.on('end', () => cb(b));
 }
 
+// ---------- which models actually ran (fleet-wide) ----------
+// WHY: /api/fleet reported cost and agent counts but nothing about WHICH models
+// did the work, so a session that put nearly all of its money on the top tier
+// because a model was left unset looked exactly like a cheap one — the only way
+// to find it was opening sessions one at a time. Everything below is derived
+// from the r.agents/r.events sessionSummary has ALREADY parsed: no extra file
+// read, no git, no second pass, so /api/fleet costs the same as before.
+// The full model id is kept on purpose ('claude-opus-4-8', never 'Opus') — when
+// a default quietly changes underneath you, the version IS the story.
+// Order matters, and it used to be wrong: family names were tested BEFORE size
+// qualifiers, so `gpt-5-mini` matched /gpt-5/ and got billed as premium while the
+// /mini/ rule sat unreachable. That inflates "top-tier spend" — the one number
+// this whole feature exists to report honestly. Size qualifiers first, always.
+function modelTier(model) {
+  const m = String(model || '').toLowerCase();
+  if (/mini|nano|flash|haiku|lite/.test(m)) return 'cheap';
+  if (/fable|mythos/.test(m)) return 'flagship';
+  if (/sonnet|codex|gpt-4/.test(m)) return 'mid';
+  if (/opus|gpt-5|o3|o1/.test(m)) return 'premium';
+  if (/gpt-3/.test(m)) return 'cheap';
+  return 'unknown';
+}
+const TIERS = ['flagship', 'premium', 'mid', 'cheap', 'unknown'];
+const TOP_TIERS = ['flagship', 'premium'];        // the two that make a bill hurt
+const LIVE_WINDOW_MS = 600000;                    // "active recently" — the same window `stalled` uses
+const LIVE_AGENTS_MAX = 6;                        // a glance at who's working, not a roster
+const dollars = n => Math.round(n * 10000) / 10000; // agent costs are already 4dp; don't invent precision
+
+// One row per model id that actually ran, dearest first, plus the same money
+// split by tier. Agents we never saw a model line for are counted separately
+// instead of being folded into a tier they might not belong to.
+function modelBreakdown(agents) {
+  const by = new Map();
+  const tierMix = { flagship: 0, premium: 0, mid: 0, cheap: 0, unknown: 0 };
+  let agentsNoModel = 0;
+  for (const a of agents) {
+    if (!a.model) { agentsNoModel++; continue; }
+    const tier = modelTier(a.model);
+    const row = by.get(a.model) || { id: a.model, tier, agents: 0, cost: 0, outTokens: 0 };
+    row.agents++;
+    row.cost += a.cost || 0;
+    row.outTokens += a.outTokens || 0;
+    by.set(a.model, row);
+    tierMix[tier] += a.cost || 0;
+  }
+  const total = TIERS.reduce((n, t) => n + tierMix[t], 0);
+  const top = TOP_TIERS.reduce((n, t) => n + tierMix[t], 0);
+  // No money means no split to report. A 0 here would render as "0% on the
+  // expensive tiers" — i.e. all clear — which is the opposite of "can't tell".
+  const topTierShare = total > 0 ? Math.round((top / total) * 1000) / 1000 : null;
+  for (const t of TIERS) tierMix[t] = dollars(tierMix[t]);
+  const models = [...by.values()]
+    .sort((x, y) => y.cost - x.cost || y.agents - x.agents)
+    .map(r => ({ ...r, cost: dollars(r.cost) }));
+  return { models, tierMix, topTierShare, agentsNoModel };
+}
+
+// Who is working right now. Gated on the same 10-minute recency `stalled` uses,
+// then per agent: sitting on an unresolved tool call, or its own last line is
+// inside that window. Agents mid-call are listed first so the cap never hides
+// the one that is stuck, and liveAgentCount carries the real total so a capped
+// list can never be mistaken for the whole crew.
+function liveAgentsOf(agents, mtime, now) {
+  if (now - mtime > LIVE_WINDOW_MS) return [];
+  const out = [];
+  for (const a of agents) {
+    let pend = a.pendingTool && a.pendingTool.since ? a.pendingTool : null;
+    // An unresolved tool call is not proof of life: a call that went out four hours
+    // ago and never came back means STUCK, not "working". Showing those first, with
+    // no age, made a dead session look like the busiest thing on the screen.
+    const pendAge = pend ? now - Date.parse(pend.since) : NaN;
+    const stuck = pend && Number.isFinite(pendAge) && pendAge > LIVE_WINDOW_MS;
+    if (stuck) pend = null;
+    const lastTs = a.lastTs ? new Date(a.lastTs).getTime() : NaN;
+    const fresh = Number.isFinite(lastTs) && now - lastTs <= LIVE_WINDOW_MS;
+    if (a.done || (!pend && !fresh)) continue;
+    out.push({
+      name: a.name || (a.id === 'main' ? 'Main agent' : a.id),
+      model: a.model || null,
+      tool: pend ? pend.tool : null,
+      since: pend ? pend.since : null,
+      waitingMs: pend && Number.isFinite(pendAge) ? Math.max(0, Math.round(pendAge)) : null,
+    });
+  }
+  out.sort((x, y) => (y.tool ? 1 : 0) - (x.tool ? 1 : 0));
+  return out;
+}
+
 function sessionSummary(meta) {
   let r;
   try { r = getResult(meta.file); } catch { return null; }
   if (!r) return null;
+  const now = Date.now();
+  const mix = modelBreakdown(r.agents);
+  const live = liveAgentsOf(r.agents, meta.mtime, now);
   const evs = r.events;
   const first = evs.find(e => e.ts), last = [...evs].reverse().find(e => e.ts);
   const machine = meta.file.startsWith('relay:') ? meta.file.split(':')[1] : os.hostname();
@@ -1494,7 +1585,14 @@ function sessionSummary(meta) {
     tokensOut: r.agents.reduce((n, a) => n + a.outTokens, 0),
     cost: Math.round(r.agents.reduce((n, a) => n + (a.cost || 0), 0) * 100) / 100,
     retrying: r.agents.some(a => a.retrying),
-    stalled: r.agents.some(a => a.pendingTool && a.pendingTool.since && Date.now() - new Date(a.pendingTool.since) > 120000) && Date.now() - meta.mtime < 600000,
+    stalled: r.agents.some(a => a.pendingTool && a.pendingTool.since && now - new Date(a.pendingTool.since) > 120000) && now - meta.mtime < LIVE_WINDOW_MS,
+    // model identity — see modelBreakdown()/liveAgentsOf() above
+    models: mix.models,                 // [{id, tier, agents, cost, outTokens}] dearest first
+    tierMix: mix.tierMix,               // {flagship, premium, mid, cheap, unknown} in dollars
+    topTierShare: mix.topTierShare,     // 0..1 of this session's money on flagship+premium, null when cost is 0
+    agentsNoModel: mix.agentsNoModel,   // agents whose model was never recorded (so counts add up honestly)
+    liveAgents: live.slice(0, LIVE_AGENTS_MAX), // [{name, model, tool, since}] — empty unless active recently
+    liveAgentCount: live.length,        // real total, so "3 of 18" is always tellable
   };
 }
 
@@ -2633,7 +2731,11 @@ const server = http.createServer((req, res) => {
   // ---- session/project metadata (loopback + origin + CSRF gated) ----
   if (url.pathname === '/api/meta' && req.method === 'GET') {
     if (!metaGate(req, res)) return;
-    return json(res, { ...metaState, csrf: META_CSRF, readOnly: metaReadOnly });
+    // appVersion rides along here rather than on a new route: the frontend
+    // already fetches this once at boot, so the header can name the version
+    // you're actually looking at without another request. (Not metaVersion —
+    // that one counts metadata edits.)
+    return json(res, { ...metaState, csrf: META_CSRF, readOnly: metaReadOnly, appVersion: APP_VERSION });
   }
   if (url.pathname === '/api/meta/session' && req.method === 'POST') {
     if (!writeGate(req, res)) return;

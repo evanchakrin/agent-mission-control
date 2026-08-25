@@ -12,28 +12,13 @@
 <header>
   <img class="hlogo" src="/favicon.svg" alt="Agent Mission Control logo" width="24" height="24">
   <h1>Agent Mission Control</h1>
+  <span id="appVersion" class="app-version"></span>
   <div class="spicker" id="spicker">
     <button id="spickerBtn">— select session —</button>
     <div id="spickerPanel"><input id="spickerSearch" type="text" placeholder="search sessions…"><div id="spickerList"></div></div>
   </div>
   <div class="tabs">
-    <button id="viewFleet" class="on">⌂ Fleet</button>
-    <button id="viewTable">Table</button>
-    <button id="viewFingerprints">🧬 Fingerprints</button>
-    <button id="viewCalendar">📅 Calendar</button>
-    <button id="viewRings">🎯 Rings</button>
-    <button id="viewRhythm">🕛 Rhythm</button>
-    <button id="viewProjects">Projects</button>
-    <button id="viewUsage">📈 Usage</button>
-    <button id="viewFlows">⇶ Flows</button>
-    <button id="viewPlaybooks">📖 Playbooks</button>
-    <button id="viewBrain">🧠 Brain</button>
-    <button id="viewAudit">🛡 Audit</button>
-    <button id="viewConstellation">✦ Galaxy</button>
-    <button id="viewMachines">Machines</button>
-    <button id="viewUnsaved">👻 Unsaved</button>
-    <button id="viewTrouble">🔥 Trouble files</button>
-    <button id="viewLeaks">🔑 Secrets</button>
+    <div id="navBar" class="navbar"></div>
     <button id="viewBoard">Board</button>
     <button id="viewStory">Story</button>
     <button id="viewLanes">Lanes</button>
@@ -49,6 +34,7 @@
   <div id="notifPanel"><div class="notif-head">Notifications <button id="notifClear">clear</button></div><div id="notifList"></div></div>
 </header>
 <div id="statbar"></div>
+<div id="liveNowStrip" style="display:none"></div>
 <div id="stickbar" style="display:none"></div>
 <div id="failbar" style="display:none"></div>
 <main>
@@ -69,7 +55,7 @@
     <div id="unsaved" style="display:none"></div>
     <div id="trouble" style="display:none"></div>
     <div id="leaks" style="display:none"></div>
-    <div id="constellation" style="display:none"><canvas id="constCanvas"></canvas><div class="const-legend"><span style="color:#fb7185">● Claude</span><span style="color:#60a5fa">● Codex</span><span style="color:#c084fc">● OTLP</span><span style="color:#e5e9f0">★ machine · drag stars · scroll to zoom · click to open</span></div></div>
+    <div id="constellation" style="display:none"><canvas id="constCanvas"></canvas><div class="const-legend"><span style="color:#f87171">● Flagship</span><span style="color:#fbbf24">● Premium</span><span style="color:#60a5fa">● Mid</span><span style="color:#34d399">● Cheap</span><span style="color:#8a93a8">● Unknown</span><span style="color:#e5e9f0">star size = cost · ★ machine · drag stars · scroll to zoom · click to open</span></div></div>
     <div id="board" style="display:none">
       <svg id="edges"></svg>
       <div id="cards"></div>

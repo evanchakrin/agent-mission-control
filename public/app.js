@@ -12,6 +12,77 @@ const AGENT_KIND = {
 };
 const kindColor = k => (AGENT_KIND[k] || AGENT_KIND.claude).color;
 
+// ---------- model + tier identity (server already sorted each agent's model into
+// a tier — flagship/premium/mid/cheap/unknown — see modelTier() in server.js;
+// this is just the ONE color/label scheme every view below shares, so a wall of
+// pricey runs reads the same way in Fleet, Table, Fingerprints, and the Galaxy).
+// Colour runs hot (flagship, priciest) to cool (cheap) so "expensive" is legible
+// at a glance without reading a single number.
+const TIERS = ['flagship', 'premium', 'mid', 'cheap', 'unknown'];
+const TIER_COLOR = { flagship: 'var(--red)', premium: 'var(--amber)', mid: 'var(--blue)', cheap: 'var(--green)', unknown: 'var(--dim)' };
+// Literal hex twin of TIER_COLOR, kept in sync with the --red/--amber/--blue/
+// --green/--dim values in style.css by hand (same pattern kindColor() uses).
+// Needed anywhere a var(--x) reference won't work: Canvas fillStyle can't
+// resolve CSS custom properties at all, and an inline `background:${col}22`
+// alpha-suffix trick needs a real hex string — `var(--amber)22` is invalid CSS.
+const TIER_COLOR_HEX = { flagship: '#f87171', premium: '#fbbf24', mid: '#60a5fa', cheap: '#34d399', unknown: '#8a93a8' };
+const TIER_LABEL = { flagship: 'Flagship', premium: 'Premium', mid: 'Mid', cheap: 'Cheap', unknown: 'Unknown' };
+// Shorten a model id for a chip without losing the version — 'claude-opus-4-8'
+// -> 'Opus 4.8', 'claude-fable-5' -> 'Fable 5'. The FULL id always stays in the
+// tooltip (see modelChips) because that's the only place a '4' vs '5' is provable.
+function modelShortName(id) {
+  const s = String(id || '').replace(/^(us\.|eu\.)?anthropic\./, '').replace(/^claude-/, '');
+  const parts = s.split(/[-_]/).filter(Boolean);
+  if (!parts.length) return id ? String(id) : 'unknown';
+  const fam = parts[0].charAt(0).toUpperCase() + parts[0].slice(1);
+  const rest = parts.slice(1).join('.');
+  return rest ? `${fam} ${rest}` : fam;
+}
+// Which tier a session's money (or, lacking any cost, its agent headcount)
+// leans on hardest. Returns null only when the session has no model data at
+// all — callers fall back to TIER_COLOR.unknown / var(--line) for that case.
+function dominantTier(s) {
+  const mix = (s && s.tierMix) || {};
+  let best = null, bestV = 0;
+  for (const t of TIERS) { const v = mix[t] || 0; if (v > bestV) { bestV = v; best = t; } }
+  if (best) return best;
+  const byTier = {};
+  for (const m of (s && s.models) || []) byTier[m.tier] = (byTier[m.tier] || 0) + m.agents;
+  let bestA = null, bestAV = 0;
+  for (const t of TIERS) { const v = byTier[t] || 0; if (v > bestAV) { bestAV = v; bestA = t; } }
+  return bestA;
+}
+function tierColorOf(s) { const t = dominantTier(s); return t ? TIER_COLOR[t] : TIER_COLOR.unknown; }
+// Compact tier-coloured chips: model short name + how many agents ran it. Full
+// id + per-model cost in the tooltip. agentsNoModel gets its own grey chip so
+// the counts always reconcile in the UI, same as they do in the data.
+function modelChips(s, opts) {
+  const max = (opts && opts.max) || 5;
+  const models = s.models || [];
+  if (!models.length && !s.agentsNoModel) return '';
+  const shown = models.slice(0, max);
+  const overflow = models.length - shown.length;
+  let html = '<div class="model-chips">';
+  html += shown.map(m => {
+    // Inline style needs a literal hex to append an alpha suffix (var(--x)22 is
+    // invalid CSS) — TIER_COLOR_HEX below, same trick kindColor() chips already use.
+    const col = TIER_COLOR_HEX[m.tier] || TIER_COLOR_HEX.unknown;
+    const tip = `${m.id} — ${m.agents} agent${m.agents === 1 ? '' : 's'} · ~${fmtUsd(m.cost)} · ${TIER_LABEL[m.tier] || m.tier}`;
+    return `<span class="model-chip" style="background:${col}22;color:${col};border-color:${col}66" title="${esc(tip)}">${esc(modelShortName(m.id))} ×${m.agents}</span>`;
+  }).join('');
+  if (overflow > 0) html += `<span class="model-chip model-chip-more" title="${overflow} more model${overflow === 1 ? '' : 's'} not shown">+${overflow}</span>`;
+  if (s.agentsNoModel) html += `<span class="model-chip model-chip-unknown" title="${s.agentsNoModel} agent${s.agentsNoModel === 1 ? '' : 's'} whose model was never recorded">no model ×${s.agentsNoModel}</span>`;
+  html += '</div>';
+  return html;
+}
+// Real dollars per tier for a table-cell tooltip — never a bare percentage
+// with nothing behind it.
+function tierMixTooltip(s) {
+  const mix = s.tierMix || {};
+  const parts = TIERS.filter(t => mix[t] > 0).map(t => `${TIER_LABEL[t]}: ${fmtUsd(mix[t])}`);
+  return parts.length ? parts.join(' · ') : 'no cost recorded';
+}
+
 const KINDS = ['user-text', 'user-queued', 'assistant-text', 'tool-call', 'tool-result', 'spawn', 'spawn-result'];
 const KIND_LABEL = { 'user-text': 'user', 'user-queued': 'queued', 'assistant-text': 'reply', 'tool-call': 'tool', 'tool-result': 'result', 'spawn': 'spawn', 'spawn-result': 'return' };
 const KIND_COLOR = { 'user-text': '#f87171', 'user-queued': '#f87171', 'assistant-text': '#fbbf24', 'tool-call': '#818cf8', 'tool-result': '#60a5fa', 'spawn': '#5eead4', 'spawn-result': '#34d399' };
@@ -20,7 +91,38 @@ const KIND_COLOR = { 'user-text': '#f87171', 'user-queued': '#f87171', 'assistan
 // Tabs that dispatch through setTabs() (own data load, no live feed/footer) rather
 // than render() (which drives the session-detail panes). Declared up top because
 // the home-view preference below needs it before `state` exists.
-const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines', 'fingerprints', 'calendar', 'rings', 'rhythm', 'unsaved', 'trouble', 'leaks'];
+//
+// VIEW_META + NAV_MENUS are the SINGLE source of truth for every overview view:
+// icon/label/pane come from VIEW_META, menu grouping + order from NAV_MENUS. Adding
+// a view later = one VIEW_META entry + one id in a menu's `views` array — OVERVIEW,
+// the nav bar markup, the click dispatch, and the BAKED hide-list (which just hides
+// the whole #navBar element) all derive from these two automatically.
+const VIEW_META = {
+  fleet:         { label: 'Fleet',         icon: '',   pane: 'fleet' },
+  table:         { label: 'Table',         icon: '',   pane: 'tableView' },
+  constellation: { label: 'Galaxy',        icon: '✦',  pane: 'constellation' },
+  calendar:      { label: 'Calendar',      icon: '📅', pane: 'calendar' },
+  fingerprints:  { label: 'Fingerprints',  icon: '🧬', pane: 'fingerprints' },
+  rings:         { label: 'Rings',         icon: '🎯', pane: 'rings' },
+  rhythm:        { label: 'Rhythm',        icon: '🕛', pane: 'rhythm' },
+  trouble:       { label: 'Trouble files', icon: '🔥', pane: 'trouble' },
+  unsaved:       { label: 'Unsaved',       icon: '👻', pane: 'unsaved' },
+  leaks:         { label: 'Secrets',       icon: '🔑', pane: 'leaks' },
+  flows:         { label: 'Flows',         icon: '⇶',  pane: 'flows' },
+  playbooks:     { label: 'Playbooks',     icon: '📖', pane: 'playbooks' },
+  brain:         { label: 'Brain',         icon: '🧠', pane: 'brain' },
+  machines:      { label: 'Machines',      icon: '',   pane: 'machines' },
+  projects:      { label: 'Projects',      icon: '',   pane: 'projects' },
+  usage:         { label: 'Usage',         icon: '📈', pane: 'usage' },
+  audit:         { label: 'Audit',         icon: '🛡', pane: 'audit' },
+};
+const NAV_MENUS = [
+  { key: 'sessions', label: 'Sessions', views: ['fleet', 'table', 'constellation', 'calendar', 'fingerprints', 'rings', 'rhythm'] },
+  { key: 'health',   label: 'Health',   views: ['trouble', 'unsaved', 'leaks', 'flows'] },
+  { key: 'improve',  label: 'Improve',  views: ['playbooks', 'brain'] },
+  { key: 'system',   label: 'System',   views: ['machines', 'projects', 'usage', 'audit'] },
+];
+const OVERVIEW = NAV_MENUS.flatMap(m => m.views);
 
 // ---------- home-view preference ----------
 // The owner is beta-testing which overview becomes his daily screen (Fingerprints,
@@ -36,7 +138,7 @@ function homeButton(id) {
 }
 function wireHomeButton(root, id, rerender) {
   const b = root.querySelector('[data-home="' + id + '"]');
-  if (b) b.onclick = () => { setHomeView(getHomeView() === id ? null : id); rerender(); };
+  if (b) b.onclick = () => { setHomeView(getHomeView() === id ? null : id); updateNavHome(); rerender(); };
 }
 
 const state = {
@@ -131,7 +233,7 @@ function closeSearch() { $('searchOverlay').classList.remove('open'); }
 $('deepSearchBtn').onclick = e => { e.stopPropagation(); openSearch(); };
 $('searchOverlay').onclick = e => { if (e.target === $('searchOverlay')) closeSearch(); };
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeSearch();
+  if (e.key === 'Escape') { closeSearch(); closeNavMenus(); }
   if (e.key === 'k' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); openSearch(); }
 });
 $('soInput').onkeydown = async e => {
@@ -167,6 +269,21 @@ function openSessionAt(file, seq) {
   }, 300);
 }
 
+// ---------- header version ----------
+// The dashboard's own version was already computed server-side (APP_VERSION,
+// read from package.json) and already served via /api/update-check for the
+// stale-version notification below — this just also puts it somewhere the
+// owner can actually see it. One fetch at boot, no polling of its own.
+function loadAppVersion() {
+  const el = $('appVersion');
+  if (!el) return;
+  fetch('/api/update-check').then(r => r.json()).then(v => {
+    el.textContent = 'v' + v.current;
+    el.title = v.updateAvailable ? `v${v.current} installed — v${v.latest} is available` : `v${v.current} — up to date`;
+    el.classList.toggle('update-avail', !!v.updateAvailable);
+  }).catch(() => { /* offline at boot — leave it blank rather than guess */ });
+}
+
 // ---------- notifications ----------
 // A background poll of /api/fleet detects newly-errored sessions and runs that
 // finished (were active, now idle > N min). Fires desktop notifications + a bell.
@@ -187,6 +304,10 @@ let updateNotified = false, budgetNotifiedDay = null;
 async function pollNotifications() {
   let fleet;
   try { fleet = await (await fetch('/api/fleet')).json(); } catch { return; }
+  // This poll runs every 15s regardless of which overview tab is open — piggyback
+  // on it to keep the "at work now" strip current without a fetch of its own.
+  fleetCache = fleet;
+  renderLiveNowStrip();
   for (const s of fleet) {
     const prev = notifSeen.get(s.file);
     if (!prev) { notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: Date.now() - s.mtime < 6e5, stalled: s.stalled }); continue; }
@@ -261,10 +382,45 @@ $('notifClear').onclick = (e) => { e.stopPropagation(); notifs.length = 0; rende
 document.addEventListener('click', e => { if (!$('notifPanel').contains(e.target) && e.target !== $('bell') && !$('bell').contains(e.target)) $('notifPanel').classList.remove('open'); });
 
 let fleetCache = null;
+
+// ---------- "at work now" strip ----------
+// A one-line pulse of the fleet: who is actually working right now, across every
+// session — driven entirely by liveAgents/liveAgentCount that the server already
+// computed per session (10-min recency window, see liveAgentsOf() in server.js).
+// No extra fetch of its own: this reads whatever fleetCache already holds, and
+// gets refreshed by every view that (re)loads the fleet plus the existing 15s
+// notification poll — so it costs nothing extra to keep current.
+const LIVE_STRIP_CAP = 8; // agents shown before "+N more" — a glance, not a roster
+function renderLiveNowStrip() {
+  const el = $('liveNowStrip');
+  if (!el || el.style.display === 'none') return;
+  const fleet = fleetCache || [];
+  const items = [];
+  let total = 0;
+  for (const s of fleet) {
+    if (!s.liveAgentCount) continue;
+    total += s.liveAgentCount;
+    for (const a of (s.liveAgents || [])) items.push({ ...a, sessionFile: s.file, sessionTitle: s.title || s.session.slice(0, 8) });
+  }
+  if (!total) { el.innerHTML = `<span class="lns-idle">○ Nothing running right now.</span>`; return; }
+  const shown = items.slice(0, LIVE_STRIP_CAP);
+  const overflow = total - shown.length;
+  el.innerHTML = `<span class="lns-label">● ${total} agent${total === 1 ? '' : 's'} working now</span>` +
+    shown.map(a => {
+      const tip = `${a.sessionTitle}${a.model ? ' · ' + a.model : ''}`;
+      return `<span class="lns-item" data-file="${esc(a.sessionFile)}" title="${esc(tip)}">
+        <b>${esc(a.name)}</b>${a.model ? ` · ${esc(modelShortName(a.model))}` : ''}${a.tool ? ` · running <i>${esc(a.tool)}</i>` : ' · thinking'}
+      </span>`;
+    }).join('') +
+    (overflow > 0 ? `<span class="lns-more">+${overflow} more</span>` : '');
+  el.querySelectorAll('.lns-item[data-file]').forEach(x => x.onclick = () => openSession(x.dataset.file));
+}
+
 async function loadFleet() {
   if (!fleetCache) $('fleet').innerHTML = '<div class="fleet-loading">Scanning sessions…</div>';
   fleetCache = await (await fetch('/api/fleet')).json();
   renderFleet();
+  renderLiveNowStrip();
 }
 
 let fleetFilter = '';
@@ -284,6 +440,7 @@ function renderFleet() {
         <h3>${esc(s.title || s.session.slice(0, 8))}</h3>
         <div class="fproj"><span class="kind-badge" style="background:${col}22;color:${col}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span> ${esc(s.machine || '')} · ${esc(s.project.replace(/^[Cc⇄]+\s?[·]?\s?/, '').replace(/^[Cc]--Users-[^-]+-/, ''))}</div>
         ${cardBadges(s) ? `<div class="fbadges">${cardBadges(s)}</div>` : ''}
+        ${modelChips(s)}
         <div class="fstats">
           <span><b>${s.agents}</b> agents</span><span><b>${s.events}</b> events</span>
           <span><b>${s.toolCalls}</b> tools</span><span><b>${fmtDur(s.durationMs)}</b></span>
@@ -391,12 +548,15 @@ let tableSort = { col: 'mtime', dir: -1 };
 async function loadTable() {
   if (!fleetCache) { $('tableView').innerHTML = '<div class="fleet-loading">Scanning…</div>'; fleetCache = await (await fetch('/api/fleet')).json(); }
   renderTable();
+  renderLiveNowStrip();
 }
 function renderTable() {
   const cols = [
     { k: 'title', label: 'Session', num: false },
     { k: 'kind', label: 'Agent', num: false },
     { k: 'machine', label: 'Machine', num: false },
+    { k: 'models', label: 'Models', num: false, sortKey: 'topTierShare', dir0: -1 },
+    { k: 'topTierShare', label: 'Top-tier %', num: true },
     { k: 'agents', label: 'Agents', num: true },
     { k: 'events', label: 'Events', num: true },
     { k: 'toolCalls', label: 'Tools', num: true },
@@ -408,8 +568,12 @@ function renderTable() {
   ];
   let rows = filteredFleet().slice();
   const { col, dir } = tableSort;
+  const sortField = (cols.find(c => c.k === col) || {}).sortKey || col;
   rows.sort((a, b) => {
-    const av = a[col], bv = b[col];
+    let av = a[sortField], bv = b[sortField];
+    // null topTierShare ("can't tell", no cost) sorts as lowest rather than
+    // breaking the numeric comparison or silently reading as 0%.
+    if (sortField === 'topTierShare') { av = av == null ? -1 : av; bv = bv == null ? -1 : bv; }
     if (typeof av === 'number') return (av - bv) * dir;
     return String(av || '').localeCompare(String(bv || '')) * dir;
   });
@@ -421,10 +585,16 @@ function renderTable() {
     `<th class="tact"></th></tr></thead><tbody>` +
     rows.map(s => {
       const c = kindColor(s.kind); const m = metaOf(s);
+      // A confident "100%" next to a cost of $0.000 is noise dressed as a finding.
+      // Below a cent of total spend there is nothing worth reporting a share of.
+      const spend = s.tierMix ? TIERS.reduce((a, t) => a + (s.tierMix[t] || 0), 0) : 0;
+      const tts = spend < 0.01 ? null : s.topTierShare;
       return `<tr data-file="${esc(s.file)}"${m.archived ? ' class="row-archived"' : ''}>
         <td class="tsess">${esc(s.title || s.session.slice(0, 8))}</td>
         <td><span class="kind-badge" style="background:${c}22;color:${c}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span></td>
         <td>${esc(s.machine || '')}</td>
+        <td class="tmodels">${modelChips(s, { max: 3 }) || '<span class="dim">—</span>'}</td>
+        <td class="num" title="${esc(tierMixTooltip(s))}">${tts == null ? '—' : Math.round(tts * 100) + '%'}</td>
         <td class="num">${s.agents}</td><td class="num">${s.events}</td><td class="num">${s.toolCalls}</td>
         <td class="num">${fmtDur(s.durationMs)}</td><td class="num">${fmtTok(s.tokensOut)}</td>
         <td class="num fcost">~${fmtUsd(s.cost)}</td><td class="num ${s.errors ? 'ferr' : ''}">${s.errors || ''}</td>
@@ -432,7 +602,7 @@ function renderTable() {
         <td class="tact">${s.stableKey ? `<button class="row-arch" data-sk="${esc(s.stableKey)}" title="${m.archived ? 'unarchive' : 'archive'}">${m.archived ? '⤴' : '🗄'}</button><button class="row-menu" title="organize">⋯</button>` : ''}</td>
       </tr>`;
     }).join('') + `</tbody></table></div>`;
-  $('tableView').querySelectorAll('th[data-k]').forEach(th => { th.onclick = () => { const k = th.dataset.k; tableSort = { col: k, dir: tableSort.col === k ? -tableSort.dir : (cols.find(c => c.k === k).num ? -1 : 1) }; renderTable(); }; });
+  $('tableView').querySelectorAll('th[data-k]').forEach(th => { th.onclick = () => { const k = th.dataset.k; const c = cols.find(c => c.k === k); tableSort = { col: k, dir: tableSort.col === k ? -tableSort.dir : (c.dir0 || (c.num ? -1 : 1)) }; renderTable(); }; });
   $('tableView').querySelectorAll('tr[data-file]').forEach(tr => {
     const s = rows.find(x => x.file === tr.dataset.file);
     tr.onclick = () => openSession(tr.dataset.file);
@@ -748,6 +918,7 @@ async function loadFingerprints() {
   // that never updates is worse than no home screen at all
   try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
   renderFingerprints();
+  renderLiveNowStrip();
   fetchMissingGlyphs();
 }
 function computeGlyph(s, d) {
@@ -764,7 +935,7 @@ function computeGlyph(s, d) {
     if (e.kind === 'tool-call' || e.kind === 'spawn' || e.kind === 'tool-result') buckets[idx]++;
     if (e.error) errB[idx]++;
   }
-  return { buckets, errB, kind: s.kind, cost: s.cost, dur: s.durationMs, title: s.title || s.session.slice(0, 8), file: s.file, errors: s.errors };
+  return { buckets, errB, kind: s.kind, cost: s.cost, dur: s.durationMs, title: s.title || s.session.slice(0, 8), file: s.file, errors: s.errors, tier: dominantTier(s) };
 }
 async function fetchMissingGlyphs() {
   if (fpLoading) return;
@@ -786,6 +957,9 @@ function fpGlyphSvg(g, dims) {
   const N = g.buckets.length, bw = w / N;
   const max = Math.max(...g.buckets, 1);
   const col = kindColor(g.kind);
+  // Frame colour = the session's dominant model tier (see dominantTier() up top)
+  // so a wall of pricey runs is visible before you read a single number.
+  const tierCol = g.tier ? TIER_COLOR[g.tier] : 'var(--line)';
   const padB = 2, plotH = h - padB - 2;
   let bars = '';
   for (let i = 0; i < N; i++) {
@@ -800,10 +974,10 @@ function fpGlyphSvg(g, dims) {
   const durNorm = Math.max(0, Math.min(1, Math.log10(durMin + 1) / Math.log10(181))); // 0..~3h on a log scale
   const tickLen = 3 + durNorm * (w * 0.4);
   return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" class="fp-svg">
-    <rect x="0.5" y="0.5" width="${w - 1}" height="${h - 1}" rx="3" fill="var(--panel2)" stroke="var(--line)"/>
+    <rect x="0.75" y="0.75" width="${w - 1.5}" height="${h - 1.5}" rx="3" fill="var(--panel2)" stroke="${tierCol}" stroke-width="1.5"/>
     ${bars}
     <line x1="${(w - tickLen).toFixed(1)}" y1="${(h - 0.75).toFixed(1)}" x2="${w.toFixed(1)}" y2="${(h - 0.75).toFixed(1)}" stroke="${col}" stroke-width="1.5" opacity=".85"/>
-    <title>${esc(g.title)}&#10;~${fmtUsd(g.cost)} · ${fmtDur(g.dur)}${g.errors ? ` · ${g.errors} error${g.errors === 1 ? '' : 's'}` : ''}</title>
+    <title>${esc(g.title)}&#10;~${fmtUsd(g.cost)} · ${fmtDur(g.dur)}${g.errors ? ` · ${g.errors} error${g.errors === 1 ? '' : 's'}` : ''}${g.tier ? ` · ${TIER_LABEL[g.tier]} tier` : ''}</title>
   </svg>`;
 }
 function fpSkeletonSvg(dims) {
@@ -823,7 +997,8 @@ function renderFingerprints() {
       ${homeButton('fingerprints')}
       <button id="fpRefresh" class="mini-btn">↻ refresh</button>
     </div>
-    <div class="rings-legend">One tile is one session, newest first. Taller bars = a busier stretch of that run, <span style="color:var(--red)">red</span> = a stretch that hit an error, and the tick along the bottom shows how long it ran. You are looking for the odd one out — hover any tile for its name and cost.</div>` +
+    <div class="rings-legend">One tile is one session, newest first. Taller bars = a busier stretch of that run, <span style="color:var(--red)">red</span> bars = a stretch that hit an error, and the tick along the bottom shows how long it ran. The tile's <b>border</b> is coloured by its dominant model tier — see the legend below. You are looking for the odd one out — hover any tile for its name, cost, and tier.</div>
+    <div class="usage-legend">Border colour = priciest model tier this session leaned on: ${TIERS.map(t => `<span style="color:${TIER_COLOR[t]}">■ ${TIER_LABEL[t]}</span>`).join('')}</div>` +
     (shown.length === 0
       ? `<div class="fp-empty">${all.length === 0 ? 'No sessions yet — once you run something, each session gets its own little shape here.' : 'No sessions match these filters.'}</div>`
       : `<div class="fp-wall sz-${fpSize}">` + shown.map(s => {
@@ -846,14 +1021,15 @@ function renderFingerprints() {
 // agents). A plain-language line above states the busiest day in words, not just
 // color. Clicking a day opens a panel below listing that day's sessions.
 let calMetric = 'sessions', calSelectedDay = null;
-const CAL_METRIC_COLOR = { sessions: '#5eead4', cost: '#818cf8', agents: '#60a5fa', errors: '#f87171' };
-const CAL_METRIC_LABEL = { sessions: 'Sessions', cost: 'Cost', errors: 'Errors', agents: 'Agents' };
+const CAL_METRIC_COLOR = { sessions: '#5eead4', cost: '#818cf8', agents: '#60a5fa', errors: '#f87171', topTier: '#f87171' };
+const CAL_METRIC_LABEL = { sessions: 'Sessions', cost: 'Cost', errors: 'Errors', agents: 'Agents', topTier: 'Top-tier $' };
 
 async function loadCalendar() {
   // refetch every time: any of these can be the home screen, and a home screen
   // that never updates is worse than no home screen at all
   try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
   renderCalendar();
+  renderLiveNowStrip();
 }
 function calDayKey(ts) {
   const d = new Date(ts);
@@ -864,6 +1040,7 @@ function calMetricVal(rec, metric) {
   if (metric === 'cost') return rec.cost;
   if (metric === 'errors') return rec.errors;
   if (metric === 'agents') return rec.agents;
+  if (metric === 'topTier') return rec.topTier;
   return rec.sessions;
 }
 function calSummary(days) {
@@ -900,9 +1077,10 @@ function renderCalendar() {
     if (!s.mtime || s.mtime > calTodayEnd.getTime()) continue;
     if (metaOf(s).archived) continue;
     const k = calDayKey(s.mtime);
-    if (!days.has(k)) days.set(k, { sessions: 0, cost: 0, errors: 0, agents: 0, date: new Date(s.mtime) });
+    if (!days.has(k)) days.set(k, { sessions: 0, cost: 0, errors: 0, agents: 0, topTier: 0, date: new Date(s.mtime) });
     const d = days.get(k);
     d.sessions++; d.cost += s.cost || 0; d.errors += s.errors || 0; d.agents += s.agents || 0;
+    d.topTier += (s.tierMix && (s.tierMix.flagship + s.tierMix.premium)) || 0;
   }
 
   const today = new Date(); today.setHours(0, 0, 0, 0);
@@ -942,7 +1120,7 @@ function renderCalendar() {
       fill = col;
     }
     const dStr = c.date.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
-    const tip = c.rec ? `${dStr}: ${c.rec.sessions} session${c.rec.sessions === 1 ? '' : 's'}, ~${fmtUsd(c.rec.cost)}${c.rec.errors ? `, ${c.rec.errors} err` : ''}` : `${dStr}: no sessions`;
+    const tip = c.rec ? `${dStr}: ${c.rec.sessions} session${c.rec.sessions === 1 ? '' : 's'}, ~${fmtUsd(c.rec.cost)}${c.rec.errors ? `, ${c.rec.errors} err` : ''}${calMetric === 'topTier' ? `, ~${fmtUsd(c.rec.topTier)} on flagship/premium` : ''}` : `${dStr}: no sessions`;
     svg += `<rect class="cal-cell${calSelectedDay === c.key ? ' sel' : ''}" data-key="${c.key}" x="${x}" y="${y}" width="${CELL}" height="${CELL}" rx="2" fill="${fill}" fill-opacity="${op}"><title>${esc(tip)}</title></rect>`;
   });
 
@@ -964,6 +1142,47 @@ function renderCalendar() {
   $('calendar').querySelectorAll('.cal-day-item').forEach(el => el.onclick = () => openSession(el.dataset.file));
 }
 
+// ---------- shared time-bucket coloring for RINGS + RHYTHM ----------
+// Both views slice sessions into small time windows (a week, an hour) and paint
+// each window green/amber/red by a RATE — never `some(...)`, and never below a
+// minimum sample. Two selectable metrics share this: 'trouble' (share of a
+// window's runs that hit an error/retry/stall — the original, unchanged
+// thresholds) and 'topTier' (share of a window's DOLLARS spent on flagship/
+// premium models). topTier is gated on the window's total $, not just session
+// count — a window can be full of sessions and still have zero dollars billed,
+// which is "can't tell", not "cheap".
+// There are TWO reasons a bucket can't be judged, and conflating them told the
+// owner his sample was too small when it was actually fine but had no cost on it.
+function bmUnjudged(bm) {
+  return bm.rate === null ? 'no cost recorded, so this cannot be judged' : 'too few runs to judge';
+}
+function bucketMetric(list, metric, minSample) {
+  const n = list.length;
+  if (metric === 'topTier') {
+    // Sum the SAME numbers on both sides. s.cost is rounded to 2dp while tierMix
+    // carries 4dp, so dividing one by the other let a share exceed 100% — which
+    // then drew a negative-height bar on the weekday strip.
+    const tierTotal = s => (s.tierMix ? TIERS.reduce((a, t) => a + (s.tierMix[t] || 0), 0) : 0);
+    const total = list.reduce((a, s) => a + tierTotal(s), 0);
+    const top = list.reduce((a, s) => a + ((s.tierMix && (s.tierMix.flagship + s.tierMix.premium)) || 0), 0);
+    const rate = total > 0 ? Math.min(100, Math.round(top / total * 100)) : null;
+    return {
+      n, rate, judged: n >= minSample && rate !== null, thresh: [66, 33],
+      note: total > 0 ? `~${fmtUsd(top)} of ~${fmtUsd(total)} on flagship/premium` : (n ? 'no cost recorded' : ''),
+    };
+  }
+  const rough = list.filter(s => s.errors > 0 || s.retrying || s.stalled).length;
+  const rate = n ? Math.round(rough / n * 100) : 0;
+  return { n, rate, judged: n >= minSample, thresh: [30, 10], note: n ? `${rough} of ${n} hit trouble` : '' };
+}
+function bucketColor(bm) {
+  if (!bm.n) return { color: 'var(--line)', op: .35 };
+  if (!bm.judged) return { color: 'var(--dim)', op: .55 };
+  const [hi, lo] = bm.thresh;
+  return { color: bm.rate > hi ? 'var(--red)' : bm.rate >= lo ? 'var(--amber)' : 'var(--green)', op: .92 };
+}
+const BUCKET_METRICS = [['trouble', 'Trouble rate'], ['topTier', 'Top-tier spend']];
+
 // ---------- RINGS view (candidate home screen #3) — one growth-ring disc per project ----------
 // Each project/repo becomes a disc, drawn like a cut tree trunk: the ring closest
 // to the center is that project's OLDEST week of activity (in a bounded window),
@@ -982,6 +1201,7 @@ async function loadRings() {
   // that never updates is worse than no home screen at all
   try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
   renderRings();
+  renderLiveNowStrip();
 }
 function ringWeekStart(ts) {
   const d = new Date(ts); d.setHours(0, 0, 0, 0);
@@ -997,7 +1217,7 @@ function cleanProjLabel(raw) {
   const win = s.replace(/^[Cc]--Users-[^-]+-/, '');
   return (win !== s ? win : s.replace(/^(⇄|Codex)\s*·?\s*/, '')) || 'Unknown';
 }
-function ringDiscSvg(sessions) {
+function ringDiscSvg(sessions, metric) {
   const anchor = ringWeekStart(sessions[sessions.length - 1].mtime); // sessions pre-sorted ascending
   const oldest = ringWeekStart(sessions[0].mtime);
   const spanAll = Math.round((anchor - oldest) / RING_WEEK_MS) + 1;
@@ -1016,22 +1236,15 @@ function ringDiscSvg(sessions) {
   weeksShown.forEach((wk, i) => {
     const r = RING_BASE_R + i * RING_STEP;
     const n = wk.length;
-    let color = 'var(--line)', op = .35, sw = 2;
-    // Same rule as the Rhythm clock: colour by the SHARE that went badly, never by
-    // "did any of them", which turns one bad run in seventeen into a red year.
-    const roughN = wk.filter(s => s.errors > 0 || s.retrying || s.stalled).length;
-    const rate = n ? Math.round(roughN / n * 100) : 0;
-    if (n > 0) {
-      sw = 2 + Math.round((n / maxN) * 6);
-      if (n < RING_MIN_SAMPLE) { color = 'var(--dim)'; op = .55; }
-      else {
-        color = rate > 30 ? 'var(--red)' : rate >= 10 ? 'var(--amber)' : 'var(--green)';
-        op = .92;
-      }
-    }
+    // Same rule as the Rhythm clock: colour by the SHARE that qualifies, never by
+    // "did any of them", which turns one bad (or one pricey) run in seventeen
+    // into a red year. See bucketMetric()/bucketColor() above.
+    const bm = bucketMetric(wk, metric, RING_MIN_SAMPLE);
+    const { color, op } = bucketColor(bm);
+    const sw = n > 0 ? 2 + Math.round((n / maxN) * 6) : 2;
     const weekStr = new Date(anchor - (span - 1 - i) * RING_WEEK_MS).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
     const tip = n
-      ? `Week of ${weekStr}: ${n} session${n === 1 ? '' : 's'}` + (n < RING_MIN_SAMPLE ? ' (too few to judge)' : ` · ${roughN} of ${n} hit trouble (${rate}%)`)
+      ? `Week of ${weekStr}: ${n} session${n === 1 ? '' : 's'}` + (bm.judged ? ` · ${bm.note} (${bm.rate}%)` : bm.note ? ` (${bm.note}, ${bmUnjudged(bm)})` : ' (too few to judge)')
       : `Week of ${weekStr}: no runs`;
     rings += `<circle cx="0" cy="0" r="${r}" fill="none" stroke="${color}" stroke-width="${sw}" opacity="${op}"><title>${esc(tip)}</title></circle>`;
   });
@@ -1040,6 +1253,7 @@ function ringDiscSvg(sessions) {
     ${rings}
   </svg>`;
 }
+let ringMetric = 'trouble';
 function renderRings() {
   const all = (fleetCache || []).filter(s => !metaOf(s).archived && s.mtime);
   const groups = new Map();
@@ -1054,9 +1268,14 @@ function renderRings() {
     return { proj, sessions, cost, rough };
   }).sort((a, b) => b.sessions.length - a.sessions.length || b.sessions[b.sessions.length - 1].mtime - a.sessions[a.sessions.length - 1].mtime);
 
+  const ringLegend = ringMetric === 'topTier'
+    ? `Each ring is a week — colour is the <b>share of that week's dollars</b> spent on flagship/premium models: <span style="color:var(--green)">green</span> under 33%, <span style="color:var(--amber)">amber</span> 33–66%, <span style="color:var(--red)">red</span> over 66%, <span style="color:var(--dim)">grey</span> too few runs or no cost recorded that week to judge.`
+    : `Each ring is a week — colour is the <b>share</b> of that week's runs that hit trouble: <span style="color:var(--green)">green</span> under 10%, <span style="color:var(--amber)">amber</span> 10–30%, <span style="color:var(--red)">red</span> over 30%, <span style="color:var(--dim)">grey</span> too few runs that week to judge.`;
   $('rings').innerHTML =
-    `<div class="fleet-head"><h2>Projects — rings — ${discs.length} project${discs.length === 1 ? '' : 's'}</h2>${homeButton('rings')}</div>
-    <div class="rings-legend">Each ring is a week — colour is the <b>share</b> of that week's runs that hit trouble: <span style="color:var(--green)">green</span> under 10%, <span style="color:var(--amber)">amber</span> 10–30%, <span style="color:var(--red)">red</span> over 30%, <span style="color:var(--dim)">grey</span> too few runs that week to judge. Thicker ring = busier week. Only the last ${RING_MAX_WEEKS} weeks are drawn: centre = ${RING_MAX_WEEKS} weeks ago, edge = most recent. Hover any ring for the real numbers; click a disc to see it in Fleet.</div>` +
+    `<div class="fleet-head"><h2>Projects — rings — ${discs.length} project${discs.length === 1 ? '' : 's'}</h2>
+      <div class="seg" id="ringMetricSeg">${BUCKET_METRICS.map(([v, l]) => `<button data-m="${v}" class="${ringMetric === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+      ${homeButton('rings')}</div>
+    <div class="rings-legend">${ringLegend} Thicker ring = busier week. Only the last ${RING_MAX_WEEKS} weeks are drawn: centre = ${RING_MAX_WEEKS} weeks ago, edge = most recent. Hover any ring for the real numbers; click a disc to see it in Fleet.</div>` +
     (discs.length === 0
       ? `<div class="fp-empty">No sessions yet — once you run something, its project gets a ring disc here.</div>`
       : `<div class="rings-grid">` + discs.map(d => {
@@ -1079,12 +1298,13 @@ function renderRings() {
           : `${sn} sessions shown, ~${fmtUsd(sCost)}${sRough ? `, ${sRough} rough run${sRough === 1 ? '' : 's'}` : ', all clean'}`)
           + (older ? ` · ${older} older not shown` : '');
         return `<div class="ring-card" data-proj="${esc(d.proj)}" title="Click to see ${esc(label)} in Fleet">
-          ${ringDiscSvg(d.sessions)}
+          ${ringDiscSvg(d.sessions, ringMetric)}
           <div class="ring-name">${esc(label)}</div>
           <div class="ring-summary">${esc(summary)}</div>
         </div>`;
       }).join('') + `</div>`);
   wireHomeButton($('rings'), 'rings', renderRings);
+  $('rings').querySelector('#ringMetricSeg')?.querySelectorAll('button').forEach(b => b.onclick = () => { ringMetric = b.dataset.m; renderRings(); });
   $('rings').querySelectorAll('.ring-card').forEach(c => c.onclick = () => {
     fleetFilter = c.dataset.proj; fleetKind = 'all'; fleetMachine = 'all'; fleetProject = 'all'; fleetArchived = 'hide';
     state.view = 'fleet'; setTabs();
@@ -1109,6 +1329,7 @@ async function loadRhythm() {
   // that never updates is worse than no home screen at all
   try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
   renderRhythm();
+  renderLiveNowStrip();
 }
 function rhySessionStart(s) { return s.mtime - (s.durationMs || 0); }
 function polarWedgePath(cx, cy, rInner, rOuter, aStartDeg, aEndDeg) {
@@ -1120,6 +1341,7 @@ function polarWedgePath(cx, cy, rInner, rOuter, aStartDeg, aEndDeg) {
   return `M${x1.toFixed(1)},${y1.toFixed(1)} L${x2.toFixed(1)},${y2.toFixed(1)} A${rOuter},${rOuter} 0 ${large} 1 ${x3.toFixed(1)},${y3.toFixed(1)} L${x4.toFixed(1)},${y4.toFixed(1)} A${rInner},${rInner} 0 ${large} 0 ${x1.toFixed(1)},${y1.toFixed(1)} Z`;
 }
 function rhyRoughRate(list) { return list.length ? Math.round(list.filter(s => s.errors > 0 || s.retrying || s.stalled).length / list.length * 100) : 0; }
+let rhyMetric = 'trouble';
 function renderRhythm() {
   const all = (fleetCache || []).filter(s => !metaOf(s).archived && s.mtime);
   const hours = Array.from({ length: 24 }, () => []);
@@ -1135,23 +1357,15 @@ function renderRhythm() {
   for (let h = 0; h < 24; h++) {
     const list = hours[h], n = list.length;
     const len = R_IN + (n / maxHour) * (R_OUT - R_IN);
-    // Colour from the SHARE of rough runs, never `some(...)`. A boolean OR over an
+    // Colour from the SHARE that qualifies, never `some(...)`. A boolean OR over an
     // all-time bucket is monotone in sample size: the hours you use most are the
-    // ones guaranteed to contain one bad run eventually, so they'd go red and stay
-    // red forever — telling you the exact opposite of the truth.
-    let color = 'var(--line)', op = .35;
-    const roughN = list.filter(s => s.errors > 0 || s.retrying || s.stalled).length;
-    const rate = n ? Math.round(roughN / n * 100) : 0;
-    if (n > 0) {
-      if (n < RHY_MIN_SAMPLE) { color = 'var(--dim)'; op = .55; }
-      else {
-        color = rate > 30 ? 'var(--red)' : rate >= 10 ? 'var(--amber)' : 'var(--green)';
-        op = .92;
-      }
-    }
+    // ones guaranteed to contain one bad (or one pricey) run eventually, so they'd
+    // go red and stay red forever — telling you the exact opposite of the truth.
+    const bm = bucketMetric(list, rhyMetric, RHY_MIN_SAMPLE);
+    const { color, op } = bucketColor(bm);
     const hourLabel = h === 0 ? '12am' : h < 12 ? `${h}am` : h === 12 ? '12pm' : `${h - 12}pm`;
     const tip = n
-      ? `${hourLabel}: ${n} session${n === 1 ? '' : 's'}` + (n < RHY_MIN_SAMPLE ? ' (too few to judge)' : ` · ${roughN} of ${n} hit trouble (${rate}%)`)
+      ? `${hourLabel}: ${n} session${n === 1 ? '' : 's'}` + (bm.judged ? ` · ${bm.note} (${bm.rate}%)` : bm.note ? ` (${bm.note}, ${bmUnjudged(bm)})` : ' (too few to judge)')
       : `${hourLabel}: no runs`;
     wedges += `<path d="${polarWedgePath(CX, CY, R_IN, n > 0 ? len : R_IN + 4, h * 15 - 6.5, h * 15 + 6.5)}" fill="${color}" opacity="${op}"><title>${esc(tip)}</title></path>`;
   }
@@ -1174,17 +1388,31 @@ function renderRhythm() {
   let wdBars = '';
   weekdays.forEach((list, i) => {
     const n = list.length;
-    const rough = list.filter(s => s.errors > 0 || s.retrying || s.stalled).length;
     const h = (n / maxWd) * WD_H;
-    const roughH = n ? (rough / n) * h : 0;
     const x = i * (WD_W + WD_GAP);
-    // The red overlay is a rate too, so it obeys the same small-sample gate as the
-    // clock: below the threshold the bar is plain volume and the tooltip says why.
-    const judged = n >= RHY_MIN_SAMPLE;
-    const tip = `${RHY_WEEKDAYS[i]}: ${n} session${n === 1 ? '' : 's'}` + (judged ? `${rough ? `, ${rough} of ${n} hit trouble` : ', all clean'}` : n ? ' (too few to judge)' : '');
+    let overlay = '', tip;
+    if (rhyMetric === 'topTier') {
+      // Overlay height = share of the day's DOLLARS on flagship/premium; colour
+      // follows the same red/amber/green thresholds as the clock and Rings.
+      const bm = bucketMetric(list, 'topTier', RHY_MIN_SAMPLE);
+      tip = `${RHY_WEEKDAYS[i]}: ${n} session${n === 1 ? '' : 's'}` + (bm.judged ? ` · ${bm.note} (${bm.rate}%)` : bm.note ? ` (${bm.note}, ${bmUnjudged(bm)})` : n ? ' (too few to judge)' : '');
+      if (bm.judged) {
+        const { color } = bucketColor(bm);
+        const oh = h * (bm.rate / 100);
+        overlay = `<rect x="${x}" y="${(WD_H - oh).toFixed(1)}" width="${WD_W}" height="${oh.toFixed(1)}" rx="3" fill="${color}" opacity=".8"><title>${esc(tip)}</title></rect>`;
+      }
+    } else {
+      const rough = list.filter(s => s.errors > 0 || s.retrying || s.stalled).length;
+      const roughH = n ? (rough / n) * h : 0;
+      // The red overlay is a rate too, so it obeys the same small-sample gate as
+      // the clock: below the threshold the bar is plain volume and the tooltip says why.
+      const judged = n >= RHY_MIN_SAMPLE;
+      tip = `${RHY_WEEKDAYS[i]}: ${n} session${n === 1 ? '' : 's'}` + (judged ? `${rough ? `, ${rough} of ${n} hit trouble` : ', all clean'}` : n ? ' (too few to judge)' : '');
+      if (rough && judged) overlay = `<rect x="${x}" y="${(WD_H - h).toFixed(1)}" width="${WD_W}" height="${roughH.toFixed(1)}" rx="3" fill="var(--red)" opacity=".8"><title>${esc(tip)}</title></rect>`;
+    }
     wdBars += `<g>
       <rect x="${x}" y="${(WD_H - h).toFixed(1)}" width="${WD_W}" height="${h.toFixed(1)}" rx="3" fill="var(--accent2)" opacity=".55"><title>${esc(tip)}</title></rect>
-      ${rough && judged ? `<rect x="${x}" y="${(WD_H - h).toFixed(1)}" width="${WD_W}" height="${roughH.toFixed(1)}" rx="3" fill="var(--red)" opacity=".8"><title>${esc(tip)}</title></rect>` : ''}
+      ${overlay}
       <text x="${x + WD_W / 2}" y="${WD_H + 16}" text-anchor="middle" class="rhy-wd-label">${RHY_WEEKDAYS[i]}</text>
     </g>`;
   });
@@ -1212,9 +1440,14 @@ function renderRhythm() {
     chrono = `<div class="rhy-chrono dim">Not enough overnight runs yet to say whether they behave differently — ${overnight.length} started 12am–6am so far, ${daytime.length} during the day/evening. Need at least ${RHY_CHRONO_MIN} on both sides before judging.</div>`;
   }
 
+  const rhyLegend = rhyMetric === 'topTier'
+    ? `Spoke length = sessions started that hour, all-time. Colour = <b>share of that hour's dollars</b> spent on flagship/premium models — <span style="color:var(--green)">green</span> under 33%, <span style="color:var(--amber)">amber</span> 33–66%, <span style="color:var(--red)">red</span> over 66%, <span style="color:var(--dim)">grey</span> too few runs or no cost recorded that hour to judge.`
+    : `Spoke length = sessions started that hour, all-time. Colour = how they went — <span style="color:var(--green)">green</span> calm, <span style="color:var(--amber)">amber</span> a retry happened, <span style="color:var(--red)">red</span> hit errors, <span style="color:var(--dim)">grey</span> too few runs that hour to judge.`;
   $('rhythm').innerHTML =
-    `<div class="fleet-head"><h2>Rhythm — when you run, and how it goes</h2>${homeButton('rhythm')}</div>
-    <div class="rings-legend">Spoke length = sessions started that hour, all-time. Colour = how they went — <span style="color:var(--green)">green</span> calm, <span style="color:var(--amber)">amber</span> a retry happened, <span style="color:var(--red)">red</span> hit errors, <span style="color:var(--dim)">grey</span> too few runs that hour to judge.</div>
+    `<div class="fleet-head"><h2>Rhythm — when you run, and how it goes</h2>
+      <div class="seg" id="rhyMetricSeg">${BUCKET_METRICS.map(([v, l]) => `<button data-m="${v}" class="${rhyMetric === v ? 'on' : ''}">${l}</button>`).join('')}</div>
+      ${homeButton('rhythm')}</div>
+    <div class="rings-legend">${rhyLegend}</div>
     <div class="rhy-wrap">
       <div class="rhy-col">${clockSvg}</div>
       <div class="rhy-col">
@@ -1224,6 +1457,7 @@ function renderRhythm() {
       </div>
     </div>`;
   wireHomeButton($('rhythm'), 'rhythm', renderRhythm);
+  $('rhythm').querySelector('#rhyMetricSeg')?.querySelectorAll('button').forEach(b => b.onclick = () => { rhyMetric = b.dataset.m; renderRhythm(); });
 }
 
 // ---------- UNSAVED WORK (what your agents made that isn't saved anywhere) ----------
@@ -1874,13 +2108,17 @@ loadFlows.fetchOnly = async function () {
   flowsCache = results;
 };
 
-// model tier from an id string (for token-saving analysis)
+// model tier from an id string (for token-saving analysis).
+// Keep in lockstep with modelTier() in server.js. Size qualifiers are tested
+// BEFORE family names, or `gpt-5-mini` gets billed as premium and inflates the
+// very top-tier share this analysis exists to report honestly.
 function modelTier(model) {
   const m = String(model || '').toLowerCase();
+  if (/mini|nano|flash|haiku|lite/.test(m)) return 'cheap';
   if (/fable|mythos/.test(m)) return 'flagship';
+  if (/sonnet|codex|gpt-4/.test(m)) return 'mid';
   if (/opus|gpt-5|o3|o1/.test(m)) return 'premium';
-  if (/sonnet|gpt-4|codex/.test(m)) return 'mid';
-  if (/haiku|mini|flash|gpt-3/.test(m)) return 'cheap';
+  if (/gpt-3/.test(m)) return 'cheap';
   return 'unknown';
 }
 const TIER_RATE = { flagship: 50, premium: 25, mid: 15, cheap: 5 }; // rough $/Mtok output, for savings math
@@ -2854,11 +3092,16 @@ async function loadConstellation() {
   const maxCost = Math.max(...fleetCache.map(s => s.cost), 1);
   const stars = fleetCache.map(s => {
     const sun = suns.get(s.machine || 'local');
+    const tier = dominantTier(s);
     return {
       id: s.file, sun: false, file: s.file, machine: s.machine,
       x: sun.x + (Math.random() - 0.5) * 120, y: sun.y + (Math.random() - 0.5) * 120, vx: 0, vy: 0,
-      r: 3 + Math.sqrt(s.cost / maxCost) * 14, color: kindColor(s.kind), sunNode: sun,
+      // size stays cost (unchanged); colour is now the session's dominant model
+      // tier — see dominantTier()/TIER_COLOR_HEX up top — so an expensive corner
+      // of the fleet reads as a red cluster at a glance.
+      r: 3 + Math.sqrt(s.cost / maxCost) * 14, color: TIER_COLOR_HEX[tier] || TIER_COLOR_HEX.unknown, sunNode: sun,
       active: Date.now() - s.mtime < 6 * 3600e3, title: s.title || s.session.slice(0, 8), kind: s.kind,
+      tier, cost: s.cost,
     };
   });
   const nodes = [...suns.values(), ...stars];
@@ -2940,7 +3183,8 @@ async function loadConstellation() {
     }
     if (hover && !hover.sun) {
       ctx.fillStyle = '#e5e9f0'; ctx.font = `${12 / scale}px Segoe UI`; ctx.textAlign = 'left';
-      ctx.fillText(hover.title, hover.x + hover.r + 4 / scale, hover.y + 4 / scale);
+      const label = hover.title + (hover.tier ? ` · ${TIER_LABEL[hover.tier]} · ~${fmtUsd(hover.cost)}` : '');
+      ctx.fillText(label, hover.x + hover.r + 4 / scale, hover.y + 4 / scale);
     }
     constAnim = requestAnimationFrame(draw);
   }
@@ -3101,40 +3345,85 @@ function renderFailbar() {
   bar.style.display = '';
 }
 
+// ---------- overview nav bar (category dropdowns) ----------
+// The 17 overview views used to be one flat row of tabs and overflowed the header.
+// Markup + dispatch are both driven off NAV_MENUS/VIEW_META (declared up top next
+// to OVERVIEW) so a view only needs adding in one place. #navBar is rebuilt once at
+// boot; setTabs() just toggles classes/labels on the existing elements each switch.
+const VIEW_LOADERS = {
+  fleet: loadFleet, table: loadTable, fingerprints: loadFingerprints, calendar: loadCalendar,
+  rings: loadRings, rhythm: loadRhythm, projects: loadProjects, usage: loadUsage, flows: loadFlows,
+  playbooks: loadPlaybooks, brain: loadBrain, audit: loadAudit, constellation: loadConstellation,
+  machines: loadMachines, unsaved: loadUnsaved, trouble: loadTrouble, leaks: loadLeaks,
+};
+let openNavMenu = null;
+function closeNavMenus() {
+  if (!openNavMenu) return;
+  openNavMenu = null;
+  document.querySelectorAll('.navgrp-btn').forEach(b => b.setAttribute('aria-expanded', 'false'));
+  document.querySelectorAll('.navgrp-panel').forEach(p => p.classList.remove('open'));
+}
+function toggleNavMenu(key) {
+  const opening = openNavMenu !== key;
+  closeNavMenus();
+  if (!opening) return;
+  openNavMenu = key;
+  $('navBtn-' + key)?.setAttribute('aria-expanded', 'true');
+  $('navPanel-' + key)?.classList.add('open');
+}
+function updateNavHome() {
+  const id = getHomeView() || 'fleet';
+  const b = $('navHome');
+  if (b) { b.textContent = '⌂ ' + VIEW_META[id].label; b.dataset.view = id; }
+}
+function renderNavBar() {
+  const bar = $('navBar');
+  if (!bar) return;
+  bar.innerHTML = `<button id="navHome" class="nav-home" title="Your home view — one click, always here"></button>` +
+    NAV_MENUS.map(m => `
+      <div class="navgrp" id="navgrp-${m.key}">
+        <button class="navgrp-btn" id="navBtn-${m.key}" type="button" aria-haspopup="true" aria-expanded="false">${esc(m.label)} <span class="navgrp-car">▾</span></button>
+        <div class="navgrp-panel" id="navPanel-${m.key}" role="menu">
+          ${m.views.map(v => `<button class="navitem" id="navitem-${v}" data-view="${v}" type="button" role="menuitem">${VIEW_META[v].icon ? esc(VIEW_META[v].icon) + ' ' : ''}${esc(VIEW_META[v].label)}</button>`).join('')}
+        </div>
+      </div>`).join('');
+  updateNavHome();
+  bar.addEventListener('click', e => {
+    const item = e.target.closest('.navitem');
+    if (item) { closeNavMenus(); if (!BAKED) { state.view = item.dataset.view; setTabs(); } return; }
+    const grpBtn = e.target.closest('.navgrp-btn');
+    if (grpBtn) { e.stopPropagation(); toggleNavMenu(grpBtn.id.slice('navBtn-'.length)); return; }
+    if (e.target.closest('#navHome')) { if (!BAKED) { state.view = getHomeView() || 'fleet'; setTabs(); } }
+  });
+}
+document.addEventListener('click', closeNavMenus);
+
 // ---------- render ----------
-// (OVERVIEW is declared near `state` above — the home-view preference needs it first)
+// (OVERVIEW/NAV_MENUS/VIEW_META are declared near `state` above)
 function setTabs() {
-  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewFingerprints', 'fingerprints'], ['viewCalendar', 'calendar'], ['viewRings', 'rings'], ['viewRhythm', 'rhythm'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewPlaybooks', 'playbooks'], ['viewBrain', 'brain'], ['viewAudit', 'audit'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewUnsaved', 'unsaved'], ['viewTrouble', 'trouble'], ['viewLeaks', 'leaks'], ['viewBoard', 'board'], ['viewStory', 'story'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
+  updateNavHome();
+  $('navHome')?.classList.toggle('on', state.view === ($('navHome').dataset.view || 'fleet'));
+  for (const m of NAV_MENUS) {
+    $('navgrp-' + m.key)?.classList.toggle('has-active', m.views.includes(state.view));
+    for (const v of m.views) $('navitem-' + v)?.classList.toggle('on', state.view === v);
+  }
+  for (const [btn, v] of [['viewBoard', 'board'], ['viewStory', 'story'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
     const el = $(btn); if (el) el.classList.toggle('on', state.view === v);
   }
   const overview = OVERVIEW.includes(state.view);
   document.querySelector('main').classList.toggle('no-feed', overview);
   $('empty').style.display = 'none'; // only board/timeline turn it back on
-  for (const id of ['fleet', 'tableView', 'fingerprints', 'calendar', 'rings', 'rhythm', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines', 'unsaved', 'trouble', 'leaks']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
+  for (const v of OVERVIEW) $(VIEW_META[v].pane).style.display = (state.view === v) ? '' : 'none';
   if (overview) for (const p of SESSION_PANES) $(p).style.display = 'none';
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
   $('statbar').style.display = overview ? 'none' : '';
+  $('liveNowStrip').style.display = overview ? '' : 'none';
+  renderLiveNowStrip(); // paint from whatever's cached now; the view's own load()/poll keep it fresh
   renderStickbar(); // hides itself on the overview tabs
   renderFailbar(); // ditto
   stopConstellation();
-  if (state.view === 'fleet') loadFleet();
-  else if (state.view === 'table') loadTable();
-  else if (state.view === 'fingerprints') loadFingerprints();
-  else if (state.view === 'calendar') loadCalendar();
-  else if (state.view === 'rings') loadRings();
-  else if (state.view === 'rhythm') loadRhythm();
-  else if (state.view === 'projects') loadProjects();
-  else if (state.view === 'usage') loadUsage();
-  else if (state.view === 'flows') loadFlows();
-  else if (state.view === 'playbooks') loadPlaybooks();
-  else if (state.view === 'brain') loadBrain();
-  else if (state.view === 'audit') loadAudit();
-  else if (state.view === 'constellation') loadConstellation();
-  else if (state.view === 'machines') loadMachines();
-  else if (state.view === 'unsaved') loadUnsaved();
-  else if (state.view === 'trouble') loadTrouble();
-  else if (state.view === 'leaks') loadLeaks();
+  VIEW_LOADERS[state.view]?.();
 }
 
 function render() {
@@ -3638,23 +3927,7 @@ $('liveBtn').onclick = () => {
   state.live = true; $('liveBtn').classList.add('on');
   state.scrub = state.data.events.length; render();
 };
-$('viewFleet').onclick = () => { if (!BAKED) { state.view = 'fleet'; setTabs(); } };
-$('viewTable').onclick = () => { if (!BAKED) { state.view = 'table'; setTabs(); } };
-$('viewFingerprints').onclick = () => { if (!BAKED) { state.view = 'fingerprints'; setTabs(); } };
-$('viewCalendar').onclick = () => { if (!BAKED) { state.view = 'calendar'; setTabs(); } };
-$('viewRings').onclick = () => { if (!BAKED) { state.view = 'rings'; setTabs(); } };
-$('viewRhythm').onclick = () => { if (!BAKED) { state.view = 'rhythm'; setTabs(); } };
-$('viewProjects').onclick = () => { if (!BAKED) { state.view = 'projects'; setTabs(); } };
-$('viewUsage').onclick = () => { if (!BAKED) { state.view = 'usage'; setTabs(); } };
-$('viewFlows').onclick = () => { if (!BAKED) { state.view = 'flows'; setTabs(); } };
-$('viewPlaybooks').onclick = () => { if (!BAKED) { state.view = 'playbooks'; setTabs(); } };
-$('viewBrain').onclick = () => { if (!BAKED) { state.view = 'brain'; setTabs(); } };
-$('viewAudit').onclick = () => { if (!BAKED) { state.view = 'audit'; setTabs(); } };
-$('viewConstellation').onclick = () => { if (!BAKED) { state.view = 'constellation'; setTabs(); } };
-$('viewMachines').onclick = () => { if (!BAKED) { state.view = 'machines'; setTabs(); } };
-$('viewUnsaved').onclick = () => { if (!BAKED) { state.view = 'unsaved'; setTabs(); } };
-$('viewTrouble').onclick = () => { if (!BAKED) { state.view = 'trouble'; setTabs(); } };
-$('viewLeaks').onclick = () => { if (!BAKED) { state.view = 'leaks'; setTabs(); } };
+renderNavBar(); // builds #navHome + the four category dropdowns from NAV_MENUS
 $('viewBoard').onclick = () => { state.view = 'board'; setTabs(); render(); };
 $('viewWaterfall').onclick = () => { state.view = 'waterfall'; setTabs(); render(); };
 $('viewLanes').onclick = () => { state.view = 'lanes'; setTabs(); render(); };
@@ -3690,7 +3963,7 @@ if (BAKED) {
   state.scrub = state.data.events.length;
   document.title = 'Replay — ' + BAKED.title;
   $('spicker').style.display = 'none';
-  for (const id of ['viewFleet', 'viewTable', 'viewFingerprints', 'viewCalendar', 'viewRings', 'viewRhythm', 'viewProjects', 'viewUsage', 'viewFlows', 'viewPlaybooks', 'viewBrain', 'viewAudit', 'viewConstellation', 'viewMachines', 'viewUnsaved', 'viewTrouble', 'viewLeaks']) { const el = $(id); if (el) el.style.display = 'none'; }
+  $('navBar').style.display = 'none'; // hides home button + all four menus in one shot — they're the only children NAV_MENUS drives
   $('exportBtn').style.display = 'none';
   $('liveBtn').style.display = 'none';
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'replay';
@@ -3699,4 +3972,5 @@ if (BAKED) {
   loadSessions();
   loadMeta().then(() => setTabs());
   startNotifications();
+  loadAppVersion();
 }
