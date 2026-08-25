@@ -115,11 +115,15 @@ const VIEW_META = {
   projects:      { label: 'Projects',      icon: '',   pane: 'projects' },
   usage:         { label: 'Usage',         icon: '📈', pane: 'usage' },
   audit:         { label: 'Audit',         icon: '🛡', pane: 'audit' },
+  divergence:    { label: 'Divergence',    icon: '🪜', pane: 'divergence' },
+  graveyard:     { label: 'Graveyard',     icon: '🪦', pane: 'graveyard' },
+  hookprops:     { label: 'Hook ideas',    icon: '🪝', pane: 'hookprops' },
+  dejavu:        { label: 'Deja Vu',       icon: '🔁', pane: 'dejavu' },
 };
 const NAV_MENUS = [
   { key: 'sessions', label: 'Sessions', views: ['fleet', 'table', 'constellation', 'calendar', 'fingerprints', 'rings', 'rhythm'] },
-  { key: 'health',   label: 'Health',   views: ['trouble', 'unsaved', 'leaks', 'flows'] },
-  { key: 'improve',  label: 'Improve',  views: ['playbooks', 'brain'] },
+  { key: 'health',   label: 'Health',   views: ['trouble', 'unsaved', 'leaks', 'flows', 'divergence', 'graveyard'] },
+  { key: 'improve',  label: 'Improve',  views: ['playbooks', 'brain', 'hookprops', 'dejavu'] },
   { key: 'system',   label: 'System',   views: ['machines', 'projects', 'usage', 'audit'] },
 ];
 const OVERVIEW = NAV_MENUS.flatMap(m => m.views);
@@ -1693,6 +1697,111 @@ function renderLeaks() {
   $('leaks').querySelectorAll('.uw-sess[data-file]').forEach(el => el.onclick = () => openSession(el.dataset.file));
 }
 
+// ---------- THE GRAVEYARD (work this fleet already threw away) ----------
+// WHY: every other view asks how a run WENT. This asks what has already been tried
+// in a folder and undone, so the next agent doesn't cheerfully rebuild it.
+// v1 IS THE NARROW, PROVABLE VERSION. The server recognises four literal git
+// commands and nothing else, and it sends that list back as `looksFor` — this panel
+// prints the server's own list rather than a hand-written copy, so what's promised
+// on screen and what's actually detected cannot drift apart. Fuzzy "the run started
+// over and did something different" detection was cut on purpose: every long session
+// changes approach, so it fires constantly and means nothing.
+// NO RATES, EVER. Each row is one thing that happened once, with a link to it. The
+// denominator would be "transcripts that happen to still be on this computer", which
+// is not a fair sample of anything, so no share is computed from it.
+// NOTHING HERE WRITES ANYTHING. v1 deliberately has no "add this to my guidance
+// file" button — the list has to be proved right before anything acts on it.
+let graveData = null;
+async function loadGraveyard() {
+  $('graveyard').innerHTML = '<div class="fleet-loading">Reading the commands your agents actually ran, looking for the moments they threw work away… (this one takes a moment)</div>';
+  try { graveData = await (await fetch('/api/graveyard')).json(); }
+  catch { graveData = { moments: [], error: 'Could not check for thrown-away work just now.' }; }
+  renderGraveyard();
+}
+const GRAVE_ICON = { reset: '💣', revert: '↩️', checkout: '🗑', restore: '🗑' };
+const graveBase = p => String(p || '').split(/[\\/]/).filter(Boolean).pop() || p;
+const graveDate = ts => new Date(ts).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+function graveFilesHTML(m) {
+  if (!m.files || !m.files.length) return '';
+  // One command discarded two files both called sw.js. Bare file names would have
+  // printed the same chip twice and looked like a duplicate, so a name that repeats
+  // in this row keeps its parent folder — only where it's actually needed.
+  const seen = {};
+  for (const f of m.files) { const b = graveBase(f); seen[b] = (seen[b] || 0) + 1; }
+  const label = f => {
+    const segs = String(f).split(/[\\/]/).filter(Boolean);
+    const b = segs[segs.length - 1];
+    return seen[b] > 1 && segs.length > 1 ? segs.slice(-2).join('/') : b;
+  };
+  const chips = m.files.map(f => `<span class="gy-file" title="${esc(f)}">${esc(label(f))}</span>`).join('');
+  return m.filesNamed
+    ? `<div class="gy-files"><span class="dim">files thrown back:</span>${chips}</div>`
+    : `<div class="gy-files"><span class="dim">the command named no files, so these are what this run had edited by then${m.filesCapped ? ' (last few)' : ''}:</span>${chips}</div>`;
+}
+function renderGraveyard() {
+  const d = graveData || {};
+  const moments = d.moments || [];
+  // Everything the scan could not see, said out loud. A graveyard is only useful if
+  // it admits which graves it wasn't allowed to walk past.
+  const limits = [
+    d.capped ? `${(d.candidates || 0) - (d.scannedSessions || 0)} more transcript${(d.candidates || 0) - (d.scannedSessions || 0) === 1 ? '' : 's'} kept here weren’t reached in one pass` : null,
+    d.budgetHit ? 'the scan stopped early once it had read enough' : null,
+    d.orphans ? `${d.orphans} archived session${d.orphans === 1 ? '' : 's'} arrived with their helper transcripts but not their main one, so there’s no moment to link to` : null,
+  ].filter(Boolean);
+  const scanNote = d.error ? esc(d.error)
+    : `Read the real command text of ${d.scannedSessions === 1 ? 'the 1 transcript' : `all ${d.scannedSessions || 0} transcripts`} stored on this computer (${d.mbRead || 0}MB).${limits.length ? ` Not checked: ${esc(limits.join('; '))}.` : ''}`;
+
+  // The detector's own list, straight from the server, so what this panel promises
+  // and what it actually recognises can never drift apart. If the scan failed there
+  // is no list to print, and claiming one would be describing a check that didn't run.
+  const rules = d.looksFor || [];
+  const looks = rules.length
+    ? `This looks for <b>${rules.length === 4 ? 'four' : rules.length} exact commands</b> and nothing else:<ul class="gy-shapes">${rules.map(r => `<li><code>${esc(r.cmd)}</code> — ${esc(r.what)}</li>`).join('')}</ul>`
+    : '';
+  const note = `<div class="uw-note">${looks}
+     Anything vaguer — a run that quietly changed approach — is <b>not</b> detected, on purpose: every long session changes approach, so guessing at it would flag nearly everything.
+     <br><b>A row is not a verdict.</b> Throwing an edit away is often exactly the right call. This is the list of moments worth re-reading before an agent tries that ground again — click a row to land on the exact moment.
+     ${d.summaryOnly ? `<br>Only transcripts stored on this computer can be checked: ${d.summaryOnly} session${d.summaryOnly === 1 ? '' : 's'} in your fleet arrived from another machine already summarised, and a summary keeps the sentence (“Discard local changes”), not the command.` : ''}
+     <br><b>Nothing here changes anything.</b> There is no button that writes this into a guidance file — the list has to earn its trust first.</div>`;
+
+  // one block per project folder, folders with the most moments first
+  const byRepo = new Map();
+  moments.forEach((m, i) => {
+    const k = (m.repo || '').toLowerCase();
+    if (!byRepo.has(k)) byRepo.set(k, { repo: m.repo, rows: [] });
+    byRepo.get(k).rows.push({ m, i });
+  });
+  const repos = [...byRepo.values()].sort((a, b) => b.rows.length - a.rows.length);
+  const body = repos.map(r => `<div class="gy-repo">
+      <div class="gy-repo-h"><b>${esc(graveBase(r.repo) || 'folder not recorded')}</b><span class="dim">${esc(r.repo || '')} · ${r.rows.length} moment${r.rows.length === 1 ? '' : 's'}</span></div>
+      ${r.rows.map(({ m, i }) => `<div class="gy-row" data-i="${i}" title="${m.seq == null ? 'open this session (the exact moment couldn’t be pinpointed)' : 'open this session at that exact moment'}">
+        <span class="gy-when" title="${esc(fmtAgo(m.ts))}">${esc(graveDate(m.ts))}</span>
+        <span class="gy-icon" title="${esc(m.cmd)}">${GRAVE_ICON[m.kind] || '🗑'}</span>
+        <div class="gy-main">
+          <div class="gy-what">${esc(m.what)}<span class="dim"> — in “${esc(m.title || 'a session')}” on ${esc(m.machine || 'this computer')}</span></div>
+          ${graveFilesHTML(m)}
+          <code class="gy-cmd" title="${esc(m.whole || m.command)}">${esc(m.command)}</code>
+        </div>
+        <span class="gy-open">${m.seq == null ? 'open session ↗' : 'open the moment ↗'}</span>
+      </div>`).join('')}
+    </div>`).join('');
+
+  const empty = `<div class="sl-clear">✓ No agent has thrown work away in anything this computer can read.<div class="sl-clear-sub">None of the ${d.scannedSessions || 0} transcript${d.scannedSessions === 1 ? '' : 's'} here contains one of the four commands above. That is the normal, expected result — and it is a small sample, not a clean bill of health.</div></div>`;
+
+  $('graveyard').innerHTML =
+    `<div class="fleet-head"><h2>Graveyard — ${(d.totalMoments || moments.length) ? `${d.totalMoments || moments.length} moment${(d.totalMoments || moments.length) === 1 ? '' : 's'} where work was thrown away${d.totalMoments > moments.length ? ` (showing the newest ${moments.length})` : ''}` : 'nothing thrown away'}</h2>
+      <span class="dim">${scanNote}</span>${homeButton('graveyard')}</div>
+     ${note}
+     ${d.error ? '' : moments.length ? body : empty}`;
+
+  wireHomeButton($('graveyard'), 'graveyard', renderGraveyard);
+  $('graveyard').querySelectorAll('.gy-row[data-i]').forEach(el => el.onclick = () => {
+    const m = moments[+el.dataset.i];
+    if (!m) return;
+    if (m.seq == null) openSession(m.file); else openSessionAt(m.file, m.seq);
+  });
+}
+
 // ---------- PLAYBOOK STUDIO (mine the fleet, generate reusable plays) ----------
 // Generation only — the studio designs plays from YOUR fleet's track record;
 // you paste them to an agent yourself. It never executes anything.
@@ -1957,6 +2066,200 @@ function dirRootsHTML(roots) {
   return roots.map(r => `
         <div class="dir-root-row${r.ok === false ? ' dir-root-dead' : ''}"><span title="${esc(r.path)}"><b>${esc(r.label || r.path)}</b> <span class="dim">${esc(r.path)}${r.ok === false ? ' — can’t find this folder right now, so it offers nothing' : ''}</span></span><button class="mini-btn dir-root-rm" data-path="${esc(r.path)}">✕ remove</button></div>`).join('');
 }
+// ---------- RULE REHEARSAL (would this standing order have been broken before?) ----------
+// WHAT IT ANSWERS: before a rule is planted into every future session in a repo,
+// how often would it have been broken in the sessions already on record?
+// WHY IT IS DELIBERATELY NARROW: a rule written in English can mean anything, and a
+// scorer that "interprets" it would print a confident number next to a rule it never
+// actually checked. That is worse than no number, because the owner plants on the
+// strength of it. So this understands exactly the sentence shapes listed in
+// RR_SHAPES, shows those shapes on screen so the owner can see what is checkable,
+// and answers anything else with "not automatically measurable" and nothing more.
+// No LLM, no fuzzy matching, no partial credit, same answer every time.
+// A NAMED TOOL MUST BE A REAL TOOL: "never use sudo" looks exactly like "never use
+// Bash" to a regex. If the named word is not a tool this fleet has actually called,
+// the clause is dropped as unmeasurable rather than scored 0 — a 0 there would read
+// as "you never break this", when the truth is "I didn't understand you".
+// RATES, NOT BOOLEANS: every answer is "broken in N of the M sessions where the rule
+// APPLIED" — the denominator is only the sessions that had a chance to break it —
+// and under RR_MIN_APPLICABLE runs there is no percentage at all.
+const RR_MIN_APPLICABLE = 3;   // below this, no rate is shown for a clause or overall
+const RR_MAX_EXAMPLES = 10;    // linked sessions listed per clause
+const RR_MAX_CLAUSES = 6;      // a rule body is a rule, not a program
+const RR_MAX_ROLES = 4;        // roles taken from one "a / b / c → tier" line
+const RR_TIER_RANK = { cheap: 0, mid: 1, premium: 2, flagship: 3 };
+// the shapes, in the owner's words — this array IS the on-screen help, so the two
+// can never drift apart
+const RR_SHAPES = [
+  { kind: 'ban', example: 'never use Bash', re: /\b(?:never|do\s+not|don['’]?t)\s+(?:use|run|call|invoke|touch)\s+(?:the\s+)?[`"']?([A-Za-z][\w-]{1,40})[`"']?/i },
+  { kind: 'order', example: 'always run Read before Edit', re: /\balways\s+(?:run|use|call)\s+[`"']?([A-Za-z][\w-]{1,40})[`"']?\s+before\s+(?:any\s+|each\s+|every\s+|you\s+)?[`"']?([A-Za-z][\w-]{1,40})[`"']?/i },
+  { kind: 'tier', example: 'review agents must run on claude-sonnet-5 (or “review → claude-sonnet-5”)', re: /^[\s\-*•]*["'`]?([A-Za-z][\w /&+-]{1,40}?)["'`]?\s*(?:agents?|workers?|helpers?|subagents?)?\s*[:→-]*\s*(?:must|should)\s+(?:run\s+on|use)\s+(?:the\s+)?["'`]?([\w.-]+)["'`]?/i },
+  { kind: 'tier', example: 'review / research → claude-sonnet-5', re: /^[\s\-*•]*["'`]?([A-Za-z][\w /&+-]{1,40}?)["'`]?\s*(?:agents?|workers?|helpers?|subagents?)?\s*(?:→|->)\s*["'`]?([\w.-]+)["'`]?/i },
+];
+// a line carrying any of these is a conditional rule, and gets refused outright
+const RR_CONDITIONAL = /\b(?:unless|except|if|when|whenever|only|otherwise|prefer|try to|generally|usually|where possible)\b/i;
+// same name normalisation mineFleet() aggregates roles by, so "review #3" and
+// "review #7" are one role here too
+const rrNorm = n => String(n || '').replace(/\s*#\d+$/, '').replace(/[0-9a-f-]{12,}/g, '·').slice(0, 30);
+// A role matches an agent on whole words, never a bare substring — "read" must not
+// silently claim every agent whose name happens to contain those four letters.
+function rrRoleRe(role) {
+  return new RegExp('\\b' + String(role).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
+}
+// every tool name this fleet has actually called, lowercase -> how it's really spelled
+function rrVocab(data) {
+  const v = new Map();
+  for (const { d } of data) for (const e of (d.events || [])) if (e.tool && !v.has(e.tool.toLowerCase())) v.set(e.tool.toLowerCase(), e.tool);
+  return v;
+}
+// a tier name, or a model id that resolves to one; null if it is neither
+function rrTier(word) {
+  const w = String(word || '').trim().toLowerCase().replace(/[.,;:)]+$/, '');
+  if (RR_TIER_RANK[w] !== undefined) return w;
+  const t = modelTier(w);
+  return t === 'unknown' ? null : t;
+}
+// Parse the body into checkable clauses. Every clause carries `source` — the exact
+// words it came from — so the report can show what it read rather than assert.
+function rrParse(body, vocab) {
+  const clauses = [];
+  let unreadable = 0;
+  for (const raw of String(body || '').split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    // A conditional rule ("never use X unless…", "…only when…") is not the flat rule
+    // the shapes below would score it as, and scoring it flat would overcount every
+    // legitimate exception. Refuse the whole line rather than read half of it.
+    if (RR_CONDITIONAL.test(line)) { unreadable++; continue; }
+    let got = false;
+    for (const shape of RR_SHAPES) {
+      const m = shape.re.exec(line);
+      if (!m) continue;
+      if (shape.kind === 'ban') {
+        const tool = vocab.get(m[1].toLowerCase());
+        if (tool) { clauses.push({ kind: 'ban', tool, source: line, label: `never use ${tool}` }); got = true; }
+      } else if (shape.kind === 'order') {
+        const before = vocab.get(m[1].toLowerCase()), after = vocab.get(m[2].toLowerCase());
+        if (before && after && before !== after) { clauses.push({ kind: 'order', before, after, source: line, label: `always run ${before} before ${after}` }); got = true; }
+      } else {
+        const tier = rrTier(m[2]);
+        if (tier) {
+          // "review / research / accuracy-check" is three roles on one line
+          const roles = m[1].split(/[\/,]| and /i).map(r => r.trim().replace(/\b(?:agents?|workers?|helpers?|subagents?)\b/ig, '').trim().toLowerCase())
+            .filter(r => r.length >= 3).slice(0, RR_MAX_ROLES);
+          for (const role of roles) { clauses.push({ kind: 'tier', role, tier, source: line, label: `"${role}" runs no higher than ${TIER_LABEL[tier].toLowerCase()} tier` }); got = true; }
+        }
+      }
+      if (got) break;
+    }
+    if (!got) unreadable++;
+  }
+  // the cap is per rule, not per line — one "a / b / c → tier" line can add several.
+  // Anything over it is reported as its own sentence: a clause that was dropped for
+  // room is not the same thing as a line nobody could read.
+  return { clauses: clauses.slice(0, RR_MAX_CLAUSES), unreadable, capped: Math.max(0, clauses.length - RR_MAX_CLAUSES) };
+}
+// Score one clause against the sessions on record. Returns real counts only.
+function rrEval(clause, data) {
+  const hits = [], applicable = [];
+  let couldNotTell = 0;
+  for (const { s, d } of data) {
+    const evs = (d.events || []).filter(e => e.kind === 'tool-call' || e.kind === 'spawn');
+    if (clause.kind === 'ban') {
+      if (!evs.length) continue;                  // ran no tools at all: never had the chance
+      applicable.push(s);
+      const n = evs.filter(e => e.tool === clause.tool).length;
+      if (n) hits.push({ s, why: `used ${clause.tool} ${n} time${n === 1 ? '' : 's'}` });
+    } else if (clause.kind === 'order') {
+      // per agent, in order: the rule is about what one worker did, not what the
+      // session collectively happened to contain somewhere
+      const byAgent = new Map();
+      for (const e of evs) { if (!byAgent.has(e.agent)) byAgent.set(e.agent, []); byAgent.get(e.agent).push(e.tool); }
+      let ranAfter = 0, bad = 0;
+      for (const [, tools] of byAgent) {
+        let seen = false;
+        for (const t of tools) {
+          if (t === clause.before) seen = true;
+          else if (t === clause.after) { ranAfter++; if (!seen) bad++; }
+        }
+      }
+      if (!ranAfter) continue;                    // never ran the second tool: rule could not bite
+      applicable.push(s);
+      if (bad) hits.push({ s, why: `ran ${clause.after} ${bad} time${bad === 1 ? '' : 's'} without ${clause.before} first` });
+    } else {
+      let judged = 0, matched = 0; const worse = [];
+      const roleRe = clause.roleRe || (clause.roleRe = rrRoleRe(clause.role));
+      for (const a of (d.agents || [])) {
+        if (!roleRe.test(rrNorm(a.name || ''))) continue;
+        matched++;
+        const t = a.model ? modelTier(a.model) : 'unknown';
+        if (t === 'unknown') continue;            // no model on record: cannot judge this one
+        judged++;
+        if (RR_TIER_RANK[t] > RR_TIER_RANK[clause.tier]) worse.push(`${modelShortName(a.model)} (${TIER_LABEL[t].toLowerCase()})`);
+      }
+      if (!matched) continue;
+      if (!judged) { couldNotTell++; continue; }  // the role ran, but nothing recorded what it ran on
+      applicable.push(s);
+      if (worse.length) hits.push({ s, why: `${[...new Set(worse)].slice(0, 3).join(', ')} — above ${TIER_LABEL[clause.tier].toLowerCase()}` });
+    }
+  }
+  return { clause, hits, files: applicable.map(s => s.file), applicable: applicable.length, couldNotTell, gated: applicable.length < RR_MIN_APPLICABLE };
+}
+// One clause's line in the report — a count and a denominator, never a bare percent.
+function rrClauseHTML(r, i) {
+  const c = r.clause;
+  const body = r.gated
+    ? `<span class="rr-none">not enough runs to say yet</span> <span class="dim">— only ${r.applicable} of the sessions read ever did this${r.couldNotTell ? `; ${r.couldNotTell} more couldn’t be judged` : ''}.</span>`
+    : `<b class="${r.hits.length ? 'rr-bad' : 'rr-ok'}">broken in ${r.hits.length} of ${r.applicable}</b> <span class="dim">session${r.applicable === 1 ? '' : 's'} where it applied${r.couldNotTell ? ` (${r.couldNotTell} more couldn’t be judged)` : ''}</span>`;
+  const list = (!r.gated && r.hits.length) ? `<div class="rr-hits">${r.hits.slice(0, RR_MAX_EXAMPLES).map(h => `
+      <div class="rr-hit" data-file="${esc(h.s.file)}" title="open this session">
+        <span class="rr-hit-t">${esc(h.s.title || h.s.session || 'a session')}</span>
+        <span class="dim">${esc(h.why)} · ${esc(fmtAgo(h.s.mtime))}</span>
+      </div>`).join('')}${r.hits.length > RR_MAX_EXAMPLES ? `<div class="dim">…and ${r.hits.length - RR_MAX_EXAMPLES} more</div>` : ''}</div>` : '';
+  return `<div class="rr-clause"><div class="rr-clause-h"><span class="rr-i">${i + 1}</span><b>${esc(c.label)}</b>${body}</div>
+    <div class="dim rr-src">read from: “${esc(trunc(c.source, 110))}”</div>${list}</div>`;
+}
+// The whole report. `data` is the same ~60-session cache Playbook Studio mines.
+function rrReportHTML(body, data) {
+  // No history read means no rule was checked — say that, never "not measurable",
+  // which would blame the wording for a problem that is entirely on this end.
+  if (!data.length) return { html: `<div class="dim">No sessions could be read on this computer, so this rule was <b>not checked at all</b>.</div>`, measured: false };
+  const parsed = rrParse(body, rrVocab(data));
+  // THE INTEGRITY LINE: nothing was checked, so nothing is claimed.
+  if (!parsed.clauses.length) return { html: `<div class="rr-unmeasurable">not automatically measurable</div>`, measured: false };
+  const results = parsed.clauses.map(c => rrEval(c, data));
+  // Headline denominator is the UNION of what each clause could apply to, and the
+  // numerator the union of what each clause caught — both built from the very same
+  // evaluations the rows below print, so the two can never disagree.
+  // ...and ONLY from clauses that individually cleared the gate. Unioning gated
+  // clauses produced a confident headline percentage assembled entirely out of
+  // samples the rows underneath had just declared too small to judge.
+  const brokeIn = new Set(), appliedTo = new Set();
+  const judgeable = results.filter(r => !r.gated);
+  for (const r of judgeable) { for (const h of r.hits) brokeIn.add(h.s.file); for (const f of r.files) appliedTo.add(f); }
+  const applied = appliedTo.size;
+  const gated = !judgeable.length || applied < RR_MIN_APPLICABLE;
+  const head = gated
+    ? `<div class="rr-head rr-none">Not enough runs to say yet.</div><div class="dim">${judgeable.length ? `Only ${applied} of the ${data.length} sessions read ever did the thing this rule is about — too few to put a number on.` : `None of what this rule says could be checked against enough runs to put a number on it.`}</div>`
+    : `<div class="rr-head ${brokeIn.size ? 'rr-bad' : 'rr-ok'}">Would have been broken in ${brokeIn.size} of the ${applied} recent session${applied === 1 ? '' : 's'} where it applied.</div>
+       <div class="dim">Read your last ${data.length} sessions; ${applied} of them ever did the thing this rule is about. Sessions that never did it can’t break the rule, so they are left out of the count rather than padding it.</div>`;
+  const notes = [
+    parsed.unreadable ? `The other ${parsed.unreadable} line${parsed.unreadable === 1 ? '' : 's'} of this rule ${parsed.unreadable === 1 ? 'is' : 'are'} not automatically measurable, and ${parsed.unreadable === 1 ? 'was' : 'were'} not checked at all.` : null,
+    parsed.capped ? `${parsed.capped} more checkable part${parsed.capped === 1 ? ' was' : 's were'} left out — this rehearsal reads at most ${RR_MAX_CLAUSES} parts of one rule.` : null,
+  ].filter(Boolean);
+  const partial = notes.length
+    ? `<div class="rr-partial">Only the part${parsed.clauses.length === 1 ? '' : 's'} below could be checked. ${esc(notes.join(' '))}</div>`
+    : '';
+  return { html: head + partial + results.map(rrClauseHTML).join(''), measured: true };
+}
+// One worked example per shape, straight off RR_SHAPES so the help can never
+// promise a sentence the parser doesn't actually understand.
+function rrShapesHTML() {
+  const byKind = new Map();
+  for (const s of RR_SHAPES) if (!byKind.has(s.kind)) byKind.set(s.kind, s.example);
+  return `<div class="rr-shapes dim">Sentences it can check: ${[...byKind.values()].map(e => `<code>${esc(e)}</code>`).join(' · ')}. Anything else is reported as not measurable rather than guessed at, and a named tool only counts if your sessions have really called a tool by that name.</div>`;
+}
+
 function openDirectiveComposer(pre) {
   pre = pre || {};
   const ov = document.createElement('div');
@@ -1971,6 +2274,12 @@ function openDirectiveComposer(pre) {
       <input id="dcTitle" class="pbe-name" style="width:100%;margin:4px 0 8px" value="${esc(pre.title || '')}" placeholder="e.g. Tier your models">
       <label class="dim">The order (markdown)</label>
       <textarea id="dcBody" class="dc-body">${esc(pre.body || '')}</textarea>
+      <div class="rr-box">
+        <div class="rr-bar"><button class="mini-btn" id="dcRehearse">🔎 Rehearse against my history</button>
+          <span class="dim">Checks this rule against sessions you've already run, before it changes any future one. Reads only — nothing is planted or written.</span></div>
+        ${rrShapesHTML()}
+        <div id="dcRehearseOut"></div>
+      </div>
       <label class="dim">Remind me to review this every <input id="dcReview" type="number" min="1" max="3650" value="${esc(pre.reviewEveryDays || 30)}" style="width:56px"> days</label>
       <div class="hm-m-head" style="margin-top:10px"><b>Where to plant it</b><button class="mini-btn" id="dcAll" style="margin-left:auto">toggle all</button></div>
       <div class="dir-targets" id="dcTargets">${dirTargetsHTML(targets)}</div>
@@ -2045,6 +2354,37 @@ function openDirectiveComposer(pre) {
   };
   ov.querySelector('#dcRootAddBtn').onclick = doAddRoot;
   rootInput.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); doAddRoot(); } };
+  // ---- rule rehearsal: score this rule against history BEFORE anything is planted ----
+  // The first run may have to read ~60 transcripts, so it stays a deliberate click.
+  // Once that cache is warm re-scoring costs nothing, so the report then follows the
+  // body live and can never sit there stale next to text it was not computed from.
+  const rrOut = ov.querySelector('#dcRehearseOut');
+  const rrBtn = ov.querySelector('#dcRehearse');
+  let rrLive = false, rrT = null;
+  const rrDraw = () => {
+    const body = ov.querySelector('#dcBody').value.trim();
+    if (!body) { rrOut.innerHTML = '<div class="dim">Write the rule first, then rehearse it.</div>'; return; }
+    rrOut.innerHTML = rrReportHTML(body, flowsCache || []).html;
+    rrOut.querySelectorAll('.rr-hit[data-file]').forEach(el => el.onclick = () => { ov.remove(); openSession(el.dataset.file); });
+  };
+  rrBtn.onclick = async () => {
+    rrBtn.disabled = true;
+    try {
+      if (!flowsCache) {
+        rrOut.innerHTML = '<div class="dim">Reading your recent sessions…</div>';
+        if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+        await loadFlows.fetchOnly();
+      }
+      rrDraw();
+      rrLive = true;
+    } catch { rrOut.innerHTML = '<div class="dim">Couldn’t read your recent sessions just now, so this rule was <b>not checked at all</b>.</div>'; }
+    rrBtn.disabled = false;
+  };
+  ov.querySelector('#dcBody').addEventListener('input', () => {
+    if (!rrLive) return;
+    clearTimeout(rrT); rrT = setTimeout(rrDraw, 350);
+  });
+
   ov.querySelector('#dcPlant').onclick = async () => {
     const ids = [...ov.querySelectorAll('.dir-target input:checked')].map(c => c.dataset.id);
     const title = ov.querySelector('#dcTitle').value.trim();
@@ -2741,12 +3081,16 @@ function renderAudit(entries) {
     // jump into the Brain editor for the file this entry touched
     state.view = 'brain'; setTabs(); await loadBrain();
     const item = brainItems.find(i => i.id === el.dataset.brainpath);
-    if (item) { const r = await (await fetch('/api/brain/file?id=' + item.id)).json(); if (!r.error) { brainCurrent = r; brainDirty = false; brainMode = 'view'; renderBrain(); } }
+    if (item) { const r = await (await fetch('/api/brain/file?id=' + item.id)).json(); if (!r.error) { brainCurrent = r; brainDisk = r.content; brainDirty = false; brainMode = 'view'; renderBrain(); } }
   });
 }
 
 // ---------- BRAIN view (memories, hooks, agent configs on this machine) ----------
 let brainItems = [], brainCurrent = null, brainDirty = false, brainMode = 'view';
+// What is actually ON DISK. The hooks/permissions panes edit brainCurrent.content
+// in place, which erased the original and left the save with nothing to diff — so
+// a toggled hook looked saved and never was. This keeps the before-picture.
+let brainDisk = null;
 
 // plain-language meanings for common settings.json keys
 const SETTINGS_HELP = {
@@ -2785,6 +3129,7 @@ function addStarterHook(i) {
   cfg.hooks = cfg.hooks || {};
   cfg.hooks[s.event] = cfg.hooks[s.event] || [];
   cfg.hooks[s.event].push(JSON.parse(JSON.stringify(s.hook)));
+  if (!brainDirty) brainDisk = brainCurrent.content;
   brainCurrent.content = JSON.stringify(cfg, null, 2);
   brainDirty = true;
   renderBrain();
@@ -2841,6 +3186,7 @@ function toggleHook(ev, idx, wasOn) {
   to[ev] = to[ev] || []; to[ev].push(moved);
   if (!from[ev].length) delete from[ev];
   if (cfg._disabledHooks && !Object.keys(cfg._disabledHooks).length) delete cfg._disabledHooks;
+  if (!brainDirty) brainDisk = brainCurrent.content;
   brainCurrent.content = JSON.stringify(cfg, null, 2);
   brainDirty = true;
   renderBrain();
@@ -2903,6 +3249,206 @@ function renderMD(src) {
   closeList(); if (inCode) out += '</pre>';
   return out;
 }
+// ---------- BLAST RADIUS (what would this permission rule actually have hit?) ----------
+// WHAT IT ANSWERS: the owner types an allow/deny pattern into settings.json and has
+// no way to know what it really covers. This shows the actual tool calls it would
+// have matched, out of this computer's own history, so the rule gets judged by
+// examples instead of trusted on faith.
+// IT IS AN APPROXIMATION AND IT SAYS SO ON SCREEN: Claude Code's permission matcher
+// lives inside Claude Code and moves with it. Re-implementing it exactly here would
+// be a compatibility treadmill, and a preview that CLAIMED to be exact would be the
+// worse failure — the owner would stop double-checking. So this covers the documented
+// common shapes (whole tool, Bash prefix with `:*`, file-path globs, WebFetch
+// `domain:`, MCP server prefixes) and returns "couldn't judge this one" for anything
+// else, counted and reported, rather than quietly scoring it as a miss.
+// READ-ONLY, permanently: this pane has no save button and no write route behind it.
+// The Edit tab stays the only way this file ever changes, and only by hand.
+let brCalls = null, brPattern = '', brEffect = 'deny';
+const BR_MAX_ROWS = 40;      // matched calls listed before "+N more"
+const BR_ARG_MAX = 130;      // characters of a command/path shown per row
+async function loadToolCalls() {
+  try { brCalls = await (await fetch('/api/tool-calls')).json(); }
+  catch { brCalls = { calls: [], error: 'Could not read what your agents have actually run just now.' }; }
+}
+// "Bash", "Bash(git log:*)", "mcp__github" -> {tool, spec}; null if it isn't rule-shaped
+function parsePermRule(src) {
+  const m = /^([A-Za-z_][\w-]*)\s*(?:\(([\s\S]*)\))?$/.exec(String(src || '').trim());
+  return m ? { tool: m[1], spec: m[2] == null ? null : m[2].trim() } : null;
+}
+function permToolMatches(rule, tool) {
+  if (rule.tool === tool) return true;
+  // a bare server name covers every tool that server exposes
+  if (rule.tool.startsWith('mcp__') && !rule.tool.slice(5).includes('__')) return tool.startsWith(rule.tool + '__');
+  return false;
+}
+// gitignore-ish path glob. `**` crosses folders, `*` and `?` do not. A leading `//`
+// anchors at the start of the path; anything else is matched against the tail on a
+// folder boundary, and a wildcard-free pattern also covers everything beneath it.
+// memoised: the "rules already in this file" list tallies every rule against every
+// call, so a settings file with 80 rules would otherwise rebuild thousands of
+// identical regexes on each paint
+const permGlobCache = new Map();
+function permGlobRe(pat) {
+  const hit = permGlobCache.get(pat);
+  if (hit) return hit;
+  const re = permGlobBuild(pat);
+  if (permGlobCache.size > 400) permGlobCache.clear();
+  permGlobCache.set(pat, re);
+  return re;
+}
+function permGlobBuild(pat) {
+  let p = String(pat).replace(/\\/g, '/').trim();
+  let anchored = false;
+  if (p.startsWith('//')) {
+    p = p.slice(1); anchored = true;
+    if (/^\/[A-Za-z]:/.test(p)) p = p.slice(1);  // //C:/work -> C:/work: a Windows absolute path has no leading slash
+  } else if (p.startsWith('~/')) p = p.slice(1);
+  let re = '';
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i];
+    if (c === '*' && p[i + 1] === '*') { re += '.*'; i++; if (p[i + 1] === '/') i++; }
+    else if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  if (!/[*?]/.test(p) && !p.endsWith('/')) re += '(?:/.*)?';
+  return new RegExp((anchored ? '^' : '(?:^|/)') + re + '$', 'i');
+}
+// true = matched, false = didn't, null = this preview will not guess about this call
+function permMatch(rule, call) {
+  if (!permToolMatches(rule, call.tool)) return false;
+  if (rule.spec === null || rule.spec === '*') return true;
+  if (/^domain:/i.test(rule.spec)) {
+    if (call.argKind !== 'url') return null;
+    const want = rule.spec.slice(7).trim().toLowerCase().replace(/^\*\./, '');
+    let host;
+    try { host = new URL(call.arg).hostname.toLowerCase(); } catch { return null; }
+    return !!want && (host === want || host.endsWith('.' + want));
+  }
+  if (call.argKind === 'command') {
+    const c = String(call.arg).trim();
+    // `cd x && git push` is two commands, and a Bash(git:*) rule reaches the second
+    // one. Testing only the whole string would UNDER-report an allow rule's reach —
+    // the one direction a safety preview must never err in. The split is naive about
+    // quoting on purpose: erring toward showing more is the safe side of that trade.
+    const parts = [c, ...c.split(/&&|\|\||;/g).map(x => x.trim()).filter(x => x && x !== c)];
+    if (rule.spec.endsWith(':*')) {
+      const p = rule.spec.slice(0, -2).trim().toLowerCase();
+      return !p || parts.some(x => x.toLowerCase().startsWith(p));
+    }
+    if (rule.spec.includes('*')) return null;   // a shape this preview doesn't claim to understand
+    if (parts.some(x => x === rule.spec)) return true;
+    // A clipped command is a PREFIX of the real one. If the rule doesn't match any
+    // part of that prefix it definitely isn't the whole command, so that is a
+    // confident no; only when the rule runs past the clip is the answer unknown.
+    if (call.clipped) return rule.spec.startsWith(parts[parts.length - 1]) ? null : false;
+    return false;
+  }
+  if (call.argKind === 'path') { try { return permGlobRe(rule.spec).test(String(call.arg).replace(/\\/g, '/')); } catch { return null; } }
+  return null;                                   // no argument on record: nothing to match against
+}
+// counts for one rule over the sample — used both by the big preview and by the
+// per-rule tallies next to the rules already in the file
+function permTally(src, calls) {
+  const rule = parsePermRule(src);
+  if (!rule) return null;
+  let hit = 0, unsure = 0;
+  const rows = [];
+  for (const c of calls) {
+    const m = permMatch(rule, c);
+    if (m === true) { hit++; if (rows.length < BR_MAX_ROWS) rows.push(c); }
+    else if (m === null) unsure++;
+  }
+  return { rule, hit, unsure, rows };
+}
+const BR_VERB = { allow: 'let through without asking you', deny: 'blocked', ask: 'stopped to ask you about' };
+function blastHTML() {
+  const d = brCalls;
+  if (!d) return '<div class="dim">Reading what your agents have actually run…</div>';
+  if (d.error) return `<div class="dim">${esc(d.error)}</div>`;
+  const calls = d.calls || [];
+  if (!calls.length) return '<div class="dim">No tool calls could be read on this computer, so there is nothing to test a rule against.</div>';
+  const src = brPattern.trim();
+  if (!src) return `<div class="dim">Type a pattern above — <code>Bash(git log:*)</code>, <code>Read(//C:/work/**)</code>, <code>WebFetch(domain:example.com)</code> — to see which of these ${calls.length} calls it covers.</div>`;
+  const t = permTally(src, calls);
+  if (!t) return `<div class="br-unknown">That isn’t a shape this preview understands. Permission rules look like <code>Bash</code>, <code>Bash(git log:*)</code>, <code>Read(//C:/work/**)</code>, <code>WebFetch(domain:example.com)</code> or <code>mcp__github</code>.</div>`;
+  const verb = BR_VERB[brEffect];
+  const head = t.hit
+    ? `<div class="br-head br-hit">This would have ${esc(verb)} <b>${t.hit}</b> of the ${calls.length} recent tool calls below.</div>`
+    : t.unsure
+      ? `<div class="br-head">Nothing in these ${calls.length} recent tool calls could be <i>confirmed</i> as ${esc(verb)} by this rule — but ${t.unsure} of them could not be judged either way, so this is not an all-clear.</div>`
+      : `<div class="br-head">Nothing in these ${calls.length} recent tool calls would have been ${esc(verb)} by this rule. That is not a promise about the future — only that it hasn’t come up yet in what can be read here.</div>`;
+  const unsure = t.unsure
+    ? `<div class="br-unsure">${t.unsure} call${t.unsure === 1 ? '' : 's'} matched the tool name but <b>could not be judged</b> — the argument isn’t on record, it was too long to store whole, or the pattern uses a shape this preview won’t guess at. They are counted neither as covered nor as missed.</div>`
+    : '';
+  const rows = t.hit ? `<div class="br-rows">${t.rows.map(c => `
+      <div class="br-row" data-file="${esc(c.file)}" title="open the session this ran in">
+        <span class="br-tool">${esc(c.tool)}</span>
+        <code class="br-arg">${esc(c.arg ? trunc(c.arg, BR_ARG_MAX) : '(no argument recorded)')}</code>
+        <span class="dim br-when">${esc(fmtAgo(c.ts))} · ${esc(trunc(c.title || 'a session', 40))}</span>
+      </div>`).join('')}${t.hit > t.rows.length ? `<div class="dim" style="padding:6px 2px">…and ${t.hit - t.rows.length} more</div>` : ''}</div>` : '';
+  return head + unsure + rows;
+}
+// Every reason this sample is smaller than "everything", said out loud — the same
+// contract the unsaved-work and secrets scans hold themselves to.
+function brScopeHTML() {
+  const d = brCalls || {};
+  if (d.error || !(d.calls || []).length) return '';
+  const older = (d.totalSessions || 0) - (d.scannedSessions || 0);
+  const bits = [
+    d.capped && older > 0 ? `${older} older session${older === 1 ? '' : 's'} weren’t read` : null,
+    d.budgetHit ? 'the scan stopped early once it had read enough' : null,
+  ].filter(Boolean);
+  return `<div class="dim">Sample: the ${d.calls.length} most recent tool calls this computer has on record, from ${d.sessionsInSample || 0} session${d.sessionsInSample === 1 ? '' : 's'}${d.newest ? `, ${esc(fmtAgo(d.oldest))} to ${esc(fmtAgo(d.newest))}` : ''}${bits.length ? ` — ${esc(bits.join('; '))}, so a rule may reach further than this shows` : ''}.</div>`;
+}
+// The pane. Rules already in the file are listed with their own tallies, so the
+// owner sees the blast radius of what they've ALREADY allowed, not just of the
+// pattern they're typing.
+function permsPaneHTML(content) {
+  let cfg;
+  try { cfg = JSON.parse(content); } catch { return '<div class="dim" style="padding:16px">This file isn’t valid JSON right now — fix it in Edit mode first.</div>'; }
+  const perms = (cfg && cfg.permissions) || {};
+  const calls = (brCalls && brCalls.calls) || [];
+  const listHTML = kind => {
+    const arr = Array.isArray(perms[kind]) ? perms[kind] : [];
+    if (!arr.length) return `<div class="dim">No <b>${kind}</b> rules in this file.</div>`;
+    return `<div class="br-chips">${arr.map(r => {
+      const t = calls.length ? permTally(r, calls) : null;
+      // a bare "0" would read as "covers nothing" when the honest answer is often
+      // "covers nothing I could judge", so unjudged calls get their own mark
+      const tally = t ? `<span class="br-count${t.hit ? ' br-count-hit' : ''}">${t.hit}${t.unsure ? ' +?' : ''}</span>` : '';
+      const why = t ? `${t.hit} of the sample covered${t.unsure ? `, ${t.unsure} more couldn’t be judged` : ''} — click to see them` : 'click to see which calls this covers';
+      return `<button class="br-chip" data-rule="${esc(r)}" data-effect="${esc(kind)}" title="${esc(String(r))}\n${esc(why)}"><code>${esc(trunc(String(r), 60))}</code>${tally}</button>`;
+    }).join('')}</div>`;
+  };
+  return `<div class="hooks-explain">
+    <div class="he-sec"><h4>Blast radius — what a permission rule would really have covered</h4>
+      <div class="uw-note">This is a <b>preview only, and an approximation.</b> Claude Code does its own permission matching, and that matcher changes as Claude Code changes — this one covers the common shapes (a whole tool, <code>Bash(prefix:*)</code>, file-path patterns, <code>domain:</code>, and MCP server names), reads each half of a chained command like <code>cd x &amp;&amp; git push</code> separately, and openly says "couldn’t judge" for the rest instead of guessing. Where it has to lean, it leans toward showing you <b>more</b> than the real rule would catch, never less. Treat the matches as examples to read, <b>not as a guarantee</b>.
+      <br><b>Nothing in this tab can change your settings.</b> It only reads. The one way this file is ever written is by hand in <b>Edit</b>, with the usual confirmation and audit entry.</div>
+      ${brScopeHTML()}
+    </div>
+    <div class="he-sec"><h4>Try a pattern</h4>
+      <div class="br-try">
+        <input id="brPattern" type="text" spellcheck="false" placeholder="e.g. Bash(git log:*)" value="${esc(brPattern)}">
+        <div class="seg" id="brEffectSeg">${['allow', 'ask', 'deny'].map(k => `<button data-e="${k}" class="${brEffect === k ? 'on' : ''}">${k}</button>`).join('')}</div>
+      </div>
+      <div id="brOut" class="br-out">${blastHTML()}</div>
+    </div>
+    <div class="he-sec"><h4>Rules already in this file</h4>
+      <div class="dim" style="margin-bottom:8px">The number on each is how many of the sample above that rule covers. Click one to see them.</div>
+      <div class="br-kind"><b>allow</b> ${listHTML('allow')}</div>
+      <div class="br-kind"><b>ask</b> ${listHTML('ask')}</div>
+      <div class="br-kind"><b>deny</b> ${listHTML('deny')}</div>
+    </div>
+  </div>`;
+}
+// Redraw only the result box, so typing never rebuilds (and scroll-jumps) the pane.
+function drawBlast() {
+  const out = $('brOut'); if (!out) return;
+  out.innerHTML = blastHTML();
+  out.querySelectorAll('.br-row[data-file]').forEach(el => el.onclick = () => openSession(el.dataset.file));
+}
+
 async function loadBrain() {
   try {
     const r = await (await fetch('/api/brain')).json();
@@ -2926,16 +3472,19 @@ function renderBrain() {
         const isJSON = /\.json$/i.test(brainCurrent.name) || /^\s*[{[]/.test(brainCurrent.content);
         const isMD = /\.md/i.test(brainCurrent.name);
         const isHooks = /settings\.json/i.test(brainCurrent.name) || /"hooks"\s*:/.test(brainCurrent.content);
+        // settings.local.json counts too — it carries permissions just the same
+        const isPerms = /settings[\w.]*\.json/i.test(brainCurrent.name) || /"permissions"\s*:/.test(brainCurrent.content);
         const viewable = isJSON || isMD;
         let bodyHtml;
-        if (brainMode === 'hooks' && isHooks) bodyHtml = `<div id="brainViewer">${renderHooksExplainer(brainCurrent.content)}</div>`;
+        if (brainMode === 'perms' && isPerms) bodyHtml = `<div id="brainViewer">${permsPaneHTML(brainCurrent.content)}</div>`;
+        else if (brainMode === 'hooks' && isHooks) bodyHtml = `<div id="brainViewer">${renderHooksExplainer(brainCurrent.content)}</div>`;
         else if (brainMode === 'view' && viewable) bodyHtml = `<div id="brainViewer" class="${isJSON ? 'bv-json' : 'bv-md'}">${isJSON ? `<pre class="hj">${highlightJSON(brainCurrent.content)}</pre>` : renderMD(brainCurrent.content)}</div>`;
         else bodyHtml = `<textarea id="brainEditor" spellcheck="false">${esc(brainCurrent.content)}</textarea>`;
         return `
         <div class="brain-bar">
           <b>${esc(brainCurrent.name)}</b>
           <span class="dim" style="font-size:10.5px">${esc(brainCurrent.path)}</span>
-          ${viewable ? `<div class="seg" id="brainModeSeg"><button data-m="view" class="${brainMode === 'view' ? 'on' : ''}">Read</button>${isHooks ? `<button data-m="hooks" class="${brainMode === 'hooks' ? 'on' : ''}">Hooks</button>` : ''}<button data-m="edit" class="${brainMode === 'edit' ? 'on' : ''}">Edit</button></div>` : ''}
+          ${viewable ? `<div class="seg" id="brainModeSeg"><button data-m="view" class="${brainMode === 'view' ? 'on' : ''}">Read</button>${isHooks ? `<button data-m="hooks" class="${brainMode === 'hooks' ? 'on' : ''}">Hooks</button>` : ''}${isPerms ? `<button data-m="perms" class="${brainMode === 'perms' ? 'on' : ''}">Permissions</button>` : ''}<button data-m="edit" class="${brainMode === 'edit' ? 'on' : ''}">Edit</button></div>` : ''}
           <button id="brainHist" class="mini-btn" title="version history">⟲ History</button>
           <button id="brainSave" class="mini-btn" ${brainDirty ? '' : 'disabled'}>${brainDirty ? '💾 Save' : 'Saved'}</button>
         </div>
@@ -2948,7 +3497,7 @@ function renderBrain() {
     if (brainDirty && !confirm('Discard unsaved changes?')) return;
     const r = await (await fetch('/api/brain/file?id=' + el.dataset.id)).json();
     if (r.error) return alert(r.error);
-    brainCurrent = r; brainDirty = false; brainMode = 'view'; renderBrain();
+    brainCurrent = r; brainDisk = r.content; brainDirty = false; brainMode = 'view'; renderBrain();
   });
   $('brain').querySelector('#brainModeSeg')?.querySelectorAll('button').forEach(b => b.onclick = () => {
     // hooks mode keeps staged edits (toggles live there); switching to Read discards raw-text edits
@@ -2958,6 +3507,16 @@ function renderBrain() {
   });
   $('brain').querySelectorAll('.he-toggle input').forEach(t => t.onchange = () => toggleHook(t.dataset.ev, Number(t.dataset.idx), t.dataset.on === 'true'));
   $('brain').querySelectorAll('.hook-starter').forEach(b => b.onclick = () => addStarterHook(Number(b.dataset.i)));
+  // ---- blast radius: read-only. Typing redraws only its own result box, so the
+  // pane never scroll-jumps mid-sentence; nothing here can stage or save a change.
+  if (brainMode === 'perms') {
+    if (!brCalls) loadToolCalls().then(() => { if (brainMode === 'perms') renderBrain(); });
+    const pi = $('brPattern');
+    if (pi) { let brT = null; pi.oninput = () => { brPattern = pi.value; clearTimeout(brT); brT = setTimeout(drawBlast, 250); }; }
+    $('brEffectSeg')?.querySelectorAll('button').forEach(b => b.onclick = () => { brEffect = b.dataset.e; renderBrain(); });
+    $('brain').querySelectorAll('.br-chip').forEach(b => b.onclick = () => { brPattern = b.dataset.rule; brEffect = b.dataset.effect; renderBrain(); });
+    drawBlast();
+  }
   const hb = $('brainHist');
   if (hb) hb.onclick = async () => {
     const panel = $('brainHistPanel');
@@ -2974,15 +3533,21 @@ function renderBrain() {
       const r = await fetch('/api/brain/file', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ id: brainCurrent.id, content: snap.content, baseMtime: brainCurrent.mtime }) });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) return alert(j.error || 'restore failed');
-      brainCurrent.content = snap.content; brainCurrent.mtime = j.mtime; brainDirty = false; brainMode = 'view'; renderBrain();
+      brainCurrent.content = snap.content; brainDisk = snap.content; brainCurrent.mtime = j.mtime; brainDirty = false; brainMode = 'view'; renderBrain();
     });
   };
   const ed = $('brainEditor');
-  if (ed) {
-    ed.oninput = () => { if (!brainDirty) { brainDirty = true; const b = $('brainSave'); b.disabled = false; b.textContent = '💾 Save'; } };
-    $('brainSave').onclick = async () => {
+  if (ed) ed.oninput = () => { if (!brainDirty) { brainDirty = true; const b = $('brainSave'); b.disabled = false; b.textContent = '💾 Save'; } };
+  // PRE-EXISTING BUG: this was wired only inside `if (ed)`, so in hooks mode — where
+  // there is no textarea — toggling a hook staged a change and lit up an enabled
+  // "Save" button that did nothing at all. Silently discarding a hook edit the owner
+  // believes they saved is the worst possible failure for this particular file.
+  const saveBtn = $('brainSave');
+  if (saveBtn) {
+    saveBtn.onclick = async () => {
       // diff + confirm before writing; loudest warning for hooks/settings (they execute)
-      const before = brainCurrent.content, after = ed.value;
+      const before = brainDisk != null ? brainDisk : brainCurrent.content;
+      const after = ed ? ed.value : brainCurrent.content;
       if (before === after) return;
       const isHooks = /settings/i.test(brainCurrent.name);
       const diff = miniDiff(before, after);
@@ -2993,7 +3558,7 @@ function renderBrain() {
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) return alert(j.error || 'save failed');
-      brainCurrent.content = after; brainCurrent.mtime = j.mtime; brainDirty = false;
+      brainCurrent.content = after; brainDisk = after; brainCurrent.mtime = j.mtime; brainDirty = false;
       const b = $('brainSave'); b.disabled = true; b.textContent = '✓ Saved (audited)';
     };
   }
@@ -3341,8 +3906,576 @@ function renderFailbar() {
   if (OVERVIEW.includes(state.view) || !state.data.events.length || !sessionFailed()) { bar.style.display = 'none'; return; }
   const diag = diagnoseFailure(state.data);
   if (!diag) { bar.style.display = 'none'; return; }
-  bar.innerHTML = `💥 ${esc(failureSentence(diag))}`;
+  bar.innerHTML = `<span>💥 ${esc(failureSentence(diag))}</span><button class="mini-btn" id="failCompareBtn" style="margin-left:10px">🪜 compare with last successful run</button>`;
   bar.style.display = '';
+  const cmp = $('failCompareBtn');
+  if (cmp) cmp.onclick = () => openDivergenceFor(state.file);
+}
+
+// ---------- DIVERGENCE LADDER ----------
+// WHY: "it broke" isn't enough — the useful question is WHERE it stopped matching
+// the run that worked. Candidates are found automatically by matching the VERBATIM
+// subagent task text recorded at spawn (agent.task, set in server.js normalize()) —
+// that's the one string a script/playbook re-issues identically every time it
+// delegates the same piece of work, so two runs of "the same job" line up without
+// any manual curation. Reuses flowsCache, the same fleet-wide (cross-machine, relay
+// included) cache Playbook Studio already builds — no new fetch, no new cache.
+// Individual per-run facts only (this run succeeded, that one failed) — never an
+// aggregate rate, so the data-discipline minimum-sample rule doesn't apply here.
+const DL_STEP_CAP = 300; // hard cap so one runaway session can't blow up the O(n·m) alignment
+// Which subagent in a broken session to blame: prefer one diagnoseFailure-style
+// evidence actually points at (errored/stalled), and only among agents that carry
+// a verbatim spawn task — that's the only string safe to match against another run.
+function divergenceCulprit(sessionData) {
+  const withTask = (sessionData.agents || []).filter(a => a.id !== 'main' && a.task);
+  if (!withTask.length) return null;
+  return withTask.find(a => agentOutcome(a) === 'failed')
+    || withTask.find(a => agentOutcome(a) === 'stalled')
+    || (withTask.length === 1 ? withTask[0] : null);
+}
+// A subagent's ordered (toolName, key-argument) trace. diagSig/diagTarget already
+// exist above (Playbook Studio's failure diagnosis) — sig for exact-match equality,
+// label for what gets printed.
+function stepsOfAgent(sessionData, agentId) {
+  return (sessionData.events || [])
+    .filter(e => e.agent === agentId && (e.kind === 'tool-call' || e.kind === 'spawn') && e.tool)
+    .map(e => ({ tool: e.tool, sig: diagSig(e), label: diagTarget(e) }));
+}
+const stepEq = (x, y) => !!x && !!y && x.sig === y.sig;
+// ---------- Needleman-Wunsch: global alignment of two step sequences ----------
+// Plain O(n·m) DP, no library. +2 for a matching step, -1 for a mismatch or a gap
+// (an insertion/deletion in one run that the other doesn't have). Returns the
+// aligned pairs in order — {a,b} indices into each step list, either one null
+// where a run has a step the other doesn't — so a run that diverged by ADDING or
+// SKIPPING a step still lines back up afterward instead of shifting everything.
+function nwAlign(a, b, eq) {
+  const n = a.length, m = b.length;
+  const MATCH = 2, MISMATCH = -1, GAP = -1;
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = 1; i <= n; i++) dp[i][0] = dp[i - 1][0] + GAP;
+  for (let j = 1; j <= m; j++) dp[0][j] = dp[0][j - 1] + GAP;
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      const sub = dp[i - 1][j - 1] + (eq(a[i - 1], b[j - 1]) ? MATCH : MISMATCH);
+      dp[i][j] = Math.max(sub, dp[i - 1][j] + GAP, dp[i][j - 1] + GAP);
+    }
+  }
+  const out = [];
+  let i = n, j = m;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && dp[i][j] === dp[i - 1][j - 1] + (eq(a[i - 1], b[j - 1]) ? MATCH : MISMATCH)) {
+      out.push({ a: i - 1, b: j - 1 }); i--; j--;
+    } else if (i > 0 && dp[i][j] === dp[i - 1][j] + GAP) {
+      out.push({ a: i - 1, b: null }); i--;
+    } else {
+      out.push({ a: null, b: j - 1 }); j--;
+    }
+  }
+  return out.reverse();
+}
+// Best candidate: same verbatim task string, a DIFFERENT session, and that
+// subagent actually finished clean. Most recent such match wins ("yesterday's
+// working run"). flowsCache already spans every machine that's relayed in, so
+// this isn't scoped to sessions on this computer.
+// Match on the VERBATIM spawn prompt, never on `task` — `task` is the Task tool's
+// 3-6 word description ("review auth", "fix tests"), which dozens of unrelated runs
+// share, so matching on it compared entirely different jobs as "the same work".
+// A prompt too short to be distinctive is refused outright rather than guessed at.
+const DIV_MIN_PROMPT = 60;
+function divMatchKey(a) {
+  const p = String((a && a.spawnPrompt) || '').trim().replace(/\s+/g, ' ');
+  return p.length >= DIV_MIN_PROMPT ? p : null;
+}
+async function findDivergenceCandidate(file, culprit) {
+  if (!flowsCache) await loadFlows.fetchOnly();
+  const key = divMatchKey(culprit);
+  if (!key) return { tooVague: true };
+  let best = null;
+  for (const { s, d } of (flowsCache || [])) {
+    if (s.file === file) continue;
+    for (const a of d.agents) {
+      if (a.id === 'main' || divMatchKey(a) !== key || agentOutcome(a) !== 'succeeded') continue;
+      if (!best || (s.mtime || 0) > (best.s.mtime || 0)) best = { s, d, a };
+    }
+  }
+  return best;
+}
+let divState = { sourceFile: null, status: null };
+function openDivergenceFor(file) {
+  if (!file) return;
+  divState = { sourceFile: file, status: 'pending' };
+  state.view = 'divergence';
+  setTabs();
+}
+async function resolveDivergence(file) {
+  let s = (fleetCache || []).find(x => x.file === file) || (sessionsCache || []).find(x => x.file === file) || { file, title: file };
+  let d;
+  try { d = await (await fetch('/api/session?file=' + encodeURIComponent(file))).json(); } catch { d = null; }
+  if (!d || d.error) { divState = { sourceFile: file, status: 'done:' + file, sourceTitle: s.title || file, error: 'Could not re-read that session just now — try again from the session view.' }; return; }
+  const culprit = divergenceCulprit(d);
+  if (!culprit) {
+    divState = { sourceFile: file, status: 'done:' + file, sourceTitle: s.title || file, error: 'This session\'s trouble isn\'t tied to one subagent with a recorded task string, so there\'s nothing to safely match it against — never comparing unrelated runs.' };
+    return;
+  }
+  const cand = await findDivergenceCandidate(file, culprit);
+  if (cand && cand.tooVague) {
+    divState = { sourceFile: file, status: 'done:' + file, sourceTitle: s.title || file, culpritTask: culprit.task, error: `This agent's recorded instruction is too short to identify the same job in another run, so comparing could put two unrelated runs side by side. Nothing is shown rather than something misleading.` };
+    return;
+  }
+  if (!cand) {
+    divState = { sourceFile: file, status: 'done:' + file, sourceTitle: s.title || file, culpritTask: culprit.task, error: `No other run across your ${(flowsCache || []).length} most recent sessions was given this same instruction and finished clean — nothing to compare yet.` };
+    return;
+  }
+  const aSteps = stepsOfAgent(d, culprit.id).slice(0, DL_STEP_CAP);
+  const bSteps = stepsOfAgent(cand.d, cand.a.id).slice(0, DL_STEP_CAP);
+  const align = nwAlign(aSteps, bSteps, stepEq);
+  let firstDiv = -1;
+  for (let i = 0; i < align.length; i++) {
+    const p = align[i];
+    const same = p.a != null && p.b != null && stepEq(aSteps[p.a], bSteps[p.b]);
+    if (!same) { firstDiv = i; break; }
+  }
+  divState = {
+    sourceFile: file, status: 'done:' + file, error: null,
+    a: { file, title: s.title || file, agent: culprit, steps: aSteps },
+    b: { file: cand.s.file, title: cand.s.title || cand.s.file, agent: cand.a, steps: bSteps, mtime: cand.s.mtime, machine: cand.s.machine },
+    align, firstDiv,
+  };
+}
+async function loadDivergence() {
+  const pane = $('divergence');
+  if (!pane) return;
+  if (divState.sourceFile && divState.status !== 'done:' + divState.sourceFile) {
+    pane.innerHTML = '<div class="fleet-loading">Looking through the fleet for a run that matches this one…</div>';
+    await resolveDivergence(divState.sourceFile);
+  }
+  renderDivergence();
+}
+function renderDivergence() {
+  const pane = $('divergence');
+  if (!pane) return;
+  const head = `<div class="fleet-head"><h2>Divergence Ladder</h2><span class="dim">Put a broken run next to the last one that worked, and see the exact step they stopped agreeing on.</span>${homeButton('divergence')}</div>`;
+  if (!divState.sourceFile) {
+    pane.innerHTML = head + '<div class="uw-empty">Open a failed or stalled session — the warning bar at the top of it gets a "🪜 compare with last successful run" button. Click that; this page fills in.</div>';
+    return;
+  }
+  if (divState.error) {
+    pane.innerHTML = head + `<div class="fleet-head" style="margin-top:0"><span class="dim">Session: ${esc(divState.sourceTitle || divState.sourceFile)}</span></div><div class="uw-empty">${esc(divState.error)}</div>`;
+    return;
+  }
+  const { a, b, align, firstDiv } = divState;
+  const capNote = (a.steps.length >= DL_STEP_CAP || b.steps.length >= DL_STEP_CAP) ? ' Only the first ' + DL_STEP_CAP + ' tool calls of each run were compared.' : '';
+  const rows = align.map((p, i) => {
+    const av = p.a != null ? a.steps[p.a] : null;
+    const bv = p.b != null ? b.steps[p.b] : null;
+    const same = av && bv && stepEq(av, bv);
+    const rowCls = i === firstDiv ? 'dl-first-div' : same ? '' : 'dl-diff';
+    const cell = st => st ? `<b>${esc(st.tool)}</b> <span class="dim">${esc(st.label)}</span>` : '<span class="dim">— (no matching step here)</span>';
+    return `<tr class="${rowCls}"><td class="dl-n">${i + 1}</td><td>${cell(av)}</td><td>${cell(bv)}</td></tr>`
+      + (i === firstDiv ? '<tr class="dl-flag-row"><td></td><td colspan="2">⬆ first step where these two runs stopped agreeing</td></tr>' : '');
+  }).join('');
+  pane.innerHTML = head +
+    `<div class="dl-cols">
+      <div class="dl-col-head dl-bad" data-file="${esc(a.file)}" title="open this session"><b>💥 ${esc(a.title)}</b><span class="dim">${esc(a.agent.name || 'subagent')} · this run</span></div>
+      <div class="dl-col-head dl-good" data-file="${esc(b.file)}" title="open this session"><b>✅ ${esc(b.title)}</b><span class="dim">${esc(b.agent.name || 'subagent')} · ${esc(b.machine || 'local')} · ${fmtAgo(b.mtime)}</span></div>
+    </div>
+    <div class="table-wrap"><table class="ftable dl-table"><thead><tr><th></th><th>Broken run</th><th>Last successful run</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="uw-note">Matched on the identical subagent task both runs were spawned with — “${esc(trunc(a.agent.task, 160))}”. That's what makes this comparison safe without curating a dataset by hand.${capNote}${firstDiv < 0 ? ' These two traces never actually diverged in tool-call sequence — whatever went wrong happened after the compared steps, or outside this subagent.' : ''}</div>`;
+  wireHomeButton(pane, 'divergence', renderDivergence);
+  pane.querySelectorAll('[data-file]').forEach(el => el.onclick = () => openSession(el.dataset.file));
+}
+
+// ---------- DEJA VU FINDER ----------
+// WHY: plain history search over your own prompts isn't novel — Ctrl+F does that.
+// What earns this a place is REACH — the corpus is every subagent delegation task
+// string relayed into this dashboard from ANY machine, including ones offline right
+// now — and every hit is labelled with its real OUTCOME, not just that it was said
+// before. Index is a small hand-rolled TF-IDF built client-side over flowsCache
+// (already the same fleet-wide, ~60-session cache Playbook Studio builds), cached
+// until the fleet is refreshed — cheap on purpose, nothing server-side to maintain.
+// END STATE decides the outcome, not "did anything ever go wrong on the way".
+// Counting any single recovered tool error as 'failed' branded roughly a fifth of
+// completed runs as failures — agents hit errors and recover constantly, and that
+// is normal work, not a bad run. Recovered errors surface as a neutral note instead.
+function agentOutcome(a) {
+  if (a.pendingTool && a.pendingTool.since) return 'stalled';
+  if (a.lastErrored || a.retrying) return 'failed';
+  if (a.done) return 'succeeded';
+  return 'unclear';
+}
+function agentRecoveredNote(a) {
+  const n = a.errors || 0;
+  return (n > 0 && agentOutcome(a) === 'succeeded') ? `${n} tool error${n === 1 ? '' : 's'}, recovered` : '';
+}
+const DEJA_OUTCOME = {
+  succeeded: { icon: '✅', color: 'var(--green)', label: 'succeeded' },
+  failed:    { icon: '💥', color: 'var(--red)',   label: 'failed' },
+  stalled:   { icon: '⏳', color: 'var(--amber)', label: 'stalled' },
+  unclear:   { icon: '❔', color: 'var(--dim)',   label: 'outcome unclear' },
+};
+const DEJA_STOP = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'on', 'for', 'with', 'is', 'are', 'this', 'that', 'it', 'as', 'be', 'at', 'by', 'from', 'into', 'then', 'than', 'not', 'no']);
+function tokenize(s) {
+  const m = String(s || '').toLowerCase().match(/[a-z0-9][a-z0-9_.]{1,}/g);
+  return m ? m.filter(t => !DEJA_STOP.has(t)) : [];
+}
+let dejaIndex = null; // { docs:[{s,a,tokens,tf,outcome}], df:Map, N }
+function buildDejaIndex() {
+  const docs = [], df = new Map();
+  for (const { s, d } of (flowsCache || [])) {
+    for (const a of d.agents) {
+      if (a.id === 'main' || !a.task) continue;
+      const tokens = tokenize(a.task);
+      if (!tokens.length) continue;
+      const tf = new Map();
+      for (const t of tokens) tf.set(t, (tf.get(t) || 0) + 1);
+      for (const t of tf.keys()) df.set(t, (df.get(t) || 0) + 1);
+      docs.push({ s, a, tokens, tf, outcome: agentOutcome(a) });
+    }
+  }
+  dejaIndex = { docs, df, N: docs.length };
+}
+// score = sum of tf·idf over query terms present in the doc, damped by sqrt(doc
+// length) so a long task string doesn't win purely by having more words to match.
+function dejaSearch(query, top) {
+  if (!dejaIndex || !dejaIndex.N) return [];
+  const qTerms = [...new Set(tokenize(query))];
+  if (!qTerms.length) return [];
+  const { docs, df, N } = dejaIndex;
+  const idf = t => Math.log((N + 1) / ((df.get(t) || 0) + 1)) + 1; // smoothed, always > 0
+  const scored = [];
+  for (const doc of docs) {
+    let score = 0;
+    for (const t of qTerms) { const c = doc.tf.get(t); if (c) score += c * idf(t); }
+    if (score > 0) scored.push({ doc, score: score / Math.sqrt(doc.tokens.length) });
+  }
+  scored.sort((x, y) => y.score - x.score);
+  return scored.slice(0, top).map(x => x.doc);
+}
+let dejaQuery = '';
+async function loadDejaVu() {
+  // A failed fetch used to leave the spinner up forever with an unhandled rejection
+  // behind it — a pane that never resolves looks identical to one still working.
+  try {
+    if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+    if (!flowsCache) { $('dejavu').innerHTML = '<div class="fleet-loading">Indexing delegated tasks across your fleet…</div>'; await loadFlows.fetchOnly(); }
+    buildDejaIndex();
+    renderDejaVu();
+  } catch (e) {
+    $('dejavu').innerHTML = `<div class="fleet-head"><h2>Déjà Vu</h2></div><div class="uw-note">Couldn’t read your session history just now, so there is nothing to search. ${esc(String(e && e.message || ''))}</div>`;
+  }
+}
+function renderDejaVu() {
+  const pane = $('dejavu');
+  if (!pane) return;
+  if (!pane.querySelector('#dejaBox')) {
+    // shell built once — the box only re-renders the results div below it, so
+    // typing never loses focus or cursor position (same pattern as spickerSearch)
+    pane.innerHTML =
+      `<div class="fleet-head"><h2>Deja Vu Finder</h2><button class="mini-btn" id="dejaRefresh">↻ refresh index</button>${homeButton('dejavu')}</div>
+       <div class="uw-note">Honestly, this part isn't clever — it's history search. What's useful is <b>reach</b>: <span id="dejaCount">${dejaIndex ? dejaIndex.N : 0}</span> delegated tasks indexed from every machine that has ever relayed into this dashboard, offline ones included, and every match is labelled with what actually happened — not just that it was asked before.</div>
+       <input id="dejaBox" type="text" class="deja-box" placeholder="type what you're about to ask an agent to do…">
+       <div id="dejaResults" class="deja-results"></div>`;
+    wireHomeButton(pane, 'dejavu', renderDejaVu);
+    const box = $('dejaBox');
+    box.value = dejaQuery;
+    box.oninput = () => { dejaQuery = box.value; renderDejaResults(); };
+    $('dejaRefresh').onclick = () => { flowsCache = null; pane.innerHTML = ''; loadDejaVu(); };
+  }
+  const cnt = $('dejaCount'); if (cnt) cnt.textContent = dejaIndex ? dejaIndex.N : 0;
+  renderDejaResults();
+}
+function renderDejaResults() {
+  const el = $('dejaResults');
+  if (!el) return;
+  const q = dejaQuery.trim();
+  const results = q ? dejaSearch(q, 5) : [];
+  el.innerHTML = !q
+    ? '<div class="uw-empty">Start typing — top 5 closest matches from tasks you\'ve delegated before, wherever they ran.</div>'
+    : !results.length
+      ? '<div class="uw-empty">No close match in the indexed history. This looks new.</div>'
+      : results.map(doc => {
+          const { s, a, outcome } = doc;
+          const b = DEJA_OUTCOME[outcome] || DEJA_OUTCOME.unclear;
+          return `<div class="deja-row" data-file="${esc(s.file)}" title="open this session">
+            <span class="deja-badge" style="color:${b.color}" title="${b.label}">${b.icon}</span>
+            <div class="deja-main">
+              <div class="deja-task">${esc(a.task)}</div>
+              <div class="dim">${esc(a.name || 'subagent')} in "${esc(s.title || s.session || '')}" · ${esc(s.machine || 'local')} · ${fmtAgo(s.mtime)} · ${fmtUsd(a.cost || 0)} · <span style="color:${b.color}">${b.label}</span></div>
+            </div>
+          </div>`;
+        }).join('');
+  el.querySelectorAll('.deja-row').forEach(row => row.onclick = () => openSession(row.dataset.file));
+}
+
+// ---------- HOOK PROPOSALS (the honest version of enforcement) ----------
+// WHY: a standing order is words in a guidance file — an agent reads it and may or
+// may not comply. A hook is the version the machine itself runs. So this panel
+// proposes hooks, but only where this fleet's own numbers justify one, and it prints
+// the number beside the proposal so the reasoning can be checked instead of trusted.
+// It also prints the ones it REFUSED to propose and why, because a panel that only
+// ever agrees with itself is an advertisement.
+// DISPLAY AND COPY ONLY, PERMANENTLY. There is no install button here and there
+// never will be. A guidance file holds words an agent reads; a settings file holds
+// commands the machine RUNS, so a dashboard that could plant one remotely or in bulk
+// would be remote code execution with a friendly face. The owner opens the file in
+// the Brain tab, reads the line, and saves it themselves.
+// A HOOK NOBODY CAN OVERRIDE GETS SWITCHED OFF FOREVER, so every blocking hook here
+// carries a written escape hatch, and the escape hatch is part of the proposal.
+const HP_MIN_JS_SESSIONS = 5;   // sessions that edited JavaScript before any share is quoted
+const HP_MIN_UNDOS = 3;         // undo moments before "ask first" is a pattern and not one bad afternoon
+const HP_MIN_NOMODEL = 10;      // spawns with no model recorded before a guard is worth blocking on
+const HP_NOMODEL_SHARE = 0.02;  // ...and it has to be at least this much of the fleet, not a rounding error
+const HP_MIN_FLEET_COST = 5;    // never quote a spend percentage off trivial money
+const HP_MIN_LEAKS = 2;         // a BLOCKING hook needs more than one finding, which may be a fixture
+const HP_WRITE = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const HP_JS = /\.(?:js|mjs|cjs)(?:["'\s]|$)/i;
+// What a machine says when JavaScript doesn't parse. Only ever matched against a
+// TOOL RESULT — the assistant merely saying the words "syntax error" proves nothing.
+const HP_SYNTAX = /SyntaxError|Unexpected token|Unexpected identifier|Unexpected end of input|Invalid or unexpected token/;
+
+// The commands themselves. Node is the interpreter on purpose: this dashboard
+// already requires it, it is the same on Windows and everywhere else, and the whole
+// check is visible in the one line the owner pastes — nothing to install, nothing
+// hidden in a script file somewhere. All three were run for real against sample
+// payloads under both bash and cmd.exe before being offered.
+// HP_CMD_UNDO mirrors the Graveyard's four commands and HP_CMD_SECRET mirrors
+// LEAK_RULES in server.js. Both are deliberately SHORTER than the originals — a
+// hook has to fit on one line, and neither reads quoting as carefully as the scan
+// does. Each errs toward stopping too often rather than too rarely, which is the
+// cheap mistake when there is an escape hatch one comment away.
+const HP_CMD_JS = "node -e \"let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let f='';try{f=(JSON.parse(s).tool_input||{}).file_path||''}catch(e){}if(!/\\.(js|mjs|cjs)$/i.test(f))process.exit(0);try{require('child_process').execFileSync(process.execPath,['--check',f],{stdio:'pipe'})}catch(e){console.error('That file does not parse as JavaScript right now: '+String(e.stderr||e.message));process.exit(2)}})\"";
+const HP_CMD_UNDO = "node -e \"let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let c='';try{c=(JSON.parse(s).tool_input||{}).command||''}catch(e){}if(c.indexOf('amc-ok')>=0)process.exit(0);const hit=c.split(/[;\\n]|&&|\\|\\|/).map(x=>x.trim()).find(x=>/^git\\s/.test(x)&&(/\\breset\\b.*--hard\\b/.test(x)||(/\\brevert\\b/.test(x)&&!/--(abort|continue|quit|skip)\\b/.test(x))||/\\bcheckout\\b.*\\s--(\\s|$)/.test(x)||(/\\brestore\\b/.test(x)&&!/--staged/.test(x))));if(!hit)process.exit(0);console.error('Stopped: that throws work away - '+hit+'. Check the Graveyard tab for what was thrown away here before. If you still mean it, add  # amc-ok  to the command.');process.exit(2)})\"";
+const HP_CMD_SECRET = "node -e \"let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let i={};try{i=JSON.parse(s).tool_input||{}}catch(e){}const t=[i.content,i.new_string].filter(x=>typeof x==='string').join('\\n');if(!t||t.indexOf('amc-ok')>=0)process.exit(0);const R=[[/\\b(?:AKIA|ASIA)[A-Z0-9]{16}\\b/,'an Amazon Web Services key'],[/\\bgh[pousr]_[A-Za-z0-9]{36}\\b/,'a GitHub token'],[/\\bxox[baprs]-[A-Za-z0-9]{10,48}-[A-Za-z0-9]{10,48}/,'a Slack token'],[/\\b[sr]k_live_[A-Za-z0-9]{24,64}\\b/,'a Stripe live payment key'],[/\\bAIza[A-Za-z0-9_-]{35}\\b/,'a Google API key'],[/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,'a private key']];for(const r of R)if(r[0].test(t)){console.error('Stopped: this write contains something shaped like '+r[1]+'. Put it in an environment variable and reference that instead. If it is a fake one for a doc or a test, add  amc-ok  on the same line.');process.exit(2)}})\"";
+
+function hpHookJSON(event, matcher, command) {
+  return JSON.stringify({ hooks: { [event]: [{ matcher, hooks: [{ type: 'command', command }] }] } }, null, 2);
+}
+// Where the settings file actually is on THIS computer, taken from the Brain tab's
+// own list rather than guessed at from a home-directory pattern.
+let hpSettings = null;
+let hpProps = null;
+async function loadHookProps() {
+  const pane = $('hookprops');
+  pane.innerHTML = '<div class="fleet-loading">Checking which hooks your own numbers would actually justify…</div>';
+  try {
+    if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+    if (!flowsCache) await loadFlows.fetchOnly();
+  } catch (e) {
+    pane.innerHTML = `<div class="fleet-head"><h2>Suggested hooks</h2></div><div class="uw-note">Couldn’t read your fleet history just now, so there is no evidence to base a suggestion on — and a hook suggested without evidence is exactly what this panel refuses to do. ${esc(String(e && e.message || ''))}</div>`;
+    return;
+  }
+  if (!leaksData) { try { leaksData = await (await fetch('/api/leaks')).json(); } catch { leaksData = null; } }
+  if (!graveData) { try { graveData = await (await fetch('/api/graveyard')).json(); } catch { graveData = null; } }
+  if (!brainItems.length) { try { brainItems = (await (await fetch('/api/brain')).json()).items || []; } catch { brainItems = []; } }
+  hpSettings = brainItems.find(i => /settings\.json/i.test(i.name) && /hooks/i.test(i.category || '')) || brainItems.find(i => /settings\.json/i.test(i.name)) || null;
+  renderHookProps();
+}
+
+// Build every candidate from real numbers, and sort each one into "proposed" or
+// "not proposed" by its own gate. A candidate that fails its gate still appears —
+// with the number that failed it — because that is the interesting half.
+function hookProposals() {
+  const props = [], refused = [];
+  const flows = flowsCache || [];
+  const fleet = fleetCache || [];
+
+  // 1. JavaScript that stopped parsing after an edit -------------------------
+  const jsSessions = [];
+  for (const { s, d } of flows) {
+    const ev = d.events || [];
+    let first = -1;
+    for (let i = 0; i < ev.length; i++) {
+      const e = ev[i];
+      if (e.kind === 'tool-call' && HP_WRITE.has(e.tool) && HP_JS.test(String(e.full || e.text || '') + ' ')) { first = i; break; }
+    }
+    if (first < 0) continue;
+    // only AFTER the first JavaScript edit — a syntax error before one was never
+    // this hook's to catch
+    // ...and the error must actually be about a JavaScript file. A Python or JSON
+    // parse error is real, but it is not evidence that a JAVASCRIPT parse hook
+    // would have caught anything — that inflates the case for the hook being sold.
+    const n = ev.slice(first).filter(e => {
+      if (e.kind !== 'tool-result') return false;
+      const t = String(e.full || e.text || '');
+      return HP_SYNTAX.test(t) && HP_JS.test(t + ' ');
+    }).length;
+    jsSessions.push({ s, n });
+  }
+  const jsBad = jsSessions.filter(x => x.n > 0);
+  const jsHits = jsBad.reduce((n, x) => n + x.n, 0);
+  if (jsSessions.length >= HP_MIN_JS_SESSIONS && jsBad.length) {
+    props.push({
+      id: 'js-check', event: 'PostToolUse', matcher: 'Edit|Write|MultiEdit', blocking: false,
+      title: 'Check a JavaScript file still parses, the moment it’s edited',
+      why: `<b>${jsBad.length} of the ${jsSessions.length}</b> recent sessions that edited a JavaScript file hit a JavaScript syntax error afterwards — <b>${jsHits}</b> ${jsHits === 1 ? 'time' : 'times'} in all, counted only from what a tool actually reported, never from an agent saying so.`,
+      caught: jsBad.sort((a, b) => b.n - a.n).map(x => ({ file: x.s.file, label: `${trunc(x.s.title || x.s.session || '', 38)} · ${x.n}×` })),
+      caughtLabel: 'Sessions it would have spoken up in',
+      plain: [
+        'Runs after every file edit, and does nothing at all unless the file ends in .js, .mjs or .cjs.',
+        'Asks Node the same question you would: does this file still parse?',
+        'If it doesn’t, the agent is told immediately — instead of finding out three steps later.',
+      ],
+      escape: 'None needed: this runs AFTER the edit is already saved, so it can never block your work. The worst it can do is tell the agent something is broken.',
+      command: HP_CMD_JS,
+    });
+  } else {
+    refused.push({
+      title: 'Check a JavaScript file still parses after it’s edited',
+      why: jsSessions.length < HP_MIN_JS_SESSIONS
+        ? `Only ${jsSessions.length} of the sessions read edited a JavaScript file — not enough runs to say yet (this one needs ${HP_MIN_JS_SESSIONS}).`
+        : `${jsSessions.length} sessions edited JavaScript and none of them hit a syntax error afterwards. Nothing here to catch.`,
+    });
+  }
+
+  // 2. Ask before throwing work away ----------------------------------------
+  const gy = graveData || {};
+  const undos = (gy.moments || []).length;
+  if (undos >= HP_MIN_UNDOS) {
+    props.push({
+      id: 'undo-guard', event: 'PreToolUse', matcher: 'Bash', blocking: true,
+      title: 'Say something before an agent throws work away',
+      why: `<b>${undos}</b> ${undos === 1 ? 'time' : 'times'} in the transcripts stored on this computer, an agent ran one of the four commands that discard work, across ${gy.repos || 1} project folder${(gy.repos || 1) === 1 ? '' : 's'}. Every one of them is listed in the Graveyard, with the moment it happened.`,
+      caught: (gy.moments || []).map(m => ({ file: m.file, seq: m.seq, label: `${graveDate(m.ts)} · ${trunc(m.command, 44)}` })),
+      caughtLabel: 'The commands it would have stopped',
+      plain: [
+        'Runs before a shell command, and ignores everything that isn’t one of those four git commands.',
+        'When it sees one, the command doesn’t run: the agent is told what it was about to throw away and pointed at the Graveyard.',
+        'It is deliberately a little trigger-happy — it doesn’t read quotes as carefully as the Graveyard does, so it may stop a command that merely mentions one of those. Stopping and asking is the cheap mistake here.',
+      ],
+      escape: 'Add  # amc-ok  anywhere in the command and it runs untouched. That is the whole point: a rule nobody can get past once is a rule that gets switched off for good.',
+      note: 'None of those ' + undos + ' moments was necessarily wrong — throwing an edit away is often exactly right. This hook does not forbid it, it makes it deliberate.',
+      command: HP_CMD_UNDO,
+    });
+  } else {
+    refused.push({
+      title: 'Say something before an agent throws work away',
+      why: gy.error ? 'The Graveyard scan could not run just now, so there is no evidence either way.'
+        : `Only ${undos} moment${undos === 1 ? '' : 's'} like that in everything this computer can read — below the ${HP_MIN_UNDOS} it would take to call it a habit rather than one afternoon.`,
+    });
+  }
+
+  // 3. Stop a key being written into a file ---------------------------------
+  const lk = leaksData || {};
+  const finds = (lk.findings || []).length;
+  // Every sibling proposal has a minimum before it is offered; this one had none,
+  // so a single finding — quite possibly a test fixture — could talk you into a
+  // BLOCKING hook. The one that stops your work needs the most evidence, not the least.
+  if (finds >= HP_MIN_LEAKS) {
+    props.push({
+      id: 'secret-guard', event: 'PreToolUse', matcher: 'Edit|Write|MultiEdit', blocking: true,
+      title: 'Stop something key-shaped from being written into a file',
+      why: `The key scanner found <b>${finds}</b> thing${finds === 1 ? '' : 's'} worth a look in the ${lk.filesRead || 0} files your recent agents wrote — see the Secrets tab. This is the same short list of shapes, checked before the write instead of after.`,
+      caught: (lk.findings || []).map(f => ({ file: f.sessionFile, label: `${f.kind} · ${f.path.split(/[\\/]/).pop()}` })),
+      caughtLabel: 'What it would have stopped',
+      plain: [
+        'Runs before a file is written or edited, and looks only at the text being written.',
+        'Recognises the same handful of key shapes the Secrets tab does — the ones whose vendor prefix is unmistakable. It will miss anything subtler, on purpose.',
+        'If it matches, the write does not happen and the agent is told to use an environment variable instead.',
+      ],
+      escape: 'Put  amc-ok  on the same line and the write goes through — documentation and test fixtures are full of correctly-shaped fakes.',
+      command: HP_CMD_SECRET,
+    });
+  } else {
+    refused.push({
+      title: 'Stop something key-shaped from being written into a file',
+      why: finds
+        ? `Only ${finds} finding across the ${lk.filesRead || 0} file${lk.filesRead === 1 ? '' : 's'} your agents wrote — and a single hit is as likely to be a test fixture as a real key. A hook that blocks your work needs more evidence than that (this one needs ${HP_MIN_LEAKS}). Look at it in the Secrets tab first.`
+        : `Nothing to justify it: the key scanner read ${lk.filesRead || 0} file${lk.filesRead === 1 ? '' : 's'} your agents wrote and none matched a key shape. Proposing a blocking hook off zero findings would be generic advice dressed up as evidence.`,
+    });
+  }
+
+  // 4. Every subagent must name its model -----------------------------------
+  // This is the one the fleet's headline number LOOKS like it justifies and does
+  // not, which is exactly why it is worth printing.
+  let agents = 0, noModel = 0, cost = 0, top = 0;
+  for (const s of fleet) {
+    agents += s.agents || 0;
+    noModel += s.agentsNoModel || 0;
+    cost += s.cost || 0;
+    const mix = s.tierMix || {};
+    top += (mix.flagship || 0) + (mix.premium || 0);
+  }
+  const share = agents ? noModel / agents : 0;
+  const topPct = cost >= HP_MIN_FLEET_COST ? Math.round(top / cost * 100) : null;
+  if (noModel >= HP_MIN_NOMODEL && share >= HP_NOMODEL_SHARE) {
+    props.push({
+      id: 'model-guard', event: 'PreToolUse', matcher: 'Task', blocking: true,
+      title: 'Refuse a subagent that never says which model to run',
+      why: `<b>${noModel} of your ${agents}</b> recorded agents ran with no model in the transcript at all${topPct === null ? '' : `, while ${topPct}% of ~${fmtUsd(cost)} went to the top two tiers`}. An unnamed model inherits the orchestrator's, and inheriting is where the money leaks.`,
+      caught: [], caughtLabel: '',
+      plain: [
+        'Runs before a subagent is started and reads the call’s settings.',
+        'If no model is named, the spawn does not happen and the agent is told to pick one.',
+      ],
+      escape: 'Put  amc-ok  in the subagent’s prompt when inheriting really is what you want.',
+      command: "node -e \"let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let i={};try{i=JSON.parse(s).tool_input||{}}catch(e){}const t=JSON.stringify(i);if(/\\\"model\\\"/.test(t)||t.indexOf('amc-ok')>=0)process.exit(0);console.error('Stopped: this subagent names no model, so it inherits the orchestrator one. Name a model, or put  amc-ok  in the prompt.');process.exit(2)})\"",
+    });
+  } else {
+    refused.push({
+      title: 'Refuse a subagent that never says which model to run',
+      why: `Your transcripts record a model for <b>${agents - noModel} of ${agents}</b> agents, so this hook would have stopped ${noModel} ${noModel === 1 ? 'spawn' : 'spawns'} in your whole recorded history.`
+        + (topPct === null ? '' : ` Your top-tier spend is real — <b>${topPct}% of ~${fmtUsd(cost)}</b> — but it is not coming from models nobody set. It is coming from models that were named, and were expensive.`)
+        + ' A hook cannot fix that; it is a judgement about which work deserves which tier, which is what the tiering standing order is for.',
+    });
+  }
+
+  return { props, refused, sessionsRead: flows.length, fleetSessions: fleet.length };
+}
+
+const HP_CAUGHT_MAX = 6;   // examples shown before "+N more" — evidence, not a roster
+function hpCaughtHTML(p) {
+  if (!p.caught || !p.caught.length) return '';
+  const shown = p.caught.slice(0, HP_CAUGHT_MAX);
+  const over = p.caught.length - shown.length;
+  return `<div class="hp-caught"><span class="dim">${esc(p.caughtLabel)}:</span>` +
+    shown.map(c => `<span class="hp-hit" data-file="${esc(c.file)}"${c.seq == null ? '' : ` data-seq="${c.seq}"`} title="open this session">${esc(c.label)}</span>`).join('') +
+    (over > 0 ? `<span class="dim">+${over} more</span>` : '') +
+    '</div>';
+}
+function renderHookProps() {
+  const pane = $('hookprops');
+  if (!pane) return;
+  hpProps = hookProposals();
+  const { props, refused } = hpProps;
+  const where = hpSettings ? hpSettings.path : 'settings.json in your .claude folder';
+
+  const cards = props.map((p, i) => `<div class="hp-card">
+      <div class="hp-h"><span class="hp-ev" title="${esc(HOOK_EVENT_HELP[p.event] || 'lifecycle event')}">${esc(p.event)}</span><b>${esc(p.title)}</b>${p.blocking ? '<span class="hp-block" title="this one stops the action">stops the action</span>' : '<span class="hp-warn-tag" title="this one only reports back">reports back only</span>'}</div>
+      <div class="hp-why"><b>Why this one, on your numbers:</b> ${p.why}</div>
+      ${p.note ? `<div class="hp-note">${esc(p.note)}</div>` : ''}
+      ${hpCaughtHTML(p)}
+      <ul class="hp-plain">${p.plain.map(l => `<li>${esc(l)}</li>`).join('')}</ul>
+      <div class="hp-escape"><b>Way past it:</b> ${esc(p.escape)}</div>
+      <div class="hp-where"><b>Where it goes:</b> <code>${esc(where)}</code> — inside the <code>hooks</code> section, under <code>${esc(p.event)}</code>. If that section already exists, paste only the <code>"${esc(p.event)}"</code> part into it; the Brain tab shows you what is in there now.</div>
+      <div class="hp-jsonwrap"><pre class="hp-json">${esc(hpHookJSON(p.event, p.matcher, p.command))}</pre>
+        <div class="hp-acts"><button class="mini-btn hp-copy" data-i="${i}">📋 copy this</button><button class="mini-btn hp-brain">🧠 open the file in Brain</button></div></div>
+    </div>`).join('');
+
+  const refusedHTML = refused.map(r => `<div class="hp-refused"><b>${esc(r.title)}</b><span>${r.why}</span></div>`).join('');
+
+  pane.innerHTML =
+    `<div class="fleet-head"><h2>Hook ideas — ${props.length ? `${props.length} backed by your own numbers` : 'none your numbers back yet'}</h2>
+      <span class="dim">Weighed against ${hpProps.sessionsRead} session${hpProps.sessionsRead === 1 ? '' : 's'} read in full, out of ${hpProps.fleetSessions} in your fleet.</span>${homeButton('hookprops')}</div>
+     <div class="uw-note">A standing order is <b>words an agent reads</b> and may or may not follow. A hook is the version <b>your computer runs</b>, every time, whether the agent likes it or not. That is the whole difference, and it is why this page hands you text and nothing else.
+       <br><b>Agent Mission Control will never write a hook for you</b> — not with a button here, not in bulk, not from another machine. Guidance files hold words; settings files hold commands that execute. A dashboard that could plant those would be a way to run code on your computer with a friendly face on it. So: you copy the line, you open the file in the Brain tab, you read it, you save it.
+       <br>Every proposal below shows the number that earned it. The ones that <b>didn’t</b> earn it are listed at the bottom with the number that failed them — those are the honest half.
+       <br><span class="dim">One more thing worth knowing: the evidence spans every machine that relays into this dashboard, but the settings file is <b>this computer’s</b>. A hook only guards the machine it is saved on.</span></div>
+     ${cards || '<div class="uw-empty">Nothing in your fleet’s numbers justifies a hook right now. That is a good result, not an empty page — see below for what was checked and what the numbers said.</div>'}
+     <div class="hp-sec">Checked, and <b>not</b> proposed</div>
+     ${refusedHTML}`;
+
+  wireHomeButton(pane, 'hookprops', renderHookProps);
+  pane.querySelectorAll('.hp-copy').forEach(b => b.onclick = () => {
+    const p = props[+b.dataset.i]; if (!p) return;
+    navigator.clipboard.writeText(hpHookJSON(p.event, p.matcher, p.command));
+    const o = b.textContent; b.textContent = '✓ copied'; setTimeout(() => { b.textContent = o; }, 1500);
+  });
+  // navigation only — this opens the file for the owner to read, it does not touch it
+  pane.querySelectorAll('.hp-brain').forEach(b => b.onclick = () => { state.view = 'brain'; setTabs(); });
+  pane.querySelectorAll('.hp-hit[data-file]').forEach(el => el.onclick = () => {
+    const seq = el.dataset.seq;
+    if (seq == null) openSession(el.dataset.file); else openSessionAt(el.dataset.file, Number(seq));
+  });
 }
 
 // ---------- overview nav bar (category dropdowns) ----------
@@ -3355,6 +4488,7 @@ const VIEW_LOADERS = {
   rings: loadRings, rhythm: loadRhythm, projects: loadProjects, usage: loadUsage, flows: loadFlows,
   playbooks: loadPlaybooks, brain: loadBrain, audit: loadAudit, constellation: loadConstellation,
   machines: loadMachines, unsaved: loadUnsaved, trouble: loadTrouble, leaks: loadLeaks,
+  divergence: loadDivergence, graveyard: loadGraveyard, hookprops: loadHookProps, dejavu: loadDejaVu,
 };
 let openNavMenu = null;
 function closeNavMenus() {

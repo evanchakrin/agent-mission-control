@@ -112,7 +112,12 @@ function processLine(o, agentId, ctx) {
           const summary = summarizeInput(b.input);
           if (isSpawn) {
             const label = (b.input && (b.input.description || b.input.subagent_type)) || 'subagent';
-            spawnCalls.push({ toolUseId: b.id, name: label, prompt: clip(summary, 200), ts, resolved: false, agentId: null });
+            // `summary` prefers `description` — a 3-6 word label like "review auth".
+            // Keep the VERBATIM prompt separately: anything that matches two runs as
+            // "the same job" has to compare the actual instruction, not a short label
+            // that a dozen unrelated runs happen to share.
+            const verbatim = (b.input && typeof b.input.prompt === 'string') ? b.input.prompt.trim() : '';
+            spawnCalls.push({ toolUseId: b.id, name: label, prompt: clip(summary, 200), spawnPrompt: clip(verbatim, 4000), ts, resolved: false, agentId: null });
           }
           agent.tools[b.name] = (agent.tools[b.name] || 0) + 1;
           agent.lastKind = 'tool-call';
@@ -287,6 +292,7 @@ function normalize(mainLines, subFiles, wfNames = new Map()) {
     const sp = spawnFor.get(a.id);
     a.name = sp ? sp.name : 'Subagent ' + (i + 1);
     a.task = sp ? sp.prompt : '';
+    a.spawnPrompt = sp ? (sp.spawnPrompt || '') : '';  // verbatim instruction, for run-to-run matching
     a.done = (sp && sp.resolved) || a.lastKind === 'assistant-text';
   });
 
@@ -2089,6 +2095,455 @@ function troubleFiles() {
   return out;
 }
 
+// ---------- recent tool calls (the evidence a "blast radius" preview judges) ----------
+// WHAT IT ANSWERS: if I add this permission rule, what would it actually have hit?
+// WHY IT IS A SEPARATE READ instead of reusing the parsed events every other view
+// runs on: summarizeInput() deliberately prefers a call's human `description` over
+// its `command`, so the text a session view shows for a Bash call is a sentence
+// like "List files in current directory" — NOT the string Claude Code's permission
+// matcher looks at. Matching a rule against that would be quietly, invisibly wrong
+// for exactly the two tools that matter most here (Bash and WebFetch). So this
+// re-reads the raw tool_use blocks and returns the argument THE RULE WOULD SEE,
+// tagged with what kind of argument it is, so the UI can say "couldn't check this
+// one" instead of scoring a rule against the wrong string.
+// READ-ONLY, permanently: transcripts in, JSON out. No git, no writes, and never a
+// path from the browser — the scan always walks the newest sessions itself.
+const CALLS_MAX = 200;            // tool calls returned: the sample the preview judges
+const CALLS_MIN_SESSIONS = 10;    // keep reading past CALLS_MAX so the sample spans sessions, not one busy night
+const CALLS_MAX_SESSIONS = 30;    // hard ceiling on transcripts opened in one pass
+const CALLS_SCAN_BUDGET = 5000;   // ms spent reading before stopping (and saying so)
+const CALLS_ARG_MAX = 300;        // per-call argument kept; longer than this is clipped and flagged
+const CALLS_TTL = 30000;
+const callsCache = { at: 0, value: null };
+
+// The argument a permission rule is matched against, and what kind it is. Order
+// matters: `path` is tested before `pattern` so a Grep rule scores against the
+// folder it searched, not the regex it searched for. Anything not on this list
+// comes back kind 'none' — the UI then refuses to judge that call rather than
+// matching a rule against whatever string happened to be there.
+const CALL_ARG_KEYS = [
+  ['command', 'command'],        // Bash, PowerShell — what Bash(...) matches
+  ['file_path', 'path'],         // Read, Write, Edit, MultiEdit
+  ['notebook_path', 'path'],     // NotebookEdit
+  ['path', 'path'],              // Glob, Grep
+  ['url', 'url'],                // WebFetch and friends
+  ['query', 'query'],            // WebSearch
+  ['pattern', 'query'],          // a search expression, never a path
+];
+function permArgOf(input) {
+  if (!input || typeof input !== 'object') return { arg: '', argKind: 'none' };
+  for (const [k, kind] of CALL_ARG_KEYS) {
+    if (typeof input[k] === 'string' && input[k].trim()) return { arg: input[k].trim(), argKind: kind };
+  }
+  return { arg: '', argKind: 'none' };
+}
+
+// Pull every tool_use block out of one transcript's lines. The indexOf prefilter
+// skips the ~90% of lines that cannot contain one without paying for a JSON parse.
+function collectToolCalls(lines, out) {
+  for (const line of lines) {
+    if (!line || line.indexOf('"tool_use"') < 0) continue;
+    const o = safeParse(line);
+    if (!o || o.type !== 'assistant') continue;
+    const c = o.message && o.message.content;
+    if (!Array.isArray(c)) continue;
+    for (const b of c) {
+      if (!b || b.type !== 'tool_use' || typeof b.name !== 'string') continue;
+      const { arg, argKind } = permArgOf(b.input);
+      const t = o.timestamp ? new Date(o.timestamp).getTime() : NaN;
+      out.push({
+        tool: clean(b.name, 80),
+        // clean() drops control characters, so fold newlines to spaces FIRST or a
+        // multi-line command comes back with its lines glued together
+        arg: clean(arg.replace(/\s+/g, ' '), CALLS_ARG_MAX),
+        argKind,
+        clipped: arg.length > CALLS_ARG_MAX, // a clipped command can still be prefix-matched, never exact-matched
+        ts: isNaN(t) ? null : t,
+      });
+    }
+  }
+}
+
+function computeRecentToolCalls() {
+  const all = listSessions();                    // already newest-first
+  const t0 = Date.now();
+  let scanned = 0, budgetHit = false;
+  const calls = [];
+  for (const meta of all.slice(0, CALLS_MAX_SESSIONS)) {
+    if (calls.length >= CALLS_MAX && scanned >= CALLS_MIN_SESSIONS) break;
+    if (Date.now() - t0 > CALLS_SCAN_BUDGET) { budgetHit = true; break; }
+    const full = resolveSessionPath(meta.file);
+    if (!full) continue;
+    let text;
+    try { text = fs.readFileSync(full, 'utf8'); } catch { continue; } // one unreadable transcript must not sink the scan
+    scanned++;
+    const mine = [];
+    collectToolCalls(text.split('\n'), mine);
+    // subagents' calls go through the same permission rules the orchestrator's do,
+    // so leaving them out would under-report every rule's reach
+    for (const sf of subagentFiles(full)) {
+      try { collectToolCalls(fs.readFileSync(sf.path, 'utf8').split('\n'), mine); } catch { /* skip */ }
+    }
+    const title = clean(meta.title || meta.session, 140);
+    for (const c of mine) { c.file = meta.file; c.title = title; if (c.ts == null) c.ts = meta.mtime; }
+    calls.push(...mine);
+  }
+  calls.sort((a, b) => b.ts - a.ts);
+  const kept = calls.slice(0, CALLS_MAX);
+  return {
+    calls: kept,
+    scannedSessions: scanned,
+    totalSessions: all.length,
+    sessionsInSample: new Set(kept.map(c => c.file)).size,
+    capped: scanned < all.length,
+    budgetHit,
+    max: CALLS_MAX,
+    oldest: kept.length ? kept[kept.length - 1].ts : null,
+    newest: kept.length ? kept[0].ts : null,
+  };
+}
+
+// Public entry point. Cached 30s — the same reason troubleFiles() is: this opens
+// real transcripts, and clicking around a preview must not repeat that cost.
+function recentToolCalls() {
+  if (callsCache.value && Date.now() - callsCache.at < CALLS_TTL) return callsCache.value;
+  const out = computeRecentToolCalls();
+  callsCache.at = Date.now();
+  callsCache.value = out;
+  return out;
+}
+
+// ---------- the graveyard (work this fleet has already thrown away) ----------
+// WHAT IT ANSWERS: what has been tried in this folder and undone? An agent that
+// cannot see last week's dead end walks cheerfully back into it.
+// WHY IT IS THIS NARROW: the first sketch tried to notice "the run started over
+// and did something different", and that was cut on purpose — every long session
+// changes approach, so it would fire constantly and mean nothing. This recognises
+// FOUR literal git commands and nothing else. Every row is a command an agent
+// really ran, at a moment you can click straight to and read.
+// WHY IT NEEDS ITS OWN RAW SCAN: summarizeInput() prefers a call's human
+// `description` over its `command` (same reason the blast-radius preview above
+// re-reads raw blocks), so the text the rest of the dashboard holds for a Bash
+// call is a sentence like "Discard local changes" — the command string is nowhere
+// in the parsed session. So this re-reads the raw tool_use blocks and joins them
+// back to the parsed events on the tool_use id, which is what recovers the seq
+// the UI links to.
+// COVERAGE IS SMALLER THAN THE FLEET, AND THE PANEL SAYS SO: relayed sessions
+// arrive already parsed, so their command text does not exist on this computer at
+// all. Only transcripts stored here can be read — the local ones, plus whatever
+// has been pulled into the archive from a relay.
+// NO RATES, DELIBERATELY: every row is one thing that happened once, with a link
+// to it. There is no "this approach fails N% of the time" here and there must
+// never be one — the sample is only whatever transcripts happen to be kept.
+// READ-ONLY, permanently: transcripts in, JSON out. No git runs at all, nothing
+// written, and never a path the browser sent — the scan enumerates files itself.
+const GRAVE_MAX_SESSIONS = 40;                 // newest transcripts opened, newest first
+const GRAVE_MAX_BYTES = 400 * 1024 * 1024;     // bytes read in one pass before stopping (and saying so)
+const GRAVE_SCAN_BUDGET = 9000;                // ms spent reading before stopping (and saying so)
+const GRAVE_MAX_MOMENTS = 60;                  // rows returned to the UI
+const GRAVE_MAX_FILES_PER = 8;                 // files named per moment
+const GRAVE_CMD_MAX = 220;                     // characters of the command kept per row
+const GRAVE_TTL = 60000;                       // this answer moves slowly; the scan cost does not
+const graveCache = { at: 0, value: null };
+
+// The whole detector. Four literal commands, each unambiguous about what it throws
+// away. `git restore --staged` on its own only unstages — the edits survive — so it
+// is deliberately NOT on this list. This array is also what the panel prints as its
+// own help text, so the promise and the detector cannot drift apart.
+const GRAVE_RULES = {
+  reset: { id: 'reset', cmd: 'git reset --hard', what: 'threw the whole folder back to a saved point' },
+  revert: { id: 'revert', cmd: 'git revert', what: 'undid a change that had already been saved' },
+  checkout: { id: 'checkout', cmd: 'git checkout -- <files>', what: 'threw away the edits to named files' },
+  restore: { id: 'restore', cmd: 'git restore <files>', what: 'threw away the edits to named files' },
+};
+// Cheap reject before any JSON parsing: a transcript without one of these strings
+// anywhere in it cannot contain one of the four commands.
+const GRAVE_NEEDLES = ['reset --hard', 'git revert', 'git checkout', 'git restore'];
+
+// git's global options come BEFORE the subcommand (`git -C <dir> reset --hard`),
+// so they are stripped first or the subcommand never lines up.
+const GRAVE_GIT_HEAD = /^git\s+(?:(?:-C|-c|--git-dir|--work-tree|--exec-path)(?:=\S+|\s+\S+)\s+|--no-pager\s+|--literal-pathspecs\s+)*([a-z][a-z-]*)([\s\S]*)$/;
+// Split an argument string into tokens, honouring simple quoting so a path with a
+// space in it stays one path.
+function graveTokens(s) {
+  const out = [];
+  const re = /"((?:[^"\\]|\\.)*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(s))) out.push(m[1] != null ? m[1] : m[2] != null ? m[2] : m[3]);
+  return out;
+}
+// Paths named after a `--` separator, which is git's own "everything past here is a
+// file" marker — the one place a pathspec is not guessable from a flag.
+function gravePathsAfterSep(rest) {
+  const i = rest.search(/(^|\s)--(\s|$)/);
+  if (i < 0) return [];
+  return graveTokens(rest.slice(i).replace(/^\s*--\s*/, '')).filter(t => t[0] !== '-');
+}
+// One shell segment -> the undo it performs, or null. Segments are matched from
+// their FIRST word, so `grep "git reset --hard" .` (a search for the string) and
+// `echo "git revert"` are not mistaken for the command itself.
+function graveUndoOf(seg) {
+  const m = GRAVE_GIT_HEAD.exec(seg);
+  if (!m) return null;
+  const sub = m[1], rest = m[2] || '';
+  if (sub === 'reset' && /(^|\s)--hard(\s|$)/.test(rest)) return { rule: GRAVE_RULES.reset, paths: [] };
+  // --abort/--continue/--quit/--skip are the RECOVERY forms: they get you out of a
+  // revert, they do not undo saved work. Reporting them as thrown-away work (and
+  // proposing a hook that blocks the escape route) is exactly backwards.
+  if (sub === 'revert') {
+    if (/(^|\s)--(abort|continue|quit|skip)(\s|$)/.test(rest)) return null;
+    return { rule: GRAVE_RULES.revert, paths: [] };
+  }
+  if (sub === 'checkout' && /(^|\s)--(\s|$)/.test(rest)) return { rule: GRAVE_RULES.checkout, paths: gravePathsAfterSep(rest) };
+  if (sub === 'restore' && !/(^|\s)--staged(\s|$)/.test(rest)) {
+    const sep = gravePathsAfterSep(rest);
+    if (sep.length) return { rule: GRAVE_RULES.restore, paths: sep };
+    // no separator: take the bare words, dropping flags and the value of --source
+    const toks = graveTokens(rest);
+    const paths = [];
+    for (let i = 0; i < toks.length; i++) {
+      if (toks[i] === '--source' || toks[i] === '-s') { i++; continue; }
+      if (toks[i][0] !== '-') paths.push(toks[i]);
+    }
+    return { rule: GRAVE_RULES.restore, paths };
+  }
+  return null;
+}
+// Split a command into shell segments, IGNORING separators inside quotes. This is
+// the guard that stopped the first build's only false positives: a line like
+// `grep 'reset --hard\|git revert' .` splits on those bare pipes into a fragment
+// beginning "git revert", and a naive splitter read a search FOR the command as the
+// command. Bare `|` is not a separator here either — nothing pipes into a git undo.
+// An unbalanced quote makes the rest of the line look quoted and can hide a real
+// undo; that is the right way to be wrong for this feature, the same trade the leak
+// scanner makes. Missing one beats inventing one.
+function graveSegments(cmd) {
+  // A heredoc body is FILE CONTENT, not commands. A doc or script written with
+  // `cat <<EOF ... git revert ... EOF` was being read as an agent really running
+  // git revert — a fabricated entry in a list whose whole value is being accurate.
+  // Everything from the introducer to its terminator is dropped.
+  const hd = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/.exec(cmd);
+  if (hd) {
+    const end = new RegExp('^\\s*' + hd[1] + '\\s*$', 'm');
+    const after = cmd.slice(hd.index);
+    const m = end.exec(after);
+    cmd = cmd.slice(0, hd.index) + (m ? after.slice(m.index + m[0].length) : '');
+  }
+  const out = [];
+  let cur = '', q = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (q) {
+      if (c === '\\' && q === '"') { cur += c + (cmd[++i] || ''); continue; }
+      if (c === q) q = null;
+      cur += c; continue;
+    }
+    if (c === '"' || c === '\'') { q = c; cur += c; continue; }
+    if (c === '\n' || c === ';') { out.push(cur); cur = ''; continue; }
+    if ((c === '&' && cmd[i + 1] === '&') || (c === '|' && cmd[i + 1] === '|')) { out.push(cur); cur = ''; i++; continue; }
+    cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+// `cd <dir> && git checkout -- x` names its own folder, and that folder is the
+// repo the pathspecs are relative to. Prefer it over the session's recorded cwd.
+function graveCdTarget(segments) {
+  const first = (segments[0] || '').trim();
+  const m = /^cd\s+(?:\/d\s+)?(.+)$/i.exec(first);
+  if (!m) return null;
+  const t = graveTokens(m[1])[0];
+  return t && path.isAbsolute(t) ? path.normalize(t) : null;
+}
+
+// Scan ONE transcript for undo commands. Returns the bytes it read so the caller
+// can hold a budget; pushes into `hits` rather than returning them, because a
+// session's subagent files all feed the same list.
+// The byte budget is only consulted BETWEEN files, so one enormous transcript could
+// block the single-threaded hub on its own. Skip anything past a per-file cap —
+// the caller already reports when a scan was incomplete.
+const GRAVE_MAX_FILE = 48 * 1024 * 1024;
+function graveScanFile(abs, hits) {
+  let buf;
+  try {
+    if (fs.statSync(abs).size > GRAVE_MAX_FILE) return 0;
+    buf = fs.readFileSync(abs);
+  } catch { return 0; }
+  if (!GRAVE_NEEDLES.some(n => buf.includes(n))) return buf.length;
+  for (const line of buf.toString('utf8').split('\n')) {
+    if (line.indexOf('"tool_use"') < 0) continue;
+    const o = safeParse(line);
+    if (!o || o.type !== 'assistant') continue;
+    const content = o.message && o.message.content;
+    if (!Array.isArray(content)) continue;
+    for (const b of content) {
+      if (!b || b.type !== 'tool_use') continue;
+      const cmd = b.input && b.input.command;
+      if (typeof cmd !== 'string' || !cmd.trim()) continue;
+      const segs = graveSegments(cmd);
+      for (const seg of segs) {
+        const trimmed = seg.trim();
+        const u = graveUndoOf(trimmed);
+        if (!u) continue;
+        const t = o.timestamp ? new Date(o.timestamp).getTime() : NaN;
+        hits.push({
+          id: b.id || null, tool: clean(b.name, 40), rule: u.rule, paths: u.paths.slice(0, GRAVE_MAX_FILES_PER),
+          base: graveCdTarget(segs),
+          // the MATCHING segment is what gets shown: a three-line command whose
+          // undo is on line two must not be printed as its harmless first line
+          command: clean(trimmed.replace(/\s+/g, ' '), GRAVE_CMD_MAX),
+          whole: cmd.length > trimmed.length ? clean(cmd.replace(/\s+/g, ' '), GRAVE_CMD_MAX * 2) : null,
+          ts: isNaN(t) ? null : t,
+        });
+        break; // one moment per command, even when it chains two undos together
+      }
+    }
+  }
+  return buf.length;
+}
+
+// Every transcript on this computer whose raw command text can still be read:
+// the local ones, plus main transcripts pulled into the archive from a relay.
+// `orphans` counts archived sessions whose subagent transcripts arrived but whose
+// main transcript did not. Their commands are readable, but there is no session to
+// open at that moment, so they are left out — and counted, so the panel can admit it.
+function graveCandidates() {
+  const out = [];
+  let orphans = 0;
+  for (const m of listSessions()) {
+    const full = resolveSessionPath(m.file);
+    if (full) out.push({ file: m.file, path: full, title: m.title || m.session, mtime: m.mtime, machine: os.hostname(), source: 'this computer' });
+  }
+  let machines = [];
+  try { machines = fs.readdirSync(ARCHIVE_DIR()); } catch { /* no archive pulled yet */ }
+  for (const machine of machines) {
+    const base = archiveMachineDir(machine);
+    let man = {};
+    try { if (!fs.statSync(base).isDirectory()) continue; man = archiveManifest(machine); } catch { continue; }
+    const rels = Object.keys(man);
+    const mains = new Set(rels.filter(r => /^claude\/[^/]+\/[^/]+\.jsonl$/.test(r)));
+    const seenTrees = new Set();
+    for (const rel of rels) {
+      const sub = /^(claude\/[^/]+\/[^/]+)\/subagents\//.exec(rel);
+      if (sub && !seenTrees.has(sub[1])) { seenTrees.add(sub[1]); if (!mains.has(sub[1] + '.jsonl')) orphans++; }
+    }
+    for (const rel of mains) {
+      const abs = path.join(base, rel);
+      let mtime = 0;
+      try { mtime = fs.statSync(abs).mtimeMs; } catch { continue; }
+      out.push({ file: 'archive:' + machine + ':' + rel, path: abs, title: null, mtime, machine, source: machine });
+    }
+  }
+  out.sort((a, b) => b.mtime - a.mtime);
+  out.orphans = orphans;
+  return out;
+}
+// Title for an archived transcript, read only once a session has actually produced
+// a row — the same head-read /api/archive/list does, not paid for on every file.
+function graveTitleOf(abs) {
+  try {
+    const size = fs.statSync(abs).size;
+    const fd = fs.openSync(abs, 'r');
+    const buf = Buffer.alloc(Math.min(8192, size));
+    fs.readSync(fd, buf, 0, buf.length, 0); fs.closeSync(fd);
+    for (const line of buf.toString('utf8').split('\n')) {
+      const o = safeParse(line);
+      if (o && (o.type === 'custom-title' || o.type === 'ai-title')) return o.customTitle || o.aiTitle;
+    }
+  } catch { /* fall back to the file name */ }
+  return null;
+}
+
+function computeGraveyard() {
+  const cands = graveCandidates();
+  const t0 = Date.now();
+  let scanned = 0, bytes = 0, budgetHit = false;
+  const moments = [];
+  const overBudget = () => Date.now() - t0 > GRAVE_SCAN_BUDGET || bytes > GRAVE_MAX_BYTES;
+
+  for (const c of cands.slice(0, GRAVE_MAX_SESSIONS)) {
+    if (overBudget()) { budgetHit = true; break; }
+    const hits = [];
+    bytes += graveScanFile(c.path, hits);
+    // a subagent's commands are this session's commands: leaving them out would
+    // miss most of the undos, since most of the work happens down there
+    for (const sf of subagentFiles(c.path)) {
+      if (overBudget()) { budgetHit = true; break; }
+      bytes += graveScanFile(sf.path, hits);
+    }
+    scanned++;
+    if (!hits.length) continue;
+
+    // Re-parse this ONE session (cached) so each raw hit can be joined back to its
+    // parsed event by tool_use id — that is what gives the UI a seq to jump to.
+    let r = null;
+    try { r = readSession(c.path); } catch { /* the moment still stands; only its link is lost */ }
+    // A call and its result carry the SAME tool_use id, and the result comes
+    // second — indexing both put every link one event past the command, on the
+    // answer rather than the question. Only the call side is indexed.
+    const byId = new Map();
+    if (r) for (const e of r.events) if (e.toolUseId && (e.kind === 'tool-call' || e.kind === 'spawn') && !byId.has(e.toolUseId)) byId.set(e.toolUseId, e);
+    const edits = r ? r.events.filter(e => e.kind === 'tool-call' && STICK_TOOLS.has(e.tool)) : [];
+    const cwd = sessionCwd(c.path) || '';
+    const title = c.title || graveTitleOf(c.path) || path.basename(c.path, '.jsonl');
+
+    for (const h of hits) {
+      const evt = h.id ? byId.get(h.id) : null;
+      const seq = evt && evt.seq != null ? evt.seq : null;
+      const repo = h.base || cwd || '';
+      // Two very different kinds of "the files involved", never blurred together:
+      // the command NAMED them (checkout/restore), or it did not (reset/revert) and
+      // the best that can honestly be said is what this run had edited by then.
+      let files = h.paths.map(p => (path.isAbsolute(p) ? path.normalize(p) : repo ? path.normalize(path.join(repo, p)) : p));
+      const named = files.length > 0;
+      let filesCapped = false;
+      if (!named) {
+        const before = seq == null ? edits : edits.filter(e => e.seq != null && e.seq < seq);
+        const all = [...new Set(before.map(stickPathOf).filter(Boolean))];
+        filesCapped = all.length > GRAVE_MAX_FILES_PER;
+        files = all.slice(-GRAVE_MAX_FILES_PER);
+      }
+      moments.push({
+        file: c.file, title: clean(title, 140), machine: c.machine, source: c.source,
+        seq, ts: h.ts || c.mtime, kind: h.rule.id, what: h.rule.what, cmd: h.rule.cmd,
+        command: h.command, whole: h.whole, tool: h.tool,
+        repo, files, filesNamed: named, filesCapped,
+        agent: evt ? evt.agent : null,
+      });
+    }
+  }
+
+  moments.sort((a, b) => b.ts - a.ts);
+  const kept = moments.slice(0, GRAVE_MAX_MOMENTS);
+  // Sessions that exist in the picker but whose commands are simply not here to
+  // read: relayed and OTLP ones arrive already summarised, and Codex transcripts
+  // record their calls in a different shape this scan does not parse.
+  const summaryOnly = relayList().length + otelList().length + codexList().length;
+  return {
+    moments: kept,
+    repos: new Set(kept.map(m => stickKey(m.repo || ''))).size,
+    totalMoments: moments.length,
+    scannedSessions: scanned,
+    candidates: cands.length,
+    capped: cands.length > scanned,
+    budgetHit,
+    mbRead: Math.round(bytes / 1e6),
+    summaryOnly,
+    orphans: cands.orphans || 0,
+    looksFor: Object.values(GRAVE_RULES).map(r => ({ cmd: r.cmd, what: r.what })),
+  };
+}
+
+// Public entry point. Cached 60s: one pass can read hundreds of megabytes of
+// transcript, so clicking back onto the tab must not repeat that.
+function graveyard() {
+  if (graveCache.value && Date.now() - graveCache.at < GRAVE_TTL) return graveCache.value;
+  const out = computeGraveyard();
+  graveCache.at = Date.now();
+  graveCache.value = out;
+  return out;
+}
+
 // ---------- secret leak sentinel (did an agent write a real credential into a file?) ----------
 // WHAT IT ANSWERS: did one of my agents drop something that looks like a REAL
 // credential into a file? This is a smoke alarm, not a security audit.
@@ -2878,6 +3333,25 @@ const server = http.createServer((req, res) => {
     if (!metaGate(req, res)) return;
     try { return json(res, troubleFiles()); }
     catch { return json(res, { files: [], error: 'Something went wrong while looking for files your agents keep fighting with.' }); }
+  }
+
+  // ---- the graveyard: moments an agent threw work away (gated read) ----
+  // Raw transcript scan, cached 60s inside graveyard(). It reads command text and
+  // nothing else — no git, no writes, and no companion write route: v1 proves the
+  // list is right before anything is allowed to act on it.
+  if (url.pathname === '/api/graveyard' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    try { return json(res, graveyard()); }
+    catch { return json(res, { moments: [], error: 'Something went wrong while looking for work your agents threw away.' }); }
+  }
+
+  // ---- recent tool calls: what a permission rule would have matched (gated read) ----
+  // Feeds the Brain tab's read-only "blast radius" preview. There is no companion
+  // write route: nothing in that preview can save a settings file, by design.
+  if (url.pathname === '/api/tool-calls' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    try { return json(res, recentToolCalls()); }
+    catch { return json(res, { calls: [], error: 'Something went wrong while reading what your agents have actually run.' }); }
   }
 
   // ---- secret leak sentinel: credential shapes in files agents wrote (gated read) ----

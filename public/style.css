@@ -808,4 +808,146 @@ footer button.on { border-color: var(--accent); color: var(--accent); }
 .sl-kind { color: var(--amber); }
 .sl-frag { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--dim); background: var(--panel2); border-radius: 5px; padding: 2px 7px; }
 .sl-clear { font-size: 15px; font-weight: 600; color: var(--green); padding: 26px 4px; max-width: 700px; }
+
+/* ---------- Divergence Ladder ---------- */
+#divergence { position: absolute; inset: 0; overflow: auto; padding: 22px; }
+.dl-cols { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.dl-col-head { flex: 1; min-width: 220px; padding: 10px 14px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; gap: 3px; cursor: pointer; }
+.dl-col-head:hover { border-color: var(--accent); }
+.dl-col-head.dl-bad { border-left: 3px solid var(--red); }
+.dl-col-head.dl-good { border-left: 3px solid var(--green); }
+.dl-table td { vertical-align: top; }
+.dl-table .dl-n { color: var(--dim); font-size: 11px; width: 28px; }
+.dl-table tr.dl-diff td { background: rgba(251,191,36,.07); }
+.dl-table tr.dl-first-div td { background: rgba(248,113,113,.16); border-top: 2px solid var(--red); border-bottom: 2px solid var(--red); }
+.dl-flag-row td { color: var(--red); font-size: 11px; font-weight: 600; padding: 3px 10px 8px; background: rgba(248,113,113,.08); }
+
+/* ---------- Deja Vu Finder ---------- */
+#dejavu { position: absolute; inset: 0; overflow: auto; padding: 22px; }
+.deja-box { width: 100%; max-width: 640px; padding: 10px 14px; font-size: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; color: var(--text); margin-bottom: 14px; font-family: inherit; }
+.deja-box:focus { outline: none; border-color: var(--accent); }
+.deja-results { display: flex; flex-direction: column; gap: 8px; max-width: 900px; }
+.deja-row { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); cursor: pointer; }
+.deja-row:hover { border-color: var(--accent); }
+.deja-badge { font-size: 15px; line-height: 1.4; }
+.deja-main { flex: 1; min-width: 0; }
+.deja-task { font-size: 13px; margin-bottom: 3px; }
 .sl-clear-sub { font-size: 13px; font-weight: 400; line-height: 1.6; color: var(--dim); margin-top: 8px; }
+
+/* ---------- rule rehearsal (inside the standing-order composer) ---------- */
+/* Deliberately quiet: this is a check the owner runs before planting, not a
+   verdict banner. Red is reserved for a real count of broken sessions; the
+   "not enough runs / not measurable" states are grey on purpose, because a
+   number nobody should trust must not look like one that can be. */
+.rr-box { margin: 10px 0 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel2); }
+.rr-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rr-bar .dim { flex: 1; min-width: 220px; font-size: 11px; line-height: 1.45; }
+.rr-shapes { margin-top: 8px; font-size: 11px; line-height: 1.6; }
+.rr-shapes code { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-family: Consolas, monospace; color: var(--accent); }
+.rr-head { font-size: 13.5px; font-weight: 600; margin: 10px 0 2px; }
+.rr-bad { color: var(--red); }
+.rr-ok { color: var(--green); }
+.rr-none { color: var(--dim); font-weight: 600; }
+.rr-unmeasurable { margin-top: 10px; font-size: 13px; color: var(--dim); font-style: italic; }
+.rr-partial { margin: 8px 0; font-size: 11.5px; line-height: 1.55; color: var(--amber); background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.25); border-radius: 7px; padding: 7px 9px; }
+.rr-clause { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); }
+.rr-clause-h { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; font-size: 12.5px; }
+.rr-i { font-size: 10px; color: var(--dim); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.rr-src { font-size: 10.5px; margin-top: 3px; }
+.rr-hits { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; }
+.rr-hit { display: flex; gap: 9px; align-items: baseline; padding: 4px 7px; border-radius: 6px; cursor: pointer; font-size: 11.5px; }
+.rr-hit:hover { background: var(--panel); }
+.rr-hit-t { color: var(--accent2); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rr-hit .dim { font-size: 10.5px; }
+
+/* ---------- blast radius (permissions preview in the Brain tab) ---------- */
+/* Read-only by construction: there is no control in here that stages or writes
+   anything. The matcher is an approximation of Claude Code's own, so the count
+   is always shown against a stated denominator, and calls it could not judge
+   are reported separately instead of being quietly scored as misses. */
+.br-try { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+#brPattern { flex: 1; min-width: 260px; padding: 8px 11px; font-size: 12.5px; font-family: Consolas, monospace; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; color: var(--text); }
+#brPattern:focus { outline: none; border-color: var(--accent); }
+.br-out { min-height: 24px; }
+.br-head { font-size: 13px; line-height: 1.6; margin-bottom: 8px; }
+.br-head.br-hit { color: var(--amber); }
+.br-head b { color: var(--text); font-size: 15px; }
+.br-unknown, .br-unsure { font-size: 11.5px; line-height: 1.55; color: var(--dim); background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; margin-bottom: 8px; }
+.br-unknown code, .br-unsure code { color: var(--accent); }
+.br-rows { display: flex; flex-direction: column; gap: 2px; max-height: 340px; overflow-y: auto; }
+.br-row { display: grid; grid-template-columns: 120px 1fr auto; gap: 10px; align-items: baseline; padding: 4px 7px; border-radius: 6px; cursor: pointer; }
+.br-row:hover { background: var(--panel2); }
+.br-tool { font-size: 11px; color: var(--accent2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.br-arg { font-size: 11px; font-family: Consolas, monospace; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.br-when { font-size: 10.5px; white-space: nowrap; }
+.br-kind { margin-bottom: 10px; }
+.br-kind > b { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+.br-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+.br-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; color: var(--text); cursor: pointer; font-size: 11px; }
+.br-chip:hover { border-color: var(--accent); }
+.br-chip code { font-family: Consolas, monospace; font-size: 11px; }
+.br-count { font-size: 10px; color: var(--dim); border-left: 1px solid var(--line); padding-left: 6px; }
+.br-count-hit { color: var(--amber); font-weight: 700; }
+
+/* ---------- the graveyard (work already thrown away) ---------- */
+/* Rows are FACTS, not verdicts, so nothing in here is coloured like an alarm:
+   amber marks the moment, and the row itself stays neutral. No red — a discarded
+   edit is often the right call, and painting the list red would make a plain
+   record of what happened read as a list of accusations. */
+#graveyard { position: absolute; inset: 0; overflow: auto; padding: 22px; }
+.gy-shapes { margin: 7px 0 7px 4px; padding-left: 16px; display: flex; flex-direction: column; gap: 3px; }
+.gy-shapes code { background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-family: Consolas, monospace; color: var(--amber); }
+.gy-repo { margin-bottom: 18px; max-width: 1100px; }
+.gy-repo-h { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding: 0 0 7px 2px; border-bottom: 1px solid var(--line); margin-bottom: 4px; }
+.gy-repo-h b { font-size: 13.5px; color: var(--text); }
+.gy-repo-h .dim { font-size: 10.5px; word-break: break-all; }
+.gy-row { display: grid; grid-template-columns: 96px 22px 1fr auto; gap: 10px; align-items: baseline; padding: 8px 8px; border-radius: 7px; cursor: pointer; border-bottom: 1px solid var(--line); }
+.gy-row:hover { background: var(--panel2); }
+.gy-row:hover .gy-open { color: var(--accent); }
+.gy-when { font-size: 11px; color: var(--dim); white-space: nowrap; }
+.gy-icon { font-size: 13px; }
+/* min-width:0, or the 1fr track refuses to shrink below the longest unbreakable run
+   in the command line — which pushed "open the moment" off the right of the pane. */
+.gy-main { min-width: 0; }
+.gy-what { font-size: 12.5px; color: var(--amber); }
+.gy-what .dim { color: var(--dim); }
+.gy-files { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 5px; align-items: baseline; font-size: 11px; }
+.gy-file { padding: 1px 7px; background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; color: var(--text); font-size: 10.5px; }
+.gy-cmd { display: block; margin-top: 5px; font-family: Consolas, monospace; font-size: 10.5px; color: var(--dim); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 3px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gy-open { font-size: 10.5px; color: var(--dim); white-space: nowrap; }
+
+/* ---------- hook proposals (display and copy only, permanently) ---------- */
+/* There is deliberately NO control in this block that could apply a hook: the only
+   buttons are "copy" and "open the file in Brain". Settings files hold commands the
+   machine runs, so the write stays a thing the owner does by hand, in front of the
+   file, having read it. .hp-refused is styled as calmly as .hp-card on purpose —
+   the refusals are evidence too, not an error state. */
+#hookprops { position: absolute; inset: 0; overflow: auto; padding: 22px; }
+.hp-card { max-width: 1000px; margin-bottom: 18px; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent2); border-radius: 9px; padding: 14px 16px; }
+.hp-h { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 9px; }
+.hp-h b { font-size: 14px; color: var(--text); }
+.hp-ev { font-size: 10px; font-family: Consolas, monospace; padding: 2px 7px; border-radius: 6px; background: rgba(129,140,248,.15); color: var(--accent2); border: 1px solid rgba(129,140,248,.3); white-space: nowrap; }
+.hp-block { font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 8px; background: rgba(251,191,36,.13); color: var(--amber); }
+.hp-warn-tag { font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 8px; background: rgba(52,211,153,.13); color: var(--green); }
+.hp-why { font-size: 12.5px; line-height: 1.65; color: var(--dim); }
+.hp-why b { color: var(--text); }
+.hp-note { margin-top: 7px; font-size: 11.5px; line-height: 1.55; color: var(--dim); font-style: italic; }
+.hp-caught { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 5px; align-items: baseline; font-size: 11px; }
+.hp-caught .dim { margin-right: 3px; }
+.hp-hit { padding: 2px 8px; background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; color: var(--text); font-size: 10.5px; cursor: pointer; }
+.hp-hit:hover { border-color: var(--accent); }
+.hp-plain { margin: 10px 0 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; line-height: 1.5; color: var(--dim); }
+.hp-escape { margin-top: 10px; font-size: 12px; line-height: 1.55; color: var(--dim); background: var(--panel2); border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; }
+.hp-escape b { color: var(--text); }
+.hp-where { margin-top: 10px; font-size: 11.5px; line-height: 1.6; color: var(--dim); }
+.hp-where b { color: var(--text); }
+.hp-where code { font-family: Consolas, monospace; color: var(--accent); word-break: break-all; }
+.hp-jsonwrap { margin-top: 9px; }
+.hp-json { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 10px 12px; font-family: Consolas, monospace; font-size: 10.5px; line-height: 1.5; color: var(--text); overflow-x: auto; white-space: pre; max-height: 260px; }
+.hp-acts { display: flex; gap: 7px; margin-top: 7px; }
+.hp-sec { margin: 26px 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); }
+.hp-sec b { color: var(--text); }
+.hp-refused { max-width: 1000px; margin-bottom: 9px; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 9px; padding: 11px 15px; }
+.hp-refused b { display: block; font-size: 12.5px; color: var(--text); margin-bottom: 4px; }
+.hp-refused span { font-size: 12px; line-height: 1.6; color: var(--dim); }
+.hp-refused span b { display: inline; color: var(--text); margin: 0; }
