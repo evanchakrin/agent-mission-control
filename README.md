@@ -167,6 +167,14 @@ Read-only, always: `log`, `diff`, and `status` only. It never stages, commits, o
 
 **Anatomy of a failure** is the companion. When a run breaks, instead of handing you a span tree it says what it got stuck on in one line — *"Repeated the same Edit to src/auth.js 4 times, then stopped"*, or *"Ran the same test command 6 times, failing each time."* Deterministic pattern-matching over the event list: no LLM, no schedule. When it can't tell, it says nothing — no caption beats a wrong one.
 
+## What needs attention
+
+Three read-only checks that answer questions you can't ask any other tool, because they need the transcripts and the repo on the same disk.
+
+- **Trouble files** — the files your agents keep fighting with, ranked by how often working on them ended badly. The rate is gated: a file touched twice where one session failed is not a "50% problem file," so below the threshold it says **"not enough runs to say yet"** and ranks by volume instead.
+- **Unsaved work** — files your agents created that git has never seen: untracked *and* with no history on any branch. It lists them and copies paths. **It will never stage, commit, or delete anything** — that's a mutation, and this is a watch-only tool.
+- **Secrets** — a deliberately narrow scanner over only the files agents themselves wrote. Seven fixed credential shapes with distinctive vendor prefixes (AWS, GitHub, Slack, Stripe live, Google, PEM keys with actual key material, JWTs that really decode). **No entropy scoring**, no `password=` heuristics, and test/doc/example directories and `.env.example`-style filenames are suppressed. It never displays the secret — just the file, the line, what kind it looks like, and a four-character prefix. A scanner that cries wolf gets ignored, which is worse than not having one.
+
 ## Playbook Studio & the feedback loop
 
 The Board and Timeline tell you what *one run* did. Playbook Studio answers the harder question: **across everything my fleet has ever done, what should I change?** — and then gives you concrete ways to make that change stick in future sessions.
@@ -196,7 +204,7 @@ A finding is worthless until a *future* session acts on it. Copy-pasting a promp
 | --- | --- | --- | --- |
 | **① Directive** | Written into the project's `CLAUDE.md` / `AGENTS.md` — a standing rule the agent reads every session | Stable truths (*"tier your models"*, *"never guess the schema"*) | Zero — it's automatic |
 | **② Playbook** | Saved to your library, pasted when you start relevant work | Task-shaped patterns (*"adversarial review"*, *"migration sweep"*) | One paste, when relevant |
-| **③ Hook** | A `SessionStart` hook that surfaces your top directive/insight to the agent | Enforcement you don't want to rely on memory for | Zero — it fires itself |
+| **③ Hook** | A shell command the harness runs at a fixed moment — it can inject context or **block a tool call outright** | Enforcement you don't want to rely on memory for | Zero — it fires itself |
 
 **Copy-paste is the universal bridge** — it works across machines, stays watch-only, and carries no execution risk — so it's always available as the fallback. But the durable path is **① directives**, and the automatic path is **③ hooks**.
 
@@ -212,6 +220,17 @@ Reserve premium tokens for planning and the final judgment gate. Report a per-ti
 ```
 
 Every future workflow in those repos now tiers its models without anyone remembering to ask. That's the loop closed: **observe → mine → canonize → the next session inherits it.**
+
+### Directives persuade. Hooks enforce. Know which you need.
+
+A directive is *words the agent reads* — it usually follows them, and it can drift. A hook is *a program the harness runs* at a fixed moment; the model isn't asked. The same tiering lesson as a hook is a `PreToolUse` check that **refuses** a workflow whose `agent()` calls don't set a model, naming the offending lines and quoting the rule.
+
+That power is exactly why hooks are the one thing this project will never distribute for you:
+
+> **Standing orders distribute words. Hooks stay local, deliberate, and one at a time.**
+> A guidance file holds prose an agent reads. A settings file holds commands your machine *runs*. If a dashboard could plant hooks in bulk and ship them over git, one click would become remote code execution on every machine that pulls. Guidance files travel; `settings.json` never does.
+
+So AMC will **propose** a hook from your own fleet evidence — showing the exact JSON and what it would have caught — and you install it yourself in the Brain tab. Suggested, never planted. And give every blocking hook an escape hatch: a hook you can't override once is a hook you disable entirely, which costs you the other 95% of its value.
 
 ## Command center views
 
