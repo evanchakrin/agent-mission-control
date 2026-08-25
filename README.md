@@ -147,6 +147,26 @@ This metadata is **local and durable** — stored at `~/.claude/mission-control/
 
 The OTLP receiver also understands OpenInference (Phoenix) and Traceloop/OpenLLMetry attribute conventions (`llm.model_name`, `openinference.span.kind`, `llm.token_count.*`, `input/output.value`) in addition to `gen_ai.*` — any app instrumented with those exporters works out of the box.
 
+## Did the work actually land?
+
+Every other view here answers *what did the agent do*. This one answers **did any of it survive** — because the failure mode nothing else catches is the session that looks green. Reported success, no error badge, and nothing on disk.
+
+Open any session and it carries one plain sentence: *"Changed 12 files — all 12 of those changes are in your code now."* Or, when it matters: *"This session reported work, but nothing it wrote in this project is in your code now."*
+
+It works because AMC sits on the same disk as both the transcripts and the repo. It takes the file paths the session actually wrote, finds the commit that was current when the session started, and runs one read-only diff. Cloud observability has the trace but not your repo; your editor has the repo but no memory of last month.
+
+**The badge is only worth having if it is never wrong**, so the accusing verdict requires positive proof, and everything ambiguous degrades to a plain "can't tell you" with the reason:
+
+- Uncommitted edits sitting in your working tree **count as present** — that's the most ordinary state there is.
+- Work committed on a branch you've since left, and files renamed after the session wrote them, are found and **counted as present**.
+- Gitignored files are dropped from the score rather than counted against it.
+- Sessions that edited no files are **never scored** — research and question-answering runs can't raise a false alarm.
+- Files written outside the project aren't checked, and the sentence says so rather than implying they vanished.
+
+Read-only, always: `log`, `diff`, and `status` only. It never stages, commits, or touches your working tree.
+
+**Anatomy of a failure** is the companion. When a run breaks, instead of handing you a span tree it says what it got stuck on in one line — *"Repeated the same Edit to src/auth.js 4 times, then stopped"*, or *"Ran the same test command 6 times, failing each time."* Deterministic pattern-matching over the event list: no LLM, no schedule. When it can't tell, it says nothing — no caption beats a wrong one.
+
 ## Playbook Studio & the feedback loop
 
 The Board and Timeline tell you what *one run* did. Playbook Studio answers the harder question: **across everything my fleet has ever done, what should I change?** — and then gives you concrete ways to make that change stick in future sessions.
