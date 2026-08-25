@@ -3569,7 +3569,8 @@ function installPaths() {
   return {
     dest: path.join(process.env.LOCALAPPDATA, 'AgentMissionControl'),
     startupVbs: path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'AgentMissionControl.vbs'),
-    desktopUrl: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.url'),
+    desktopUrl: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.url'), // legacy, removed on install
+    desktopLnk: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.lnk'),
   };
 }
 
@@ -3578,7 +3579,7 @@ function installWindows() {
     console.log('--install is Windows-only for now. On Mac/Linux, add "node server.js" to launchd/systemd.');
     process.exit(1);
   }
-  const { dest, startupVbs, desktopUrl } = installPaths();
+  const { dest, startupVbs, desktopUrl, desktopLnk } = installPaths();
   fs.mkdirSync(dest, { recursive: true });
   fs.copyFileSync(__filename, path.join(dest, 'server.js'));
   fs.cpSync(path.join(__dirname, 'public'), path.join(dest, 'public'), { recursive: true });
@@ -3596,9 +3597,71 @@ function installWindows() {
   fs.writeFileSync(startupVbs, vbs);
 
   if (!RELAY_TO) {
+    // The old shortcut was a plain .url: it opened the browser but never STARTED
+    // the service, so clicking it while stopped just produced a connection error
+    // with no clue why. launch.vbs health-checks the port, starts start.vbs if
+    // needed, waits for it to bind, then opens the dashboard.
+    const Q = String.fromCharCode(34);
+    const launch = [
+      'Option Explicit',
+      'Dim sh, fso, here, url, http, i',
+      'Set sh = CreateObject(' + Q + 'WScript.Shell' + Q + ')',
+      'Set fso = CreateObject(' + Q + 'Scripting.FileSystemObject' + Q + ')',
+      'here = fso.GetParentFolderName(WScript.ScriptFullName)',
+      'url = ' + Q + 'http://localhost:' + PORT + Q,
+      'Function IsUp()',
+      '  IsUp = False',
+      '  On Error Resume Next',
+      '  Set http = CreateObject(' + Q + 'MSXML2.ServerXMLHTTP.6.0' + Q + ')',
+      '  http.SetTimeouts 800, 800, 1500, 1500',
+      '  http.Open ' + Q + 'GET' + Q + ', url & ' + Q + '/api/meta' + Q + ', False',
+      '  http.Send',
+      '  If Err.Number = 0 Then IsUp = True',
+      '  On Error GoTo 0',
+      'End Function',
+      'If Not IsUp() Then',
+      '  sh.Run ' + Q + 'wscript ' + Q + Q + Q + ' & here & ' + Q + '\start.vbs' + Q + Q + Q + ', 0, False',
+      '  For i = 1 To 20',
+      '    WScript.Sleep 500',
+      '    If IsUp() Then Exit For',
+      '  Next',
+      'End If',
+      'If IsUp() Then',
+      '  sh.Run url, 1, False',
+      'Else',
+      '  MsgBox ' + Q + 'Agent Mission Control could not start. Try opening ' + Q + ' & url, 48, ' + Q + 'Agent Mission Control' + Q,
+      'End If',
+    ].join('\r\n') + '\r\n';
+    fs.writeFileSync(path.join(dest, 'launch.vbs'), launch);
+
+    // the brand mark, drawn in pure Node so any machine can produce it
+    let iconArg = '';
     try {
-      fs.writeFileSync(desktopUrl, `[InternetShortcut]\r\nURL=http://localhost:${PORT}\r\n`);
-    } catch { /* no Desktop dir */ }
+      const { buildIco } = require(path.join(__dirname, 'tools', 'make-icon.js'));
+      fs.writeFileSync(path.join(dest, 'icon.ico'), buildIco([16, 32, 48, 64, 128, 256]));
+      iconArg = path.join(dest, 'icon.ico') + ',0';
+    } catch { /* no icon: Windows uses its default, the shortcut still works */ }
+
+    try {
+      const mk = path.join(dest, 'mkshortcut.vbs');
+      fs.writeFileSync(mk, [
+        'Dim sh, lnk',
+        'Set sh = CreateObject(' + Q + 'WScript.Shell' + Q + ')',
+        'Set lnk = sh.CreateShortcut(' + Q + desktopLnk + Q + ')',
+        'lnk.TargetPath = ' + Q + 'wscript.exe' + Q,
+        'lnk.Arguments = ' + Q + Q + Q + path.join(dest, 'launch.vbs') + Q + Q + Q,
+        'lnk.WorkingDirectory = ' + Q + dest + Q,
+        iconArg ? 'lnk.IconLocation = ' + Q + iconArg + Q : '',
+        'lnk.Description = ' + Q + 'Agent Mission Control - starts the dashboard if it is not running, then opens it' + Q,
+        'lnk.WindowStyle = 1',
+        'lnk.Save',
+      ].filter(Boolean).join('\r\n') + '\r\n');
+      require('child_process').execFileSync('cscript', ['//nologo', mk], { windowsHide: true, timeout: 15000 });
+      try { fs.unlinkSync(desktopUrl); } catch { /* no legacy shortcut to clean up */ }
+    } catch {
+      // couldn't build a .lnk: fall back to the old behaviour rather than nothing
+      try { fs.writeFileSync(desktopUrl, `[InternetShortcut]\r\nURL=http://localhost:${PORT}\r\n`); } catch { /* no Desktop dir */ }
+    }
   }
 
   require('child_process').spawn('wscript', [path.join(dest, 'start.vbs')], { detached: true, stdio: 'ignore' }).unref();
@@ -3609,8 +3672,9 @@ function installWindows() {
 }
 
 function uninstallWindows() {
-  const { dest, startupVbs, desktopUrl } = installPaths();
-  for (const p of [startupVbs, desktopUrl]) { try { fs.unlinkSync(p); } catch { /* absent */ } }
+  const { dest, startupVbs, desktopUrl, desktopLnk } = installPaths();
+  // both shortcut kinds: the current .lnk and any legacy .url left by an old install
+  for (const p of [startupVbs, desktopUrl, desktopLnk]) { try { fs.unlinkSync(p); } catch { /* absent */ } }
   try { fs.rmSync(dest, { recursive: true, force: true }); } catch { /* absent */ }
   console.log('Uninstalled (a running instance keeps going until logoff/reboot or you end node.exe in Task Manager).');
   process.exit(0);
