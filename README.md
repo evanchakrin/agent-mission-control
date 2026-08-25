@@ -1,6 +1,6 @@
 # Agent Mission Control
 
-**The operator's cockpit for the age of many agents.** One Node server, one page, zero dependencies — a live dashboard that watches every Claude Code, Codex, and OpenTelemetry agent session across every machine you own, tells you what your fleet is actually doing, and turns what it learns into rules your future sessions inherit.
+**Watch every agent session you're running, find the patterns that keep costing you, and write the fix into `CLAUDE.md` so your next session inherits it.**
 
 ![status](https://img.shields.io/badge/deps-none-5eead4) ![node](https://img.shields.io/badge/node-%E2%89%A518-818cf8) ![license](https://img.shields.io/badge/license-MIT-6ee7b7)
 
@@ -11,19 +11,32 @@ npx github:evanchakrin/agent-mission-control
 
 ---
 
-## What we're really building
+## The moment you need this
 
-Coding agents went from "one chat window" to **fleets** — orchestrators spawning subagents, workflows fanning out dozens at a time, the same person running work on three machines at once. The tooling didn't keep up. You can watch *one* session in your terminal; you can't see the fleet, you can't compare last week to this week, and when a run burns \$70 you find out on the invoice.
+**If you can see your agent working, you don't need this.** One agent, one terminal, one window you're already watching — that's a solved problem, and nothing here improves it.
 
-Mission Control is the missing layer: **an analytics and intelligence surface that sits above whatever runs your agents.** It doesn't replace Claude Code or Codex or your orchestrator — it reads the transcripts they already write to disk and gives you the cockpit. It never launches or kills an agent, so it's safe to run against production work. It's self-hosted and dependency-free, so your transcripts never leave your machines.
+**The pain starts the moment agent work leaves the visible terminal.** A subagent comes back with garbage and all you have is a spinner and a token count — no idea which agent went wrong, at which step, or why. A run costs more than the rest of the week combined and you can't see which model ate it. A workflow is grinding through work on the desktop upstairs while you're on the laptop, and you'll find out how it went once it's over.
 
-### The five things it gives you
+If you delegate to subagents, run sessions unattended, or fan work out in parallel, read on.
 
-1. **See the whole fleet, live.** Every session on every machine on one page — orchestrator, subagents, workflow swarms — with real-time status, a topology board, and Gantt timelines built from true tool-call durations. Not a log tail; a control room.
-2. **Know what everything costs — per model, per role, per machine.** Dollar estimates on every session and every agent, so the \$70 sweep is a number you see *while it happens*, not a line on next month's bill.
-3. **Catch failures as failures.** Retrying, stalled, and failed agents are distinguished from healthy-but-slow ones — derived from the transcripts, no instrumentation required. You see *what work* was flowing on each edge, not just that an edge exists.
-4. **Learn from your own history.** Playbook Studio mines your fleet for patterns — which roles keep failing, which burn premium tokens for no reason, which are rock-solid — and hands you fixes you can apply. (How it does this, and why it's honest, is [below](#playbook-studio--the-feedback-loop).)
-5. **Own your data.** Zero dependencies, self-hosted, loopback-gated. Multi-machine relays are outbound-only — a remote machine can send its sessions to your hub but can never reach back in. Your conversations stay yours.
+## What it is
+
+One Node file and one vanilla-JS page. Zero dependencies, MIT, self-hosted, `npx`-installable. It reads the transcripts Claude Code, Codex, and OpenTelemetry agents already write to disk — no instrumentation, no wrapper, no SDK. It never launches, steers, or kills an agent. That's a permanent design stance, not a missing feature, and it's why pointing it at work you care about is safe.
+
+**Two more reasons to leave now.**
+
+- **Costs are estimates.** Token counts times public per-model rates. Not billing — and on Pro or Max you aren't billed per token at all. The dollar figures are a proxy for load, nothing more.
+- **It's single-user, forever.** No login, no roles, no teams, no plan to add them. It's a cockpit for one operator's fleet.
+
+Both surface within ten minutes of installing. Better you hear them here.
+
+## The five things it does, most important first
+
+1. **It writes what it learns back into your repo.** Playbook Studio reads your last ~60 sessions — locally, deterministically, no LLM and no cron, running when you open the tab — and flags things like *this role has never failed and only ever runs on your most expensive model*, or *you fanned out to subagents on the same premium tier, so delegating bought you nothing*. One click turns a finding into a **standing order**: a marker-wrapped block appended to that repo's `CLAUDE.md` or `AGENTS.md`, which every future agent session in that repo reads automatically. Snapshotted, audited, drift-checked, retired in one click. What you learn on Tuesday changes how your agents behave on Wednesday, without you remembering to do anything. Every other view here is a good version of something that exists. This one isn't.
+2. **See the fleet live — one machine or five.** Every session on one page: orchestrator, subagents, workflow swarms, with real-time status, a topology board, and Gantt timelines built from true tool-call durations. Not a log tail; a control room. Relays are outbound-only — a remote box pushes its sessions to your hub and can never reach back in — and standing orders travel the other way as ordinary git commits, so a rule you wrote on the laptop is live on the desktop at the next pull. If you delegate weekly, this is the tab you leave open.
+3. **Failures read as failures.** Retrying, stalled, and failed agents are told apart from healthy-but-slow ones, derived from the transcripts with nothing to instrument. Each edge shows *what work* was flowing across it, not just that it existed.
+4. **Cost, split by model, role, machine, and session.** Estimated, as said above — the split is the useful part. It's how you find out the cheap role has been running on the expensive model all month. That finding is also the raw material for #1.
+5. **Your transcripts never leave hardware you own.** Self-hosted, loopback-gated by default, zero dependencies to audit. The whole thing is one Node file and one page — small enough to read in an afternoon before you trust it.
 
 Everything below is how each of those works.
 
@@ -31,9 +44,7 @@ Everything below is how each of those works.
 
 ## Who it's for
 
-Most dashboard READMEs try to convince everyone. This one tries to disqualify you quickly, because the fit is narrower than the feature list suggests.
-
-**The pain starts the moment agent work leaves the visible terminal.** If you run one agent at a time in one window, you can already see it — you don't need this. Everything below assumes you can't.
+Ranked honestly, smallest promise first. The fit is narrower than the feature list suggests.
 
 ### 1. Solo operators who delegate — the core audience
 
