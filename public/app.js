@@ -951,11 +951,31 @@ function gitRowsHTML(d) {
     </div>`;
   }).join('') + '<button class="mini-btn dir-git-check">↻ re-check</button>';
 }
+// checkbox list for the composer — pulled out so add/remove-root can redraw it in place
+function dirTargetsHTML(targets) {
+  // Two folders can share a basename ("app" under two different projects) and would
+  // render as two identical checkboxes. Name the parent on the ones that collide,
+  // and hang the full path off every row as a tooltip.
+  const seen = {};
+  for (const t of targets) seen[t.label + '|' + t.name] = (seen[t.label + '|' + t.name] || 0) + 1;
+  return targets.map(t => {
+    const parent = seen[t.label + '|' + t.name] > 1 ? (String(t.path || '').split(/[\\/]+/).slice(-3, -2)[0] || '') : '';
+    return `
+        <label class="dir-target" title="${esc(t.path || t.label)}"><input type="checkbox" data-id="${esc(t.id)}"> <b>${esc(t.label)}</b>${parent ? ` <span class="dim">in ${esc(parent)}</span>` : ''} <span class="dim">${esc(t.name)}${t.exists ? '' : ' · will be created'}</span></label>`;
+  }).join('') || '<div class="dim">No known repos yet — open some sessions first so I can learn where your projects live.</div>';
+}
+// owner-added folders list — remove only stops offering it, never touches planted files
+function dirRootsHTML(roots) {
+  if (!roots || !roots.length) return '<div class="dim">No folders added by hand yet.</div>';
+  return roots.map(r => `
+        <div class="dir-root-row${r.ok === false ? ' dir-root-dead' : ''}"><span title="${esc(r.path)}"><b>${esc(r.label || r.path)}</b> <span class="dim">${esc(r.path)}${r.ok === false ? ' — can’t find this folder right now, so it offers nothing' : ''}</span></span><button class="mini-btn dir-root-rm" data-path="${esc(r.path)}">✕ remove</button></div>`).join('');
+}
 function openDirectiveComposer(pre) {
   pre = pre || {};
   const ov = document.createElement('div');
   ov.className = 'pb-editor-ov'; ov.onclick = e => { if (e.target === ov) ov.remove(); };
-  const targets = directiveReg.targets || [];
+  let targets = directiveReg.targets || [];
+  let roots = directiveReg.roots || [];
   ov.innerHTML = `<div class="handle-modal">
     <div class="hm-head"><b>🛰 Plant a standing order</b><button class="mini-btn" id="dcClose">✕</button></div>
     <div class="hm-body">
@@ -966,9 +986,14 @@ function openDirectiveComposer(pre) {
       <textarea id="dcBody" class="dc-body">${esc(pre.body || '')}</textarea>
       <label class="dim">Remind me to review this every <input id="dcReview" type="number" min="1" max="3650" value="${esc(pre.reviewEveryDays || 30)}" style="width:56px"> days</label>
       <div class="hm-m-head" style="margin-top:10px"><b>Where to plant it</b><button class="mini-btn" id="dcAll" style="margin-left:auto">toggle all</button></div>
-      <div class="dir-targets">${targets.map(t => `
-        <label class="dir-target"><input type="checkbox" data-id="${esc(t.id)}"> <b>${esc(t.label)}</b> <span class="dim">${esc(t.name)}${t.exists ? '' : ' · will be created'}</span></label>`).join('') || '<div class="dim">No known repos yet — open some sessions first so I can learn where your projects live.</div>'}
+      <div class="dir-targets" id="dcTargets">${dirTargetsHTML(targets)}</div>
+      <p class="dim" style="margin-top:8px">Only folders you've used Claude Code in show up automatically — add any other project folder here.</p>
+      <div class="dir-root-add">
+        <input id="dcRootPath" type="text" placeholder="full folder path on this computer, e.g. C:\\Users\\you\\GitHub\\my-repo">
+        <button class="mini-btn" id="dcRootAddBtn">＋ Add</button>
       </div>
+      <div id="dcRootErr" class="dim" style="margin-top:4px"></div>
+      <div class="dir-roots" id="dcRootList">${dirRootsHTML(roots)}</div>
       <div id="dcConflict" class="dir-conflict" style="display:none"></div>
       <div id="dcResult" class="dim" style="margin-top:8px"></div>
     </div>
@@ -986,6 +1011,53 @@ function openDirectiveComposer(pre) {
   const resetConfirm = () => { overlapConfirmed = false; ov.querySelector('#dcConflict').style.display = 'none'; ov.querySelector('#dcPlant').textContent = '🛰 Plant'; };
   ov.querySelector('#dcTitle').addEventListener('input', resetConfirm);
   ov.querySelectorAll('.dir-target input').forEach(c => c.addEventListener('change', resetConfirm));
+  // remove-root buttons — rewired each time the roots list is redrawn
+  const wireRootRemove = () => {
+    ov.querySelectorAll('.dir-root-rm').forEach(b => b.onclick = async () => {
+      b.disabled = true;
+      try {
+        const r = await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'remove-root', path: b.dataset.path }) });
+        const j = await r.json();
+        if (!r.ok || j.error) throw new Error(j.error || 'failed');
+        // rules planted there stay live but stop appearing anywhere — say so
+        if (j.stranded) ov.querySelector('#dcRootErr').textContent = `Removed from the list. Note: ${j.stranded} rule${j.stranded === 1 ? ' is' : 's are'} still planted in that folder and stay${j.stranded === 1 ? 's' : ''} active — add the folder back if you want to retire ${j.stranded === 1 ? 'it' : 'them'}.`;
+        await refreshDirTargets();
+      } catch (e) { b.disabled = false; ov.querySelector('#dcRootErr').textContent = 'Failed: ' + e.message; }
+    });
+  };
+  wireRootRemove();
+  // re-fetch the registry and redraw the checkbox list + owner-added-folder list in
+  // place, preserving whatever the owner had already checked — used after add/remove-root
+  const refreshDirTargets = async () => {
+    const checkedIds = new Set([...ov.querySelectorAll('.dir-target input:checked')].map(c => c.dataset.id));
+    await loadDirectiveReg();
+    targets = directiveReg.targets || [];
+    roots = directiveReg.roots || [];
+    ov.querySelector('#dcTargets').innerHTML = dirTargetsHTML(targets);
+    ov.querySelector('#dcRootList').innerHTML = dirRootsHTML(roots);
+    ov.querySelectorAll('.dir-target input').forEach(c => { if (checkedIds.has(c.dataset.id)) c.checked = true; c.addEventListener('change', resetConfirm); });
+    wireRootRemove();
+    resetConfirm();
+  };
+  const rootInput = ov.querySelector('#dcRootPath');
+  const rootErr = ov.querySelector('#dcRootErr');
+  const doAddRoot = async () => {
+    const p = rootInput.value.trim();
+    if (!p) { rootErr.textContent = 'Paste a folder path first.'; return; }
+    const btn = ov.querySelector('#dcRootAddBtn');
+    btn.disabled = true; rootErr.textContent = 'Checking…';
+    try {
+      const r = await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'add-root', path: p }) });
+      const j = await r.json();
+      if (!r.ok || j.error) throw new Error(j.error || "That folder doesn't exist on this computer.");
+      rootInput.value = '';
+      rootErr.textContent = j.note ? 'Already on the list.' : 'Added.';
+      await refreshDirTargets();
+    } catch (e) { rootErr.textContent = e.message; }
+    btn.disabled = false;
+  };
+  ov.querySelector('#dcRootAddBtn').onclick = doAddRoot;
+  rootInput.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); doAddRoot(); } };
   ov.querySelector('#dcPlant').onclick = async () => {
     const ids = [...ov.querySelectorAll('.dir-target input:checked')].map(c => c.dataset.id);
     const title = ov.querySelector('#dcTitle').value.trim();

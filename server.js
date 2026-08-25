@@ -1006,8 +1006,63 @@ function saveDirectives(next) {
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
   fs.renameSync(tmp, DIRECTIVE_FILE);
 }
+// ---------- owner-added folders (the only client-supplied part of the allowlist) ----------
+// The auto-discovered list only knows repos an agent has actually run inside, so
+// most of the owner's folders were unreachable. They can now name a folder here.
+// That makes a client string reach the filesystem, so it is validated to death and
+// re-validated on every use: it must resolve to a real existing directory, it may
+// never live under a .claude tree or AMC's own state dir, and the only thing ever
+// joined onto it is a literal filename from ROOT_FILES below — never a client one.
+const DIRECTIVE_ROOTS_FILE = path.join(STATE_DIR, 'directive-roots.json');
+const ROOT_FILES = ['CLAUDE.md', 'AGENTS.md']; // FIXED basename allowlist. Never widen from a request.
+const ROOT_MAX_LEN = 400, ROOT_LIMIT = 50;
+function loadDirectiveRoots() {
+  try {
+    const v = JSON.parse(fs.readFileSync(DIRECTIVE_ROOTS_FILE, 'utf8'));
+    return { v: 1, roots: (Array.isArray(v.roots) ? v.roots : []).filter(r => r && typeof r.path === 'string') };
+  } catch { return { v: 1, roots: [] }; }
+}
+function saveDirectiveRoots(next) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const tmp = DIRECTIVE_ROOTS_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+  fs.renameSync(tmp, DIRECTIVE_ROOTS_FILE);
+}
+// Windows paths compare case-insensitively — otherwise the de-dupe is bypassable.
+function normRoot(p) { return process.platform === 'win32' ? String(p).toLowerCase() : String(p); }
+// The single gate. Returns the real resolved directory, or null if it is not usable.
+// Used for both storing a root and re-checking a stored one, so a folder that was
+// deleted, replaced by a file, or re-pointed by a symlink stops being a target.
+function safeRoot(raw) {
+  if (typeof raw !== 'string') return null;
+  if (!raw.trim() || raw.length > ROOT_MAX_LEN) return null;   // reject, never truncate — a shorter path is a different folder
+  if (clean(raw, ROOT_MAX_LEN) !== raw) return null;           // NUL/control bytes: reject outright, never scrub into a different path
+  const s = raw.trim();
+  if (!path.isAbsolute(s)) return null;                        // full folder paths only — never relative to wherever the hub was started
+  // A network share is NOT this machine. isAbsolute() and realpath both happily
+  // accept \\server\share, which would let a "standing order" write to another
+  // host over SMB — git-push has to stay the only outward action there is.
+  // (It is also what froze the hub for 21s when a share was unreachable.)
+  if (/^(\\\\|\/\/)/.test(s)) return null;
+  let p;
+  try { p = fs.realpathSync(path.resolve(s)); } catch { return null; }  // must EXIST; realpath defeats symlink games
+  if (/^(\\\\|\/\/)/.test(p)) return null;                     // re-check: a local path can still resolve onto a share
+  try { if (!fs.statSync(p).isDirectory()) return null; } catch { return null; }
+  if (p.split(/[\\/]+/).some(seg => seg.toLowerCase() === '.claude')) return null; // agent config trees are off limits
+  const state = normRoot(path.resolve(STATE_DIR));
+  if (normRoot(p) === state || normRoot(p).startsWith(state + path.sep)) return null; // and AMC's own state
+  // A whole drive is not a project folder, and neither is a system tree — nobody
+  // means "create C:\Windows\System32\CLAUDE.md" when they paste a path.
+  if (normRoot(p) === normRoot(path.parse(p).root)) return null; // p IS the drive / filesystem root
+  const np = normRoot(p);
+  const banned = [process.env.SystemRoot, process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.ProgramData,
+    '/etc', '/usr', '/bin', '/sbin', '/System', '/Library'].filter(Boolean).map(d => normRoot(path.resolve(d)));
+  if (banned.some(d => np === d || np.startsWith(d + path.sep))) return null;
+  return p;
+}
 // Plantable guidance files: one CLAUDE.md per known Claude project cwd
-// (creatable if absent), the global CLAUDE.md, plus any existing AGENTS.md.
+// (creatable if absent), the global CLAUDE.md, any existing AGENTS.md, plus
+// CLAUDE.md/AGENTS.md in each folder the owner added by hand.
 function directiveTargets() {
   const home = os.homedir();
   const targets = [];
@@ -1029,6 +1084,14 @@ function directiveTargets() {
       try { if (fs.statSync(path.join(cwd, 'AGENTS.md')).isFile()) add(label + ' (Codex)', path.join(cwd, 'AGENTS.md'), 'AGENTS.md'); } catch { /* absent */ }
     }
   } catch { /* ignore */ }
+  // Folders the owner added. Re-gated here, not trusted from the store, and the
+  // filename is always a literal out of ROOT_FILES — the root only supplies a dir.
+  for (const r of loadDirectiveRoots().roots) {
+    const root = safeRoot(r.path);
+    if (!root) continue; // moved, deleted, or no longer allowed — silently not offered
+    const label = (path.basename(root) || root).slice(0, 40);
+    for (const name of ROOT_FILES) add(name === 'AGENTS.md' ? label + ' (Codex)' : label, path.join(root, name), name);
+  }
   return targets;
 }
 const dirMarker = id => ({ start: `<!-- mission-control:directive:${id} -->`, end: `<!-- /mission-control:directive:${id} -->` });
@@ -1036,7 +1099,20 @@ function directiveBlock(d) {
   const m = dirMarker(d.id);
   return `\n\n${m.start}\n## 🛰 Standing order: ${d.title}\n_Planted by Agent Mission Control on ${new Date(d.createdAt).toISOString().slice(0, 10)}. Retire it from the dashboard rather than hand-editing this block._\n\n${d.body.trim()}\n${m.end}\n`;
 }
+// A guidance file that is a symlink or a hardlink is really some OTHER file
+// wearing this name: backing it up would copy that file's contents into this
+// folder, and writing through it edits a target we never validated. Refuse.
+function linkedAway(p) {
+  try {
+    const st = fs.lstatSync(p);
+    if (st.isSymbolicLink()) return 'symbolic link';
+    if (st.nlink > 1) return 'hard link';
+  } catch { /* absent = fine, we're creating it */ }
+  return null;
+}
 function plantIntoFile(p, d) {
+  const link = linkedAway(p);
+  if (link) return { status: 'error', error: `that file is a ${link} to somewhere else — edit it directly instead` };
   let cur = '';
   try { cur = fs.readFileSync(p, 'utf8'); } catch { /* new file */ }
   const m = dirMarker(d.id);
@@ -1053,6 +1129,8 @@ function plantIntoFile(p, d) {
   } catch (e) { return { status: 'error', error: e.message }; }
 }
 function retireFromFile(p, id) {
+  const link = linkedAway(p);
+  if (link) return { status: 'error', error: `that file is a ${link} to somewhere else — edit it directly instead` };
   const m = dirMarker(id);
   let cur;
   try { cur = fs.readFileSync(p, 'utf8'); } catch { return { status: 'missing-file' }; }
@@ -1607,7 +1685,9 @@ const server = http.createServer((req, res) => {
   // ---- directive registry (gated CRUD; plants standing orders into guidance files) ----
   if (url.pathname === '/api/directives' && req.method === 'GET') {
     if (!metaGate(req, res)) return;
-    return json(res, { items: loadDirectives().items, targets: directiveTargets() });
+    // `ok:false` = the folder is gone or no longer valid, so it offers no targets;
+    // the UI says so instead of showing a healthy-looking row that does nothing.
+    return json(res, { items: loadDirectives().items, targets: directiveTargets(), roots: loadDirectiveRoots().roots.map(r => ({ ...r, ok: !!safeRoot(r.path) })) });
   }
   if (url.pathname === '/api/directives' && req.method === 'POST') {
     if (!writeGate(req, res)) return;
@@ -1639,6 +1719,30 @@ const server = http.createServer((req, res) => {
           if (d.targets.length) { store.items.push(d); saveDirectives(store); }
           appendAudit({ kind: 'directive-plant', title, targets: d.targets.length });
           return json(res, { ok: true, items: store.items, results });
+        }
+        // ---- owner-added folders (widen the allowlist, one real directory at a time) ----
+        if (b.op === 'add-root') {
+          const p = safeRoot(b.path); // does all the validating — see safeRoot
+          if (!p) throw new Error('I could not find that folder on this computer. Paste the full folder path, not a file.');
+          const roots = loadDirectiveRoots();
+          if (roots.roots.some(r => normRoot(r.path) === normRoot(p))) return json(res, { ok: true, roots: roots.roots, targets: directiveTargets(), note: 'already on the list' });
+          if (roots.roots.length >= ROOT_LIMIT) throw new Error(`You already have ${ROOT_LIMIT} folders on the list — remove one first.`);
+          roots.roots.push({ path: p, label: path.basename(p) || p, addedAt: Date.now() });
+          saveDirectiveRoots(roots);
+          appendAudit({ kind: 'directive-root-add', path: p });
+          return json(res, { ok: true, roots: roots.roots, targets: directiveTargets() });
+        }
+        if (b.op === 'remove-root') { // stops offering the folder; anything already planted stays planted
+          if (typeof b.path !== 'string' || !b.path.trim() || b.path.length > ROOT_MAX_LEN) throw new Error('which folder?');
+          const want = normRoot(path.resolve(clean(b.path, ROOT_MAX_LEN).trim()));
+          const roots = loadDirectiveRoots();
+          const before = roots.roots.length;
+          roots.roots = roots.roots.filter(r => normRoot(r.path) !== want);
+          if (roots.roots.length !== before) { saveDirectiveRoots(roots); appendAudit({ kind: 'directive-root-remove', path: want }); }
+          // Rules planted here stay live but drop out of the target list, so they
+          // vanish from the coverage grid. Say how many, rather than hiding them.
+          const stranded = loadDirectives().items.filter(d => (d.targets || []).some(t => normRoot(t.path) === want || normRoot(t.path).startsWith(want + path.sep))).length;
+          return json(res, { ok: true, roots: roots.roots, targets: directiveTargets(), stranded });
         }
         if (b.op === 'plant-existing') { // coverage matrix: plant an already-existing order into more targets
           const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
