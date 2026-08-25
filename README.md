@@ -29,6 +29,58 @@ Everything below is how each of those works.
 
 ---
 
+## Who it's for
+
+Most dashboard READMEs try to convince everyone. This one tries to disqualify you quickly, because the fit is narrower than the feature list suggests.
+
+**The pain starts the moment agent work leaves the visible terminal.** If you run one agent at a time in one window, you can already see it — you don't need this. Everything below assumes you can't.
+
+### 1. Solo operators who delegate — the core audience
+
+You run Claude Code with subagents, parallel sessions in different terminals, or long unattended runs. A subagent shows you a spinner and a token count; it can't tell you what it was asked to do or why it came back with garbage. What you'd actually use it for:
+
+- *"That subagent returned nonsense — show me the exact task text the orchestrator handed it."*
+- *"This run took 40 minutes. Find the one tool call that ate 11 of them."*
+- *"Is that background session still moving, or did it stall 20 minutes ago — and is that a failure or a retry?"*
+- *"Rank this week's sessions by estimated cost and tell me which project each belongs to."*
+- *"My orchestrator delegated to subagents on the same premium tier — did that delegation actually buy me anything?"*
+- *"Take that finding and write it into this repo's `CLAUDE.md` so the next session inherits it."*
+- *"Scroll back to where it went off the rails three hours ago, without page-up 200 times."*
+
+### 2. Solo operators running agents across several machines
+
+A desktop, a laptop, a VPS. `ssh` + `tmux` shows you one live terminal and nothing else: no history, no cross-machine total, and nothing survives the box being reimaged. Smallest audience here, deepest pain, and the reason this project exists.
+
+- *"One list of everything running right now, on every machine."*
+- *"Did the overnight job on the desktop finish, fail, or wedge — without SSHing in to look."*
+- *"Keep the VPS's raw transcripts on the hub so I still have them after I destroy the box."*
+- *"Which machine keeps producing failed sessions — is this an environment problem, not a prompt problem?"*
+- *"Put my Codex runs and my Claude Code runs in the same list."*
+
+Honest friction: this one is **not** npx-and-done. It's a relay per machine, usually over Tailscale.
+
+### 3. Framework builders already emitting OpenTelemetry
+
+Point an existing exporter at `localhost` and get a topology and a waterfall in about a minute — no docker-compose, no collector config, no account, no signup. Good for the evening you're debugging a CrewAI or LangGraph run. It is **not** a Phoenix or Langfuse replacement: they own evals, datasets, and run-to-run comparison, and none of that exists here. The one thing nobody else gives you is your custom agents and the Claude Code session you wrote them in, on the same screen.
+
+### It's not for you if…
+
+- **You need team access.** Single-user by design — no auth, no RBAC, no multi-tenant, no hosted option. Two people cannot share a board.
+- **You need accurate spend.** Every dollar figure is *estimated* from transcripts at published API rates. On a Pro or Max seat you aren't billed per token, so these describe API-equivalent cost, not your bill. The Anthropic Console is ground truth.
+- **You need to enforce a budget.** This reports; it cannot cap, throttle, or block a run. A gateway like LiteLLM does that, with metered numbers.
+- **You need quota forecasting.** It shows what a session cost afterward, not how long until your window resets. `ccusage` and Claude Code Usage Monitor are better at that.
+- **You need evals, datasets, scoring, or prompt experiments.** None of that is here. Braintrust, LangSmith, Phoenix, and Langfuse are built for it.
+- **Your agents run in the cloud.** Cloud-executed sessions never write transcripts to your disk, so there's nothing to read.
+- **You want to launch, steer, or kill agents from the dashboard.** Watch-only, permanently, on purpose.
+- **You need to redact before sharing.** Replay exports embed the raw session — code, file paths, and anything pasted into the terminal.
+- **You already run Grafana/SigNoz/Datadog with Claude Code's native OTel export.** You have tokens, cost, and latency. What this adds is session structure, replay, and the write-back loop — not the metrics.
+
+### What actually makes it stick
+
+Charts are a first-week novelty; cost is a one-time shock. The thing here that nothing else does is the loop: **Playbook Studio finds a bad delegation pattern in your real history, and Standing Orders writes the fix into your `CLAUDE.md` so every future session inherits it.** That's the reason to keep it open — the rest is a competent version of things that exist elsewhere.
+
+---
+
 ## Quick start
 
 ```bash
