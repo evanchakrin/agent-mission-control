@@ -106,8 +106,8 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .ftable td { padding: 7px 10px; border-bottom: 1px solid var(--panel2); white-space: nowrap; }
 .ftable td.num { text-align: right; }
 .ftable td.tsess { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
-.ftable tr[data-file] { cursor: pointer; }
-.ftable tr[data-file]:hover td { background: var(--panel2); }
+.ftable tr[data-file], .ftable tr[data-i] { cursor: pointer; }
+.ftable tr[data-file]:hover td, .ftable tr[data-i]:hover td { background: var(--panel2); }
 .ftable .fcost { color: var(--accent); } .ftable .ferr { color: var(--red); } .ftable .tdate { color: var(--dim); }
 .ftable .tact { text-align: right; white-space: nowrap; width: 1%; }
 .ftable .row-arch, .ftable .row-menu { background: var(--panel2); border: 1px solid var(--line); color: var(--dim); border-radius: 5px; height: 22px; min-width: 24px; cursor: pointer; font-size: 12px; padding: 0 5px; margin-left: 3px; }
@@ -750,3 +750,27 @@ footer button.on { border-color: var(--accent); color: var(--accent); }
 .rhy-chrono { font-size: 12.5px; line-height: 1.55; max-width: 320px; }
 .rhy-chrono b { color: var(--accent); }
 .rhy-chrono.dim { color: var(--dim); }
+
+/* ---------- unsaved work (ghost files: list + copy only, never a write button) ---------- */
+#unsaved { position: absolute; inset: 0; overflow: auto; padding: 22px; }
+/* same pane contract as every other overview view: own scroll container + padding */
+#trouble, #leaks { position: absolute; inset: 0; overflow: auto; padding: 22px; }
+.uw-note { font-size: 12.5px; line-height: 1.6; color: var(--dim); background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--amber); border-radius: 8px; padding: 12px 15px; margin-bottom: 16px; max-width: 900px; }
+.uw-note b { color: var(--text); }
+.uw-empty { font-size: 13px; line-height: 1.6; color: var(--dim); padding: 24px 4px; max-width: 700px; }
+.uw-table th { cursor: default; } /* nothing here sorts: the list is always newest first */
+.uw-name { color: var(--text); }
+.uw-sub { font-size: 10.5px; color: var(--dim); margin-top: 2px; }
+.uw-repo { color: var(--dim); }
+.uw-sess { max-width: 300px; overflow: hidden; text-overflow: ellipsis; color: var(--accent2); cursor: pointer; }
+.uw-sess:hover { text-decoration: underline; }
+.uw-copy { padding: 3px 9px; font-size: 11px; white-space: nowrap; }
+
+/* ---------- secret leak sentinel (reuses the unsaved-work note/table styling) ---------- */
+/* A quiet panel is the normal result, so the all-clear is styled as reassurance,
+   not as an absence. The fragment is four characters — never a whole key. */
+#leaks { position: absolute; inset: 0; overflow: auto; padding: 22px; }
+.sl-kind { color: var(--amber); }
+.sl-frag { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--dim); background: var(--panel2); border-radius: 5px; padding: 2px 7px; }
+.sl-clear { font-size: 15px; font-weight: 600; color: var(--green); padding: 26px 4px; max-width: 700px; }
+.sl-clear-sub { font-size: 13px; font-weight: 400; line-height: 1.6; color: var(--dim); margin-top: 8px; }

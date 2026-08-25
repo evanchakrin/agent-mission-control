@@ -1179,6 +1179,26 @@ function git(cwd, args) {
     });
   });
 }
+// Same contract as git(), but feeds paths on stdin. Needed because some git
+// subcommands (notably `check-ignore -z`) REFUSE an argv path list and only
+// accept --stdin. Exit 1 is a normal "no matches" answer for check-ignore, so it
+// is reported as ok with empty output rather than as a failure.
+function gitStdin(cwd, args, input) {
+  return new Promise(resolve => {
+    const child = execFile('git', args, {
+      cwd, timeout: GIT_TIMEOUT, windowsHide: true, maxBuffer: 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' },
+    }, (err, stdout, stderr) => {
+      if (!err) return resolve({ ok: true, out: String(stdout), error: null });
+      if (err.code === 1) return resolve({ ok: true, out: String(stdout || ''), error: null }); // "none matched"
+      const raw = err.code === 'ENOENT' ? 'git is not installed on this machine'
+        : err.killed ? 'git took longer than 15 seconds and was stopped'
+          : (stderr || err.message || 'git failed');
+      resolve({ ok: false, out: '', error: clean(String(raw).replace(/\s+/g, ' ').trim(), 400) });
+    });
+    try { child.stdin.end(input); } catch { /* child already gone */ }
+  });
+}
 // Repo root for a planted file. Returns the REASON on failure too — "git isn't
 // installed" and "this folder isn't a repo" are very different sentences to show
 // someone, and collapsing both to null told owners their repos were broken.
@@ -1717,6 +1737,514 @@ async function sessionStickiness(file) {
   return out;
 }
 
+// ---------- unsaved work (files agents made that git has never seen) ----------
+// WHY: "did it stick" asks that about ONE session you already opened. This asks the
+// only question that outlives every run — what did my agents make that isn't safely
+// saved anywhere? A file counts only when git calls it UNTRACKED *and* no commit on
+// any branch has ever mentioned it: the copy on this disk is then the only copy, and
+// nothing but this list would ever tell you it exists.
+// --ignored is deliberately NOT passed, so .gitignore silently removes node_modules,
+// build output and logs for free — the owner already said those don't matter.
+// READ-ONLY, permanently: this walks transcripts and runs `git status` / `git log`.
+// It never stages, commits, moves, or writes anything, and the UI offers no way to.
+// This is the most expensive read in the app (transcript parses + one git fork per
+// repo, plus one per candidate), so it is capped, time-bounded, and cached.
+const UNSAVED_MAX_SESSIONS = 80;   // most recent transcripts scanned, newest first
+const UNSAVED_MAX_PATHS = 400;     // distinct candidate files across every repo
+const UNSAVED_MAX_PER_REPO = 120;  // paths in the single `git status` argv per repo
+const UNSAVED_MAX_HISTORY = 150;   // `git log` probes total — one fork each
+const UNSAVED_SCAN_BUDGET = 6000;  // ms spent reading transcripts before stopping
+const UNSAVED_TTL = 30000;         // this answer moves slowly; the cost does not
+const unsavedCache = { at: 0, value: null };
+let unsavedInflight = null;
+
+// git() trims stdout, which eats the leading space off the FIRST porcelain record
+// (' M file' arrives as 'M file') and made its status column unreadable. A code is
+// always two characters then a space, so a first record whose third character is not
+// a space lost exactly one leading space — put it back rather than mis-read the code.
+// -z, never plain --porcelain: the unescaped form is the only one where a path
+// containing a space survives, and quoted paths matched nothing.
+function porcelainRecords(out) {
+  const raw = String(out || '').split('\0').filter(s => s !== '');
+  const recs = [];
+  for (let i = 0; i < raw.length; i++) {
+    let rec = raw[i];
+    if (i === 0 && rec.length > 2 && rec[1] === ' ' && rec[2] !== ' ') rec = ' ' + rec;
+    if (rec.length < 4 || rec[2] !== ' ') continue;
+    const code = rec.slice(0, 2);
+    if (code[0] === 'R' || code[0] === 'C') i++; // rename/copy emits the OLD name next
+    recs.push({ code, body: rec.slice(3) });
+  }
+  return recs;
+}
+
+async function computeUnsaved() {
+  const all = listSessions();                     // already newest-first
+  const recent = all.slice(0, UNSAVED_MAX_SESSIONS);
+  const cand = new Map();                         // stickKey(path) -> candidate
+  const t0 = Date.now();
+  let scanned = 0;
+
+  for (const meta of recent) {
+    // Reading 80 transcripts can be seconds of work on one thread. Stop on either
+    // budget and SAY SO below, rather than freezing the dashboard for the owner.
+    if (Date.now() - t0 > UNSAVED_SCAN_BUDGET || cand.size >= UNSAVED_MAX_PATHS) break;
+    const full = resolveSessionPath(meta.file);
+    if (!full || !fs.existsSync(full)) continue;
+    let r;
+    try { r = readSession(full); } catch { continue; } // one unreadable transcript must not sink the scan
+    scanned++;
+    let n = 0;
+    for (const p of new Set(r.events
+      .filter(e => e.kind === 'tool-call' && STICK_TOOLS.has(e.tool))
+      .map(stickPathOf).filter(Boolean))) {
+      if (n++ >= STICK_MAX_PATHS || cand.size >= UNSAVED_MAX_PATHS) break;
+      const k = stickKey(p);
+      if (cand.has(k)) continue; // sessions run newest-first, so the newest writer wins
+      cand.set(k, { path: p, sessionFile: meta.file, sessionTitle: meta.title || meta.session });
+    }
+  }
+  const capped = scanned < all.length;
+
+  // A path that is no longer on disk is not unsaved work — it is simply gone, and
+  // there is nothing here for the owner to act on.
+  const alive = [];
+  for (const c of cand.values()) {
+    let st;
+    try { st = fs.statSync(c.path); } catch { continue; }
+    if (!st.isFile()) continue;
+    alive.push({ ...c, sizeBytes: st.size, mtime: st.mtimeMs });
+  }
+
+  // Group by repo root so each project costs ONE `git status`, never one per file.
+  // Roots are cached per folder: most of these paths are siblings.
+  const rootByDir = new Map(), byRepo = new Map();
+  for (const e of alive) {
+    const dk = stickKey(path.dirname(e.path));
+    if (!rootByDir.has(dk)) {
+      const info = await gitRepoRootInfo(e.path);
+      if (info.gitMissing) {
+        return { files: [], gitMissing: true, scannedSessions: scanned, totalSessions: all.length, maxSessions: UNSAVED_MAX_SESSIONS, capped, candidates: alive.length, repos: 0, pathsCapped: false, historyCapped: false };
+      }
+      rootByDir.set(dk, info.root);
+    }
+    const root = rootByDir.get(dk);
+    if (!root) continue;                      // outside every git project: unknowable, so never listed
+    e.repoRoot = root;
+    if (!byRepo.has(root)) byRepo.set(root, []);
+    byRepo.get(root).push(e);
+  }
+
+  const files = [];
+  let historyChecks = 0, pathsCapped = cand.size >= UNSAVED_MAX_PATHS, historyCapped = false;
+  for (const [root, list] of byRepo) {
+    const batch = list.slice(0, UNSAVED_MAX_PER_REPO);
+    if (batch.length < list.length) pathsCapped = true;
+    const st = await git(root, ['-c', 'core.quotepath=false', 'status', '--porcelain', '-z', '--', ...batch.map(e => e.path)]);
+    if (!st.ok) continue;                     // can't read this project right now: say nothing rather than guess
+    // Untracked FOLDERS collapse to "dir/" in this output, hence the prefix branch.
+    const untrackedExact = new Set(), untrackedDirs = [];
+    for (const rec of porcelainRecords(st.out)) {
+      if (rec.code !== '??') continue;
+      const abs = path.normalize(path.join(root, rec.body.replace(/\/$/, '')));
+      if (/\/$/.test(rec.body)) untrackedDirs.push(stickKey(abs + path.sep));
+      else untrackedExact.add(stickKey(abs));
+    }
+    const isUntracked = p => untrackedExact.has(stickKey(p)) || untrackedDirs.some(d => stickKey(p).startsWith(d));
+    for (const e of batch) {
+      if (!isUntracked(e.path)) continue;     // tracked: history has seen it, so it is not a ghost
+      if (historyChecks >= UNSAVED_MAX_HISTORY) { historyCapped = true; break; }
+      historyChecks++;
+      // --all, not HEAD: work committed on a branch that isn't checked out is SAFE,
+      // and calling it lost would be the worst kind of wrong answer.
+      const log = await git(root, ['log', '--all', '--format=%H', '-1', '--', e.path]);
+      if (!log.ok || log.out.trim()) continue;
+      files.push(e);
+    }
+  }
+  files.sort((a, b) => b.mtime - a.mtime);    // newest first: the work still fresh in mind
+
+  return {
+    files: files.map(e => ({
+      path: e.path,
+      repoRoot: e.repoRoot,
+      sizeBytes: e.sizeBytes,
+      mtime: e.mtime,
+      sessionFile: e.sessionFile,
+      sessionTitle: clean(e.sessionTitle, 140),
+    })),
+    gitMissing: false,
+    scannedSessions: scanned,
+    totalSessions: all.length,
+    maxSessions: UNSAVED_MAX_SESSIONS,
+    capped,                                   // older sessions existed but were not looked at
+    candidates: alive.length,                 // files written by those sessions that still exist
+    repos: byRepo.size,
+    pathsCapped,                              // more written files than this scan would check
+    historyCapped,                            // more untracked files than history probes allowed
+  };
+}
+
+// Public entry point. Cached for 30s, and a single in-flight scan is shared: two
+// clicks a second apart must not fork git twice over the same repos.
+async function unsavedWork() {
+  if (unsavedCache.value && Date.now() - unsavedCache.at < UNSAVED_TTL) return unsavedCache.value;
+  if (unsavedInflight) return unsavedInflight;
+  unsavedInflight = computeUnsaved()
+    .then(v => { unsavedCache.at = Date.now(); unsavedCache.value = v; return v; })
+    .finally(() => { unsavedInflight = null; });
+  return unsavedInflight;
+}
+
+// ---------- trouble files (which files agents keep fighting with) ----------
+// WHAT IT ANSWERS: which files do my agents keep fighting with? NOT "did this
+// file ever see an error" — a boolean OR over an all-time bucket only ever goes
+// up, so the files touched the most would turn red forever regardless of how
+// well those sessions actually went. This is a RATE, gated on a minimum sample,
+// the same shape as the Rings/Rhythm "share of runs that went badly" views: a
+// file touched twice, once badly, is two data points, not a 50% problem file.
+// "Went badly" is the exact definition sessionSummary() already scores the whole
+// fleet by (errors > 0 || retrying || stalled) — recomputed inline per session
+// here rather than calling sessionSummary(), since that would reparse a
+// transcript this scan already has open.
+// READ-ONLY, permanently: pure transcript parsing, same STICK_TOOLS/stickPathOf
+// spine "did it stick" and "unsaved work" already use above. No git involved at
+// all — nothing here needs to know what's saved, only what went wrong.
+const TROUBLE_MAX_SESSIONS = 150;  // most recent transcripts scanned, newest first
+const TROUBLE_MIN_SESSIONS = 5;    // gate: a file needs at least this many touches before its rate is shown
+const TROUBLE_MAX_ROWS = 20;       // rows returned to the UI
+const TROUBLE_SCAN_BUDGET = 6000;  // ms spent reading transcripts before stopping
+const TROUBLE_TTL = 30000;         // this answer moves slowly; the scan cost does not
+const troubleCache = { at: 0, value: null };
+
+function computeTroubleFiles() {
+  const all = listSessions();                     // already newest-first
+  const recent = all.slice(0, TROUBLE_MAX_SESSIONS);
+  const t0 = Date.now();
+  let scanned = 0;
+  const byPath = new Map();                        // stickKey(path) -> { path, touches: [...] }
+
+  for (const meta of recent) {
+    // Reading 150 transcripts is real work on one thread. Stop on budget and SAY
+    // SO below, rather than freezing the dashboard for the owner.
+    if (Date.now() - t0 > TROUBLE_SCAN_BUDGET) break;
+    const full = resolveSessionPath(meta.file);
+    if (!full || !fs.existsSync(full)) continue;
+    let r;
+    try { r = readSession(full); } catch { continue; } // one unreadable transcript must not sink the scan
+    scanned++;
+    const touched = new Set(r.events
+      .filter(e => e.kind === 'tool-call' && STICK_TOOLS.has(e.tool))
+      .map(stickPathOf).filter(Boolean));
+    if (!touched.size) continue; // a session that wrote nothing has no file to blame or clear
+    const bad = r.events.some(e => e.error)
+      || r.agents.some(a => a.retrying)
+      || (r.agents.some(a => a.pendingTool && a.pendingTool.since && Date.now() - new Date(a.pendingTool.since) > 120000) && Date.now() - meta.mtime < 600000);
+    for (const p of touched) {
+      const k = stickKey(p);
+      if (!byPath.has(k)) byPath.set(k, { path: p, touches: [] });
+      byPath.get(k).touches.push({ file: meta.file, title: clean(meta.title || meta.session, 140), mtime: meta.mtime, bad });
+    }
+  }
+  const capped = scanned < all.length;
+
+  const files = [...byPath.values()].map(f => {
+    const sessions = f.touches.length;
+    const badSessions = f.touches.filter(t => t.bad).length;
+    // THE GATE: below TROUBLE_MIN_SESSIONS, no rate is computed at all — the row
+    // is shown by volume only, with the UI expected to say "not enough runs to
+    // say yet" rather than print a percentage nobody should trust.
+    const gated = sessions >= TROUBLE_MIN_SESSIONS;
+    f.touches.sort((a, b) => b.mtime - a.mtime); // newest first, for the drill-down
+    return {
+      path: f.path,
+      sessions,
+      badSessions,
+      rate: gated ? Math.round(badSessions / sessions * 100) : null,
+      lastTouched: f.touches[0].mtime,
+      sessionRefs: f.touches,
+    };
+  })
+    // Ranked by volume, never by rate over the whole population — sorting by
+    // rate first is exactly the trap this feature exists to avoid: it would
+    // float a 1-of-1 failure above a file with 40 clean runs and one flub.
+    .sort((a, b) => b.sessions - a.sessions || b.lastTouched - a.lastTouched)
+    .slice(0, TROUBLE_MAX_ROWS);
+
+  return {
+    files,
+    scannedSessions: scanned,
+    totalSessions: all.length,
+    maxSessions: TROUBLE_MAX_SESSIONS,
+    minSessions: TROUBLE_MIN_SESSIONS,
+    capped,             // older sessions existed but were not looked at
+  };
+}
+
+// Public entry point. Cached 30s: this walks up to TROUBLE_MAX_SESSIONS
+// transcripts on every call, so repeated clicks must not repeat that cost.
+function troubleFiles() {
+  if (troubleCache.value && Date.now() - troubleCache.at < TROUBLE_TTL) return troubleCache.value;
+  const out = computeTroubleFiles();
+  troubleCache.at = Date.now();
+  troubleCache.value = out;
+  return out;
+}
+
+// ---------- secret leak sentinel (did an agent write a real credential into a file?) ----------
+// WHAT IT ANSWERS: did one of my agents drop something that looks like a REAL
+// credential into a file? This is a smoke alarm, not a security audit.
+// WHY IT IS THIS NARROW: an earlier version of this design scored strings by
+// entropy and was deliberately cut, because entropy flags every hash, minified
+// bundle, UUID and base64 blob on the disk. A scanner that cries wolf gets
+// ignored, which is worse than not having one, so this recognises ONLY a short
+// list of credential shapes whose PREFIX is unmistakable — the vendor stamps it
+// on the key itself. There is no "high entropy string" rule and no "password="
+// rule, on purpose. It will miss real secrets, and that trade is the point:
+// prefer missing a real one over inventing a fake one.
+// SCOPE: only files the agents themselves wrote, per the transcript record — the
+// same STICK_TOOLS/stickPathOf spine "did it stick", "unsaved work" and "trouble
+// files" already use. Never the whole disk, never a path the browser sent.
+// READ-ONLY, permanently: it reads those files and runs one `git check-ignore`
+// per project. Nothing is written, and nothing is ever changed.
+// THE SECRET ITSELF NEVER LEAVES THIS FUNCTION: the response carries the file,
+// the line number, what KIND of key it looks like, and the first four characters.
+// Nothing is logged, cached to disk, or sent anywhere.
+const LEAK_MAX_SESSIONS = 60;               // most recent transcripts scanned, newest first
+const LEAK_MAX_FILES = 150;                 // files actually opened and read
+const LEAK_MAX_BYTES = 512 * 1024;          // per file: larger than this is a bundle or a blob, not hand-written config
+const LEAK_TOTAL_BYTES = 16 * 1024 * 1024;  // whole scan, so this can never eat the disk
+const LEAK_MAX_PER_FILE = 5;                // one bad file must not fill the whole panel
+const LEAK_MAX_FINDINGS = 60;
+const LEAK_MAX_PER_REPO = 120;              // paths in one `git check-ignore` argv
+const LEAK_SCAN_BUDGET = 6000;              // ms spent reading transcripts before stopping
+const LEAK_TTL = 60000;                     // this answer moves slowly; the scan cost does not
+const leakCache = { at: 0, value: null };
+let leakInflight = null;
+
+// A JWT-shaped triple is only a token if its first part really is a base64url
+// JSON header naming an algorithm. Anything else that happens to have two dots
+// in it — a version string, a filename, a hash — fails here and is dropped.
+function jwtHeaderIsReal(m) {
+  try {
+    const head = m.split('.')[0];
+    const json = Buffer.from(head.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    if (json[0] !== '{') return false;
+    const o = JSON.parse(json);
+    // alg:"none" is the unsigned form — a demo token, never a live credential
+    return !!o && typeof o === 'object' && typeof o.alg === 'string' && o.alg.toLowerCase() !== 'none';
+  } catch { return false; }
+}
+
+// The whole detector. Every rule is a fixed vendor prefix plus an exact length —
+// nothing here is a guess, and nothing here is a heuristic. `kind` is the sentence
+// the owner reads, so it names the service, not the token format.
+const LEAK_RULES = [
+  { id: 'aws', kind: 'An Amazon Web Services key', re: /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g },
+  { id: 'github', kind: 'A GitHub token', re: /\bgh[pousr]_[A-Za-z0-9]{36}\b/g },
+  { id: 'slack', kind: 'A Slack token', re: /\bxox[baprs]-[A-Za-z0-9]{10,48}-[A-Za-z0-9]{10,48}(?:-[A-Za-z0-9]{10,64})?\b/g },
+  { id: 'stripe', kind: 'A Stripe live payment key', re: /\b[sr]k_live_[A-Za-z0-9]{24,64}\b/g },
+  { id: 'google', kind: 'A Google API key', re: /\bAIza[A-Za-z0-9_-]{35}\b/g },
+  // The header ALONE is not a key — parsers, validators, docs and error strings all
+  // contain that literal. Require actual key material after it: at least one line of
+  // 40+ base64 characters before the END marker. Mentions stop matching; real keys don't.
+  { id: 'pem', kind: 'A private key', re: /-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----[\r\n]+(?:[A-Za-z0-9+/=]{40,}[\r\n]+)+/g },
+  { id: 'jwt', kind: 'A signed login token', re: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, confirm: jwtHeaderIsReal },
+];
+
+// Documentation, READMEs and .env.example files are full of correctly-shaped fake
+// keys, and flagging those is exactly how this feature would lose the owner's
+// trust. Tested against the match AND the text immediately around it, because the
+// giveaway is usually the sentence, not the key ("replace this with your own").
+const LEAK_PLACEHOLDER = /EXAMPLE|SAMPLE|PLACEHOLDER|REPLACE|CHANGE[-_ ]?ME|INSERT[-_ ]?YOUR|DUMMY|REDACT|NOT[-_ ]?REAL|FAKE|YOUR[-_]|<|abcdef|1234567890/i;
+// A random key essentially never repeats one character six times; XXXXXX, 000000
+// and aaaaaa are all somebody typing a blank to be filled in later.
+const leakIsPlaceholder = s => LEAK_PLACEHOLDER.test(s) || /(.)\1{5,}/.test(s);
+
+// Folders whose contents nobody wrote by hand: dependencies, build output, git's
+// own storage, and test fixtures — which exist precisely to hold realistic fakes.
+// Tests, docs and examples belong here too: they are full of realistic-looking
+// fakes on purpose, and flagging them is how a scanner teaches you to ignore it.
+const LEAK_NOISE_DIRS = new Set(['node_modules', 'dist', 'build', '.git', 'coverage', 'vendor', '.next', '.nuxt', '.venv', 'site-packages', 'fixtures', '__fixtures__', 'testdata', 'test-fixtures', '__snapshots__',
+  'test', 'tests', '__tests__', 'spec', '__mocks__', 'docs', 'doc', 'examples', 'example', 'samples']);
+// Generated files: lockfiles, minified bundles and source maps are megabytes of
+// machine output where any match is noise by definition.
+// ...and by FILENAME: .env.example / .env.sample / anything.template exists to hold
+// a shaped placeholder, and *.test.* / *.spec.* are tests wherever they happen to sit.
+const LEAK_NOISE_FILES = /^(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|composer\.lock|Cargo\.lock)$|\.min\.[a-z0-9]+$|\.map$|\.(?:example|sample|template|dist)$|^\.env\.(?:example|sample|template)$|\.(?:test|spec)\.[a-z0-9]+$/i;
+function leakIsNoisePath(p) {
+  const segs = p.split(/[\\/]/);
+  const name = segs[segs.length - 1] || '';
+  if (LEAK_NOISE_FILES.test(name)) return true;
+  return segs.slice(0, -1).some(s => LEAK_NOISE_DIRS.has(s));
+}
+
+// Scan ONE file. Returns null when it could not be read, and never returns any of
+// the file's text — only a line number, a kind, and four characters.
+function leakScanFile(p) {
+  let buf;
+  try { buf = fs.readFileSync(p); } catch { return null; }
+  if (buf.includes(0)) return { binary: true, hits: [] }; // a NUL byte means this is not source or config
+  const text = buf.toString('utf8');
+  const hits = [], seen = new Set();
+  for (const rule of LEAK_RULES) {
+    rule.re.lastIndex = 0; // these regexes are /g and module-level: reset before every file
+    let m;
+    while (hits.length < LEAK_MAX_PER_FILE && (m = rule.re.exec(text)) !== null) {
+      const match = m[0];
+      // A window around the match, used ONLY for the placeholder test below. It is
+      // never returned, never logged, and goes out of scope with this iteration.
+      const ls = text.lastIndexOf('\n', m.index) + 1;
+      let le = text.indexOf('\n', m.index);
+      if (le < 0) le = text.length;
+      const around = text.slice(Math.max(ls, m.index - 120), Math.min(le, m.index + match.length + 120));
+      if (leakIsPlaceholder(match) || leakIsPlaceholder(around)) continue;
+      if (rule.confirm && !rule.confirm(match)) continue;
+      const line = text.slice(0, m.index).split('\n').length;
+      const key = rule.id + '@' + line;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      hits.push({ kind: rule.kind, line, fragment: match.slice(0, 4) + '…' });
+    }
+  }
+  return { binary: false, hits };
+}
+
+async function computeLeaks() {
+  const all = listSessions();                     // already newest-first
+  const recent = all.slice(0, LEAK_MAX_SESSIONS);
+  const cand = new Map();                         // stickKey(path) -> candidate
+  const t0 = Date.now();
+  let scanned = 0, skippedNoise = 0;
+
+  for (const meta of recent) {
+    // Reading 60 transcripts is real work on one thread. Stop on either budget and
+    // SAY SO in the response, rather than freezing the dashboard for the owner.
+    if (Date.now() - t0 > LEAK_SCAN_BUDGET || cand.size >= LEAK_MAX_FILES) break;
+    const full = resolveSessionPath(meta.file);
+    if (!full || !fs.existsSync(full)) continue;
+    let r;
+    try { r = readSession(full); } catch { continue; } // one unreadable transcript must not sink the scan
+    scanned++;
+    let n = 0;
+    for (const p of new Set(r.events
+      .filter(e => e.kind === 'tool-call' && STICK_TOOLS.has(e.tool))
+      .map(stickPathOf).filter(Boolean))) {
+      if (n++ >= STICK_MAX_PATHS || cand.size >= LEAK_MAX_FILES) break;
+      const k = stickKey(p);
+      if (cand.has(k)) continue;                  // sessions run newest-first, so the newest writer wins
+      if (leakIsNoisePath(p)) { skippedNoise++; continue; }
+      cand.set(k, { path: p, sessionFile: meta.file, sessionTitle: meta.title || meta.session });
+    }
+  }
+  const capped = scanned < all.length;
+  const filesCapped = cand.size >= LEAK_MAX_FILES;
+
+  // Files that are gone, or too big to be hand-written config, never get opened.
+  const alive = [];
+  let skippedBig = 0;
+  for (const c of cand.values()) {
+    let st;
+    try { st = fs.statSync(c.path); } catch { continue; }
+    if (!st.isFile()) continue;
+    if (st.size > LEAK_MAX_BYTES) { skippedBig++; continue; }
+    alive.push({ ...c, mtime: st.mtimeMs, sizeBytes: st.size });
+  }
+
+  // Group by project so `git check-ignore` costs ONE call per repo, never one per
+  // file. Roots are cached per folder: most of these paths are siblings.
+  const rootByDir = new Map(), byRepo = new Map(), loose = [];
+  for (const e of alive) {
+    const dk = stickKey(path.dirname(e.path));
+    if (!rootByDir.has(dk)) rootByDir.set(dk, (await gitRepoRootInfo(e.path)).root);
+    const root = rootByDir.get(dk);
+    e.repoRoot = root || null;
+    if (!root) { loose.push(e); continue; }       // outside every project: nothing to ask git about
+    if (!byRepo.has(root)) byRepo.set(root, []);
+    byRepo.get(root).push(e);
+  }
+
+  // A file git was told to ignore is one the owner already decided not to share,
+  // so a key in it is not a leak into the codebase. check-ignore exits 1 when
+  // NOTHING matched, which git() reports as a failure — that is the normal case
+  // and simply means nothing here is suppressed.
+  const toScan = loose.slice();
+  let skippedIgnored = 0, skippedUnchecked = 0;
+  for (const [root, list] of byRepo) {
+    const batch = list.slice(0, LEAK_MAX_PER_REPO);
+    // Anything past the cap does not get scanned AT ALL. Scanning a file we could
+    // not ask git about risks flagging a local .env the owner deliberately keeps
+    // out of the repo — which is the exact noise this feature exists to avoid — so
+    // it is dropped and counted, and the panel says how many.
+    skippedUnchecked += list.length - batch.length;
+    // `check-ignore -z` is a FATAL error unless it is paired with --stdin: git
+    // rejects the combination outright, so this call always failed and the whole
+    // gitignore suppression silently did nothing — every ignored file an agent
+    // wrote got scanned and flagged, which is precisely the noise this exists to
+    // stop. Paths go in on stdin (NUL-separated), results come back the same way.
+    const ig = await gitStdin(root, ['-c', 'core.quotepath=false', 'check-ignore', '-z', '--stdin'],
+      batch.map(e => e.path).join('\0'));
+    // exit 1 just means "none of them are ignored" — that is a normal answer, not
+    // a failure. Anything else and we do not know, so nothing is suppressed.
+    const ignored = new Set(String(ig.out || '').split('\0').filter(Boolean).map(s => stickKey(path.normalize(s))));
+    for (const e of batch) {
+      if (ignored.has(stickKey(e.path))) { skippedIgnored++; continue; }
+      toScan.push(e);
+    }
+  }
+
+  toScan.sort((a, b) => b.mtime - a.mtime);       // newest first: the work still fresh in mind
+  const findings = [];
+  let read = 0, bytes = 0, skippedBinary = 0, budgetHit = false;
+  for (const e of toScan) {
+    if (findings.length >= LEAK_MAX_FINDINGS || bytes >= LEAK_TOTAL_BYTES) { budgetHit = true; break; }
+    const r = leakScanFile(e.path);
+    if (!r) continue;
+    read++; bytes += e.sizeBytes;
+    if (r.binary) { skippedBinary++; continue; }
+    for (const h of r.hits) {
+      if (findings.length >= LEAK_MAX_FINDINGS) break;
+      findings.push({
+        path: e.path,
+        repoRoot: e.repoRoot,
+        line: h.line,
+        kind: h.kind,
+        fragment: h.fragment,                     // first four characters and nothing else, ever
+        mtime: e.mtime,
+        sessionFile: e.sessionFile,
+        sessionTitle: clean(e.sessionTitle, 140),
+      });
+    }
+  }
+
+  return {
+    findings,
+    scannedSessions: scanned,
+    totalSessions: all.length,
+    maxSessions: LEAK_MAX_SESSIONS,
+    capped,                                       // older sessions existed but were not looked at
+    filesRead: read,                              // files actually opened and searched
+    filesCapped,                                  // those sessions wrote more files than one pass reads
+    skippedNoise,                                 // dependency/build/fixture folders and generated files
+    skippedBig,                                   // over LEAK_MAX_BYTES
+    skippedBinary,                                // not text
+    skippedIgnored,                               // git was told to ignore them
+    skippedUnchecked,                             // too many in one project to ask git about, so never opened
+    budgetHit,                                    // stopped early on the findings or bytes cap
+  };
+}
+
+// Public entry point. Cached for 60s, and a single in-flight scan is shared: two
+// clicks a second apart must not read every file twice.
+async function secretLeaks() {
+  if (leakCache.value && Date.now() - leakCache.at < LEAK_TTL) return leakCache.value;
+  if (leakInflight) return leakInflight;
+  leakInflight = computeLeaks()
+    .then(v => { leakCache.at = Date.now(); leakCache.value = v; return v; })
+    .finally(() => { leakInflight = null; });
+  return leakInflight;
+}
+
 // ---------- standalone replay export ----------
 
 function buildExport(result, title) {
@@ -2229,6 +2757,36 @@ const server = http.createServer((req, res) => {
     return sessionStickiness(url.searchParams.get('file') || '')
       .then(s => json(res, s))
       .catch(() => json(res, { status: 'unknown', reason: 'Something went wrong while checking this session against your code.' }));
+  }
+
+  // ---- unsaved work: ghost files across the recent fleet (gated read) ----
+  // One fleet-wide scan, cached 30s inside unsavedWork(). No file it names is ever
+  // touched — there is no companion write route here, and there never will be.
+  if (url.pathname === '/api/unsaved' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    return unsavedWork()
+      .then(u => json(res, u))
+      .catch(() => json(res, { files: [], error: 'Something went wrong while looking for work that was never saved.' }));
+  }
+
+  // ---- trouble files: which files agents keep fighting with (gated read) ----
+  // Same session data "unsaved work" already reads, aggregated by path instead
+  // of by session. No git involved. Cached 30s inside troubleFiles().
+  if (url.pathname === '/api/trouble-files' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    try { return json(res, troubleFiles()); }
+    catch { return json(res, { files: [], error: 'Something went wrong while looking for files your agents keep fighting with.' }); }
+  }
+
+  // ---- secret leak sentinel: credential shapes in files agents wrote (gated read) ----
+  // The response carries a kind, a line number and four characters — never the
+  // matched text. There is no companion write route, and nothing is ever written
+  // to disk. Cached 60s inside secretLeaks().
+  if (url.pathname === '/api/leaks' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    return secretLeaks()
+      .then(l => json(res, l))
+      .catch(() => json(res, { findings: [], error: 'Something went wrong while checking your agents’ files for keys.' }));
   }
 
   if (url.pathname === '/api/export') {

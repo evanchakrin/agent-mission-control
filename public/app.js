@@ -20,7 +20,7 @@ const KIND_COLOR = { 'user-text': '#f87171', 'user-queued': '#f87171', 'assistan
 // Tabs that dispatch through setTabs() (own data load, no live feed/footer) rather
 // than render() (which drives the session-detail panes). Declared up top because
 // the home-view preference below needs it before `state` exists.
-const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines', 'fingerprints', 'calendar', 'rings', 'rhythm'];
+const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines', 'fingerprints', 'calendar', 'rings', 'rhythm', 'unsaved', 'trouble', 'leaks'];
 
 // ---------- home-view preference ----------
 // The owner is beta-testing which overview becomes his daily screen (Fingerprints,
@@ -1224,6 +1224,239 @@ function renderRhythm() {
       </div>
     </div>`;
   wireHomeButton($('rhythm'), 'rhythm', renderRhythm);
+}
+
+// ---------- UNSAVED WORK (what your agents made that isn't saved anywhere) ----------
+// WHY: every other view asks how a run went. This asks the only thing that outlives
+// the run — what did my agents make that isn't safely saved anywhere? A file listed
+// here is untracked AND has never appeared in a commit on any branch, so the copy on
+// this computer is the only copy in existence.
+// LIST AND COPY ONLY. There is no save button, no stage button, no delete — this
+// dashboard watches, it never changes the owner's files, and the header says so.
+let unsavedData = null;
+async function loadUnsaved() {
+  $('unsaved').innerHTML = '<div class="fleet-loading">Checking your recent sessions for work that was never saved… (this one takes a moment)</div>';
+  try { unsavedData = await (await fetch('/api/unsaved')).json(); }
+  catch { unsavedData = { error: 'Could not check for unsaved work just now.' }; }
+  renderUnsaved();
+}
+// fmtBytes rounds to the nearest KB, which prints a small note as "0KB" — say the
+// real number instead, because a tiny file is exactly the kind that gets forgotten.
+const uwSize = n => (n < 1000 ? `${n || 0} bytes` : fmtBytes(n));
+// Show the path the way the owner thinks of it: relative to the project folder.
+function uwRel(p, root) {
+  const inside = root && p.length > root.length
+    && (p[root.length] === '\\' || p[root.length] === '/')
+    && p.slice(0, root.length).toLowerCase() === root.toLowerCase();
+  return (inside ? p.slice(root.length + 1) : p).replace(/\\/g, '/');
+}
+function renderUnsaved() {
+  const d = unsavedData || {};
+  const files = d.files || [];
+  // Every reason the list could be incomplete, said out loud. A list of things you
+  // might lose is only trustworthy if it admits what it didn't look at.
+  const older = (d.totalSessions || 0) - (d.scannedSessions || 0);
+  const limits = [
+    d.capped ? `${older} older session${older === 1 ? '' : 's'} weren’t checked` : null,
+    d.pathsCapped ? 'those sessions wrote more files than one pass checks' : null,
+    d.historyCapped ? 'more files were unsaved than one pass could confirm' : null,
+  ].filter(Boolean);
+  const scanNote = d.error ? esc(d.error)
+    : d.gitMissing ? 'git isn’t installed on this computer, so there is no way to tell what has been saved and what hasn’t.'
+      : `Looked through ${d.scannedSessions === 1 ? 'the most recent session' : `the ${d.scannedSessions} most recent sessions`} on this computer${limits.length ? ` — ${esc(limits.join('; '))}, so there may be more` : ''}.`;
+
+  const table = `<div class="table-wrap"><table class="ftable uw-table"><thead><tr>
+      <th>File</th><th>Project</th><th class="num">Last written</th><th class="num">Size</th><th>Made during</th><th class="tact"></th>
+    </tr></thead><tbody>` +
+    files.map((f, i) => {
+      const name = f.path.split(/[\\/]/).pop();
+      const rel = uwRel(f.path, f.repoRoot);
+      return `<tr>
+      <td class="tsess" title="${esc(f.path)}"><div class="uw-name">${esc(name)}</div>${rel === name ? '' : `<div class="uw-sub">${esc(rel)}</div>`}</td>
+      <td class="uw-repo" title="${esc(f.repoRoot || '')}">${esc((f.repoRoot || '').split(/[\\/]/).pop())}</td>
+      <td class="num tdate"><span class="ago ${agoClass(f.mtime)}">${fmtAgo(f.mtime)}</span></td>
+      <td class="num">${esc(uwSize(f.sizeBytes))}</td>
+      <td class="uw-sess" data-file="${esc(f.sessionFile)}" title="open this session">${esc(f.sessionTitle || 'a session')}</td>
+      <td class="tact"><button class="mini-btn uw-copy" data-i="${i}">📋 copy path</button></td>
+    </tr>`;
+    }).join('') + '</tbody></table></div>';
+
+  const empty = `<div class="uw-empty">Nothing is sitting unsaved. Every file your recent agents made is either already saved into a project’s history, or lives in a folder your project was told to ignore.</div>`;
+
+  $('unsaved').innerHTML =
+    `<div class="fleet-head"><h2>Unsaved work — ${files.length} file${files.length === 1 ? '' : 's'} only this computer is holding</h2>
+      <span class="dim">${scanNote}</span>${homeButton('unsaved')}</div>
+     <div class="uw-note">“Not saved anywhere” means your project’s history has never seen this file — it isn’t saved into it, and it isn’t sitting on another branch either. If this computer’s disk went away, so would the file.
+       <b>This is a list and nothing more.</b> Agent Mission Control will never save, move, change, or delete these files for you — copy a path and handle it yourself.</div>
+     ${d.error || d.gitMissing ? '' : files.length ? table : empty}`;
+
+  wireHomeButton($('unsaved'), 'unsaved', renderUnsaved);
+  $('unsaved').querySelectorAll('.uw-copy').forEach(b => b.onclick = () => {
+    const f = files[+b.dataset.i]; if (!f) return;
+    navigator.clipboard.writeText(f.path);
+    const o = b.textContent; b.textContent = '✓ copied'; setTimeout(() => { b.textContent = o; }, 1500);
+  });
+  $('unsaved').querySelectorAll('.uw-sess[data-file]').forEach(el => el.onclick = () => openSession(el.dataset.file));
+}
+
+// ---------- TROUBLE FILES (which files agents keep fighting with) ----------
+// WHY: every other view asks how a RUN went. This asks which FILE keeps costing
+// time, aggregated across the recent fleet — the file a session touched, not the
+// session itself. THE RATE IS THE WHOLE POINT AND THE WHOLE RISK: a file touched
+// twice where one session went badly is a coin flip, not a 50% problem file, so
+// the server already refuses to compute a rate below a minimum sample — this
+// only ever prints the percentage the server sent, never derives its own.
+let troubleData = null;
+let troubleSort = { col: 'sessions', dir: -1 };
+async function loadTrouble() {
+  $('trouble').innerHTML = '<div class="fleet-loading">Looking through your recent sessions for files that keep causing trouble…</div>';
+  try { troubleData = await (await fetch('/api/trouble-files')).json(); }
+  catch { troubleData = { files: [], error: 'Could not check for trouble files just now.' }; }
+  renderTrouble();
+}
+// Same green/amber/red/grey scale as Rings and Rhythm: grey below the sample
+// gate (server sends rate: null), then green under 10%, amber 10–30, red over.
+function tfRateColor(rate) {
+  return rate === null ? 'var(--dim)' : rate > 30 ? 'var(--red)' : rate >= 10 ? 'var(--amber)' : 'var(--green)';
+}
+function renderTrouble() {
+  const d = troubleData || {};
+  const files = (d.files || []).slice();
+  const cols = [
+    { k: 'path', label: 'File', num: false },
+    { k: 'sessions', label: 'Sessions', num: true },
+    { k: 'badSessions', label: 'Went badly', num: true },
+    { k: 'rate', label: 'Rate', num: true },
+    { k: 'lastTouched', label: 'Last touched', num: true },
+  ];
+  const { col, dir } = troubleSort;
+  files.sort((a, b) => {
+    const av = col === 'rate' ? (a.rate ?? -1) : col === 'path' ? a.path : a[col];
+    const bv = col === 'rate' ? (b.rate ?? -1) : col === 'path' ? b.path : b[col];
+    if (typeof av === 'number') return (av - bv) * dir;
+    return String(av || '').localeCompare(String(bv || '')) * dir;
+  });
+
+  const older = (d.totalSessions || 0) - (d.scannedSessions || 0);
+  const scanNote = d.error ? esc(d.error)
+    : `Looked through ${d.scannedSessions === 1 ? 'the most recent session' : `the ${d.scannedSessions} most recent sessions`} on this computer${d.capped ? ` — ${older} older session${older === 1 ? '' : 's'} weren’t checked, so there may be more` : ''}.`;
+
+  const table = `<div class="table-wrap"><table class="ftable"><thead><tr>` +
+    cols.map(c => `<th data-k="${c.k}" class="${c.num ? 'num' : ''} ${col === c.k ? 'sorted' : ''}">${c.label}${col === c.k ? (dir < 0 ? ' ▼' : ' ▲') : ''}</th>`).join('') +
+    `</tr></thead><tbody>` +
+    files.map((f, i) => {
+      const name = f.path.split(/[\\/]/).pop();
+      const dirPart = f.path.slice(0, f.path.length - name.length).replace(/[\\/]$/, '');
+      return `<tr data-i="${i}" title="${esc(f.path)} — click to see which sessions touched it">
+        <td class="tsess"><div class="uw-name">${esc(name)}</div>${dirPart ? `<div class="uw-sub">${esc(dirPart)}</div>` : ''}</td>
+        <td class="num">${f.sessions}</td>
+        <td class="num ${(f.rate !== null && f.badSessions) ? 'ferr' : ''}">${f.badSessions}</td>
+        <td class="num" style="color:${tfRateColor(f.rate)}">${f.rate === null ? 'not enough runs to say yet' : f.rate + '%'}</td>
+        <td class="num tdate"><span class="ago ${agoClass(f.lastTouched)}">${fmtAgo(f.lastTouched)}</span></td>
+      </tr>`;
+    }).join('') + `</tbody></table></div>`;
+
+  const empty = `<div class="uw-empty">No file has been written by more than one of your recent sessions — there's nothing yet to compare.</div>`;
+
+  $('trouble').innerHTML =
+    `<div class="fleet-head"><h2>Trouble files — ${files.length} file${files.length === 1 ? '' : 's'} your agents keep touching</h2>
+      <span class="dim">${scanNote}</span>${homeButton('trouble')}</div>
+     <div class="uw-note">A file's <b>rate</b> is the share of sessions that touched it and went badly (an error, a retry, or a stall) — out of the sessions that touched THAT file, never out of every session ever run. It only shows once a file has been touched at least ${d.minSessions || 5} times; touched less often than that, a file is listed by how much it's used with no rate attached, because too small a sample makes one unlucky run look like a permanently broken file.
+       <b>Click a row</b> to see exactly which sessions touched that file.</div>
+     ${d.error ? '' : files.length ? table : empty}`;
+
+  wireHomeButton($('trouble'), 'trouble', renderTrouble);
+  $('trouble').querySelectorAll('th[data-k]').forEach(th => { th.onclick = () => { const k = th.dataset.k; troubleSort = { col: k, dir: troubleSort.col === k ? -troubleSort.dir : (cols.find(c => c.k === k).num ? -1 : 1) }; renderTrouble(); }; });
+  $('trouble').querySelectorAll('tr[data-i]').forEach(tr => { tr.onclick = () => openTroubleDrilldown(files[+tr.dataset.i]); });
+}
+// Row click -> which sessions touched this file, newest first, each opening it.
+function openTroubleDrilldown(f) {
+  if (!f) return;
+  const ov = document.createElement('div'); ov.className = 'pb-editor-ov'; ov.onclick = e => { if (e.target === ov) ov.remove(); };
+  ov.innerHTML = `<div class="handle-modal">
+    <div class="hm-head"><b>${esc(f.path.split(/[\\/]/).pop())}</b><button class="mini-btn" id="tfClose">✕</button></div>
+    <div class="hm-body"><div class="dim" style="margin-bottom:10px;word-break:break-all">${esc(f.path)}</div>
+      <div class="dim" style="margin-bottom:8px">${f.sessions} session${f.sessions === 1 ? '' : 's'} touched this file${f.badSessions ? ` — ${f.badSessions} of them went badly` : ' — all of them went cleanly'}.</div>
+      ${(f.sessionRefs || []).map(s => `<div class="arch-item" data-file="${esc(s.file)}">
+        <div class="ai-t">${s.bad ? '⚠ ' : ''}${esc(s.title || 'a session')}</div>
+        <div class="ai-m dim">${fmtAgo(s.mtime)}${s.bad ? ' · went badly' : ' · went cleanly'}</div>
+      </div>`).join('')}
+    </div></div>`;
+  document.body.appendChild(ov);
+  ov.querySelector('#tfClose').onclick = () => ov.remove();
+  ov.querySelectorAll('.arch-item[data-file]').forEach(el => el.onclick = () => { ov.remove(); openSession(el.dataset.file); });
+}
+
+// ---------- SECRET LEAK SENTINEL (did an agent write a real key into a file?) ----------
+// WHY: every other view asks how the work went. This asks whether the work left a
+// live credential lying in a file. It is deliberately a SMOKE ALARM, not an audit:
+// the server only recognises a handful of shapes whose vendor prefix is
+// unmistakable, so a quiet panel is the normal, expected result and the copy has to
+// say that plainly rather than imply the whole disk was cleared.
+// THE KEY IS NEVER SENT HERE. The server returns a kind, a line number and the
+// first four characters; there is nothing in this data to leak on screen, and no
+// button here reveals, copies or changes a secret — only the file path.
+let leaksData = null;
+async function loadLeaks() {
+  $('leaks').innerHTML = '<div class="fleet-loading">Reading the files your recent agents wrote, looking for anything shaped like a real key…</div>';
+  try { leaksData = await (await fetch('/api/leaks')).json(); }
+  catch { leaksData = { findings: [], error: 'Could not check your agents’ files for keys just now.' }; }
+  renderLeaks();
+}
+function renderLeaks() {
+  const d = leaksData || {};
+  const hits = d.findings || [];
+  // Every reason the scan saw less than everything, said out loud. A quiet alarm is
+  // only reassuring if it admits exactly how much it actually looked at.
+  const older = (d.totalSessions || 0) - (d.scannedSessions || 0);
+  const limits = [
+    d.capped ? `${older} older session${older === 1 ? '' : 's'} weren’t checked` : null,
+    d.filesCapped ? 'those sessions wrote more files than one pass reads' : null,
+    d.budgetHit ? 'the scan stopped early once it had read enough' : null,
+  ].filter(Boolean);
+  const skips = [
+    d.skippedNoise ? `${d.skippedNoise} in dependency, build or test-fixture folders` : null,
+    d.skippedIgnored ? `${d.skippedIgnored} your project is told to ignore` : null,
+    d.skippedUnchecked ? `${d.skippedUnchecked} in projects with more files than one pass can check` : null,
+    d.skippedBig ? `${d.skippedBig} too big to be hand-written` : null,
+    d.skippedBinary ? `${d.skippedBinary} that ${d.skippedBinary === 1 ? 'isn’t' : 'aren’t'} text` : null,
+  ].filter(Boolean);
+  const scanNote = d.error ? esc(d.error)
+    : `Read ${d.filesRead === 1 ? 'the 1 file' : `all ${d.filesRead || 0} files`} written by ${d.scannedSessions === 1 ? 'your most recent session' : `your ${d.scannedSessions || 0} most recent sessions`}${limits.length ? ` — ${esc(limits.join('; '))}, so there may be more` : ''}.${skips.length ? ` Skipped ${esc(skips.join(', '))}.` : ''}`;
+
+  const table = `<div class="table-wrap"><table class="ftable uw-table"><thead><tr>
+      <th>File</th><th>Looks like</th><th class="num">Line</th><th>Starts with</th><th class="num">Last written</th><th>Written during</th><th class="tact"></th>
+    </tr></thead><tbody>` +
+    hits.map((f, i) => {
+      const name = f.path.split(/[\\/]/).pop();
+      const rel = uwRel(f.path, f.repoRoot);
+      return `<tr>
+      <td class="tsess" title="${esc(f.path)}"><div class="uw-name">${esc(name)}</div>${rel === name ? '' : `<div class="uw-sub">${esc(rel)}</div>`}</td>
+      <td class="sl-kind">${esc(f.kind)}</td>
+      <td class="num">${esc(String(f.line))}</td>
+      <td><code class="sl-frag">${esc(f.fragment)}</code></td>
+      <td class="num tdate"><span class="ago ${agoClass(f.mtime)}">${fmtAgo(f.mtime)}</span></td>
+      <td class="uw-sess" data-file="${esc(f.sessionFile)}" title="open this session">${esc(f.sessionTitle || 'a session')}</td>
+      <td class="tact"><button class="mini-btn uw-copy" data-i="${i}">📋 copy path</button></td>
+    </tr>`;
+    }).join('') + '</tbody></table></div>';
+
+  const empty = `<div class="sl-clear">✓ Nothing that looks like a real key turned up.<div class="sl-clear-sub">None of the files your recent agents wrote contain one of the key shapes listed above. That is the normal, expected result.</div></div>`;
+
+  $('leaks').innerHTML =
+    `<div class="fleet-head"><h2>Secrets — ${hits.length ? `${hits.length} thing${hits.length === 1 ? '' : 's'} worth a look` : 'nothing worth a look'}</h2>
+      <span class="dim">${scanNote}</span>${homeButton('leaks')}</div>
+     <div class="uw-note">This is a <b>smoke alarm, not a security check.</b> It only recognises keys that announce themselves — Amazon Web Services, GitHub, Slack, Stripe live payment keys, Google API keys, private keys, and signed login tokens. Anything else that happens to look random is left alone on purpose, because a warning that is usually wrong is one you stop reading. <b>It will miss things.</b>
+       <br>The key itself is never shown, saved, or sent anywhere — you get the file, the line, and the first four characters, so you can find it yourself. <b>Agent Mission Control will never change, remove, or rotate anything for you.</b></div>
+     ${d.error ? '' : hits.length ? table : empty}`;
+
+  wireHomeButton($('leaks'), 'leaks', renderLeaks);
+  $('leaks').querySelectorAll('.uw-copy').forEach(b => b.onclick = () => {
+    const f = hits[+b.dataset.i]; if (!f) return;
+    navigator.clipboard.writeText(f.path); // the path, never the key
+    const o = b.textContent; b.textContent = '✓ copied'; setTimeout(() => { b.textContent = o; }, 1500);
+  });
+  $('leaks').querySelectorAll('.uw-sess[data-file]').forEach(el => el.onclick = () => openSession(el.dataset.file));
 }
 
 // ---------- PLAYBOOK STUDIO (mine the fleet, generate reusable plays) ----------
@@ -2871,13 +3104,13 @@ function renderFailbar() {
 // ---------- render ----------
 // (OVERVIEW is declared near `state` above — the home-view preference needs it first)
 function setTabs() {
-  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewFingerprints', 'fingerprints'], ['viewCalendar', 'calendar'], ['viewRings', 'rings'], ['viewRhythm', 'rhythm'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewPlaybooks', 'playbooks'], ['viewBrain', 'brain'], ['viewAudit', 'audit'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewBoard', 'board'], ['viewStory', 'story'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
+  for (const [btn, v] of [['viewFleet', 'fleet'], ['viewTable', 'table'], ['viewFingerprints', 'fingerprints'], ['viewCalendar', 'calendar'], ['viewRings', 'rings'], ['viewRhythm', 'rhythm'], ['viewProjects', 'projects'], ['viewUsage', 'usage'], ['viewFlows', 'flows'], ['viewPlaybooks', 'playbooks'], ['viewBrain', 'brain'], ['viewAudit', 'audit'], ['viewConstellation', 'constellation'], ['viewMachines', 'machines'], ['viewUnsaved', 'unsaved'], ['viewTrouble', 'trouble'], ['viewLeaks', 'leaks'], ['viewBoard', 'board'], ['viewStory', 'story'], ['viewLanes', 'lanes'], ['viewWaterfall', 'waterfall'], ['viewCost', 'costflow'], ['viewTimeline', 'timeline']]) {
     const el = $(btn); if (el) el.classList.toggle('on', state.view === v);
   }
   const overview = OVERVIEW.includes(state.view);
   document.querySelector('main').classList.toggle('no-feed', overview);
   $('empty').style.display = 'none'; // only board/timeline turn it back on
-  for (const id of ['fleet', 'tableView', 'fingerprints', 'calendar', 'rings', 'rhythm', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
+  for (const id of ['fleet', 'tableView', 'fingerprints', 'calendar', 'rings', 'rhythm', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines', 'unsaved', 'trouble', 'leaks']) $(id).style.display = (state.view === id.replace('View', '')) ? '' : 'none';
   if (overview) for (const p of SESSION_PANES) $(p).style.display = 'none';
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
@@ -2899,6 +3132,9 @@ function setTabs() {
   else if (state.view === 'audit') loadAudit();
   else if (state.view === 'constellation') loadConstellation();
   else if (state.view === 'machines') loadMachines();
+  else if (state.view === 'unsaved') loadUnsaved();
+  else if (state.view === 'trouble') loadTrouble();
+  else if (state.view === 'leaks') loadLeaks();
 }
 
 function render() {
@@ -3416,6 +3652,9 @@ $('viewBrain').onclick = () => { if (!BAKED) { state.view = 'brain'; setTabs(); 
 $('viewAudit').onclick = () => { if (!BAKED) { state.view = 'audit'; setTabs(); } };
 $('viewConstellation').onclick = () => { if (!BAKED) { state.view = 'constellation'; setTabs(); } };
 $('viewMachines').onclick = () => { if (!BAKED) { state.view = 'machines'; setTabs(); } };
+$('viewUnsaved').onclick = () => { if (!BAKED) { state.view = 'unsaved'; setTabs(); } };
+$('viewTrouble').onclick = () => { if (!BAKED) { state.view = 'trouble'; setTabs(); } };
+$('viewLeaks').onclick = () => { if (!BAKED) { state.view = 'leaks'; setTabs(); } };
 $('viewBoard').onclick = () => { state.view = 'board'; setTabs(); render(); };
 $('viewWaterfall').onclick = () => { state.view = 'waterfall'; setTabs(); render(); };
 $('viewLanes').onclick = () => { state.view = 'lanes'; setTabs(); render(); };
@@ -3451,7 +3690,7 @@ if (BAKED) {
   state.scrub = state.data.events.length;
   document.title = 'Replay — ' + BAKED.title;
   $('spicker').style.display = 'none';
-  for (const id of ['viewFleet', 'viewTable', 'viewFingerprints', 'viewCalendar', 'viewRings', 'viewRhythm', 'viewProjects', 'viewUsage', 'viewFlows', 'viewPlaybooks', 'viewBrain', 'viewAudit', 'viewConstellation', 'viewMachines']) { const el = $(id); if (el) el.style.display = 'none'; }
+  for (const id of ['viewFleet', 'viewTable', 'viewFingerprints', 'viewCalendar', 'viewRings', 'viewRhythm', 'viewProjects', 'viewUsage', 'viewFlows', 'viewPlaybooks', 'viewBrain', 'viewAudit', 'viewConstellation', 'viewMachines', 'viewUnsaved', 'viewTrouble', 'viewLeaks']) { const el = $(id); if (el) el.style.display = 'none'; }
   $('exportBtn').style.display = 'none';
   $('liveBtn').style.display = 'none';
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'replay';
