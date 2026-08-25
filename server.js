@@ -1478,6 +1478,245 @@ function sessionSummary(meta) {
   };
 }
 
+// ---------- did it stick (session -> git) ----------
+// A session can finish GREEN and still leave nothing behind: the edit was undone
+// later, made in a different copy of the folder, or never saved. Nothing else in
+// this dashboard catches that, so this compares the files a session SAID it wrote
+// against what git actually shows changed since the session began.
+// Rules: read-only git only (log, diff, status) through the argv-only git()
+// helper above, never a path the browser sent, and deliberately timid — anything
+// that cannot be proven from evidence comes back 'unknown' with a plain sentence,
+// because a badge that is sometimes wrong is worse than no badge at all.
+const STICK_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']); // the write-style tools
+const STICK_MAX_PATHS = 60;   // hard cap: one git call, never an unbounded argv
+const stickCache = new Map(); // file@mtime -> result (the answer can only change when the file does)
+
+// The file one write-style call targeted, recovered from the event summary.
+// summarizeInput() already reduces Edit/Write/MultiEdit to their file_path;
+// NotebookEdit has no matching key so it arrives as (possibly clipped) JSON.
+// Anything that is not a plain absolute path is dropped rather than guessed at.
+function stickPathOf(evt) {
+  const raw = String(evt.full || evt.text || '').trim();
+  if (!raw) return null;
+  if (raw[0] === '{') {
+    const m = /"(?:file_path|notebook_path)"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw);
+    if (!m) return null;
+    try {
+      const p = JSON.parse('"' + m[1] + '"');
+      return path.isAbsolute(p) ? path.normalize(p) : null;
+    } catch { return null; }
+  }
+  if (raw.endsWith('…')) return null; // clip() truncated it: not a path we can trust
+  return path.isAbsolute(raw) ? path.normalize(raw) : null;
+}
+
+// The folder a session actually worked in. The project slug is lossy, so prefer
+// the cwd this transcript recorded and only fall back to the project's.
+function sessionCwd(sessionPath) {
+  try {
+    const size = fs.statSync(sessionPath).size;
+    const fd = fs.openSync(sessionPath, 'r');
+    const buf = Buffer.alloc(Math.min(16384, size));
+    fs.readSync(fd, buf, 0, buf.length, 0); fs.closeSync(fd);
+    const m = /"cwd":"((?:[^"\\]|\\.)+)"/.exec(buf.toString('utf8'));
+    if (m) return JSON.parse('"' + m[1] + '"');
+  } catch { /* fall through to the project-level answer */ }
+  return claudeProjectCwd(path.dirname(sessionPath));
+}
+
+// Compare on Windows the way Windows does: same file, different capitalisation
+// must not read as "gone". Everywhere else the filesystem is case-sensitive and
+// folding case would invent matches that are not there.
+// macOS is case-insensitive by default too, so folding only on Windows made a
+// path whose capitalisation differed from git's index read as a missing file.
+const stickKey = p => (process.platform === 'win32' || process.platform === 'darwin' ? p.toLowerCase() : p);
+
+async function computeStickiness(sessionPath) {
+  const r = readSession(sessionPath);
+  const wrote = [...new Set(r.events
+    .filter(e => e.kind === 'tool-call' && STICK_TOOLS.has(e.tool))
+    .map(stickPathOf).filter(Boolean))];
+  // Checked before any git runs at all: a research or question-answering session
+  // edited nothing, so there is nothing to score and it must never be badged.
+  if (!wrote.length) return { status: 'not-scored', reason: 'This session did not edit any files.' };
+
+  const startEvt = r.events.find(e => e.ts && !isNaN(new Date(e.ts).getTime()));
+  if (!startEvt) return { status: 'unknown', reason: 'This session has no recorded start time, so there is nothing to compare it against.' };
+  const startIso = new Date(startEvt.ts).toISOString(); // rebuilt from a real Date: never raw transcript text
+
+  const cwd = sessionCwd(sessionPath);
+  if (!cwd) return { status: 'unknown', reason: 'Could not tell which folder this session was working in.' };
+  // gitRepoRootInfo takes a FILE path and looks at the folder around it, so hand
+  // it a nominal child of the working directory. Nothing is read or written there.
+  const { root, gitMissing } = await gitRepoRootInfo(path.join(cwd, '.amc-stickiness-probe'));
+  if (gitMissing) return { status: 'unknown', reason: 'git is not installed on this computer, so there is no history to check this session against.' };
+  if (!root) {
+    const gone = !fs.existsSync(cwd);
+    return {
+      status: 'unknown',
+      reason: gone
+        ? `The folder this session worked in (${clean(cwd, 160)}) is not on this computer any more, so its work cannot be checked.`
+        : 'This session worked in a folder that git does not track, so there is no saved history to compare its work against.',
+    };
+  }
+
+  // Only files inside the repo can be checked against its history. Editing files
+  // elsewhere (global settings, notes) is normal, so this is "cannot tell", not a fail.
+  const inRepo = wrote.filter(p => stickKey(p) === stickKey(root) || stickKey(p).startsWith(stickKey(root + path.sep)));
+  if (!inRepo.length) {
+    return { status: 'unknown', reason: 'Every file this session edited sits outside the project folder git tracks, so there is no history to check it against.' };
+  }
+  const paths = inRepo.slice(0, STICK_MAX_PATHS);
+  const capped = inRepo.length - paths.length;
+
+  // The commit that was current when the session started. No commit before that
+  // moment means there is no "before" picture, so refuse rather than guess.
+  const start = await git(root, ['log', '--before=' + startIso, '-1', '--format=%H']);
+  if (!start.ok) return { status: 'unknown', reason: 'Could not read this project\'s saved history, so this session cannot be checked.' };
+  const startCommit = start.out.split('\n')[0].trim();
+  if (!/^[0-9a-f]{7,40}$/.test(startCommit)) {
+    return { status: 'unknown', reason: 'This project had no saved history yet when the session started, so there is no "before" picture to compare against.' };
+  }
+
+  // ONE diff for every path at once — never one git per file.
+  // -c core.quotepath=false so accented/non-ASCII names come back readable
+  // instead of escaped, which would never match the paths we are holding.
+  const diff = await git(root, ['-c', 'core.quotepath=false', 'diff', '--name-only', startCommit + '..HEAD', '--', ...paths]);
+  if (!diff.ok) return { status: 'unknown', reason: 'Could not compare this session\'s files against your saved history, so it cannot be scored.' };
+  const landedSet = new Set(diff.out.split('\n').map(s => s.trim()).filter(Boolean)
+    .map(rel => stickKey(path.normalize(path.join(root, rel)))));
+
+  const landedPaths = paths.filter(p => landedSet.has(stickKey(p)));
+  let rest = paths.filter(p => !landedSet.has(stickKey(p)));
+
+  // Two things can still explain a file that is missing from that diff, and both
+  // of them mean the badge would otherwise be WRONG, so one more read-only call
+  // settles them together:
+  //   · uncommitted — the change is sitting on disk, not yet saved into history.
+  //     It is in your code right now, which is exactly what was asked.
+  //   · ignored — git was told never to track this file, so no history could
+  //     ever show it. Unknowable, so it is dropped from the score entirely.
+  // Ignored FOLDERS collapse to "dir/" in this output, hence the prefix branch.
+  let pending = [], ignored = [], droppedDeleted = [];
+  if (rest.length) {
+    // -z, NOT plain --porcelain: git C-QUOTES any path containing a space
+    // ("src/two words.js"), and keeping those quotes made the path match nothing,
+    // which reported a file sitting safely in the working tree as vanished. The -z
+    // form is never quoted and separates records with NUL.
+    const st = await git(root, ['-c', 'core.quotepath=false', 'status', '--porcelain', '-z', '--ignored', '--', ...rest]);
+    if (!st.ok) return { status: 'unknown', reason: 'Could not check the current state of this project\'s files, so this session cannot be scored.' };
+    const dirty = new Set(), deleted = new Set(), ignoredExact = new Set(), ignoredDirs = [];
+    const recs = st.out.split('\0').filter(s => s !== '');
+    for (let i = 0; i < recs.length; i++) {
+      const rec = recs[i];
+      if (rec.length < 4) continue;
+      const code = rec.slice(0, 2), body = rec.slice(3);
+      // A rename emits the NEW name in this record and the OLD name in the next
+      // one; consume that extra record so it is not read as its own entry.
+      if (code[0] === 'R' || code[1] === 'R') i++;
+      const abs = path.normalize(path.join(root, body.replace(/\/$/, '')));
+      if (code === '!!') {
+        if (/\/$/.test(body)) ignoredDirs.push(stickKey(abs + path.sep));
+        else ignoredExact.add(stickKey(abs));
+      } else if (code.includes('D')) {
+        deleted.add(stickKey(abs));   // gone from disk: NOT an unsaved change
+      } else dirty.add(stickKey(abs));
+    }
+    const isIgnored = p => ignoredExact.has(stickKey(p)) || ignoredDirs.some(d => stickKey(p).startsWith(d));
+    ignored = rest.filter(isIgnored);
+    rest = rest.filter(p => !isIgnored(p));
+    pending = rest.filter(p => dirty.has(stickKey(p)));
+    rest = rest.filter(p => !dirty.has(stickKey(p)));
+    droppedDeleted = rest.filter(p => deleted.has(stickKey(p)));
+    rest = rest.filter(p => !deleted.has(stickKey(p)));
+  }
+
+  // Before accusing anyone of losing work, look everywhere else it could be.
+  // Work committed on a branch that is not checked out, or a file that was
+  // renamed after the session wrote it, are both SAFE — and both looked identical
+  // to "vanished" when we only compared startCommit..HEAD along a fixed path.
+  let elsewhere = [];
+  if (rest.length) {
+    const anyRef = await git(root, ['log', '--all', '--format=%H', '-1', '--since=' + startIso, '--', ...rest]);
+    const renamed = await git(root, ['log', '--format=%H', '-1', '--follow', '--diff-filter=R', startCommit + '..HEAD', '--', rest[0]]);
+    if (!anyRef.ok || !renamed.ok) {
+      return { status: 'unknown', reason: 'Could not check every place this work might be saved, so this session was not scored.' };
+    }
+    if (anyRef.out.trim() || renamed.out.trim()) {
+      elsewhere = rest.slice();
+      rest = [];
+    }
+  }
+
+  const rel = p => path.relative(root, p).split(path.sep).join('/');
+  const changed = paths.length - ignored.length;
+  if (!changed) {
+    return { status: 'unknown', reason: 'Every file this session edited is one git was told to ignore, so nothing recorded its work and it cannot be checked.' };
+  }
+  const present = landedPaths.length + pending.length + elsewhere.length;
+  // "gone" is an ACCUSATION, so it needs proof, not just absence of evidence.
+  // Anything we could not positively account for — a file deleted from disk after
+  // the run, work found on another branch, a rename we resolved — makes this
+  // "unknown" instead. A badge that is sometimes wrong is worse than no badge.
+  let status = present === 0 ? 'gone' : rest.length === 0 ? 'stuck' : 'partial';
+  if (status === 'gone' && droppedDeleted.length) {
+    return { status: 'unknown', reason: 'Some files this session wrote are no longer on your computer, so there is no way to tell whether its work survived.' };
+  }
+  const notes = [];
+  // Honest about the method, not just the verdict: this compares whole files, so
+  // an edit that was later changed back is indistinguishable from no edit at all.
+  if (status === 'gone') notes.push('Common causes: the work was undone afterwards, or it was done in a different copy of this folder. Unsaved changes on your computer, work saved on another branch, and renamed files are all counted as present, so none of those is the explanation.');
+  if (elsewhere.length) notes.push(`${elsewhere.length === 1 ? 'One file was' : elsewhere.length + ' files were'} saved somewhere other than the branch you have open, or renamed since — counted as present.`);
+  if (droppedDeleted.length) notes.push(`${droppedDeleted.length} ${droppedDeleted.length === 1 ? 'file is' : 'files are'} no longer on your computer, so ${droppedDeleted.length === 1 ? 'it was' : 'they were'} left out.`);
+  if (pending.length) notes.push(pending.length === 1 && changed === 1
+    ? 'That change is on your computer but not yet saved into the project\'s history.'
+    : `${pending.length} of them ${pending.length === 1 ? 'is' : 'are'} changed on your computer but not yet saved into the project's history.`);
+  if (status === 'partial') notes.push(`${rest.length} of ${rest.length === 1 ? 'them looks' : 'them look'} exactly as ${rest.length === 1 ? 'it' : 'they'} did before the session ran.`);
+  if (ignored.length) notes.push(`${ignored.length} more ${ignored.length === 1 ? 'file was' : 'files were'} left out because git is told to ignore ${ignored.length === 1 ? 'it' : 'them'}.`);
+  if (capped) notes.push(`Only the first ${STICK_MAX_PATHS} files were checked; this session touched ${capped} more.`);
+  // The headline only ever speaks about this project — files written elsewhere
+  // were never checked, so it must not imply they are gone too.
+  const outside = wrote.length - inRepo.length;
+  if (outside > 0) notes.push(`${outside} other ${outside === 1 ? 'file was' : 'files were'} written outside this project folder and ${outside === 1 ? 'was' : 'were'} not checked.`);
+
+  return {
+    status,
+    reason: notes.join(' '),
+    changed,                        // files this session wrote that git can actually check
+    landed: present,                // ...that are different now from how they started
+    missing: rest.map(rel),         // ...that are not
+    pending: pending.map(rel),      // ...that changed but are not saved into history yet
+    ignored: ignored.map(rel),      // ...that git is told to ignore, so they were not scored
+    wrote: wrote.length,            // every file it wrote, project or not
+    capped,
+    repoRoot: root,
+    startCommit,
+  };
+}
+
+// Public entry point. Cached per session file + its mtime: the start commit never
+// moves, so the only thing that can change the answer is the transcript growing.
+async function sessionStickiness(file) {
+  const key = String(file || '');
+  if (/^(otel|relay|archive|codex):/.test(key)) {
+    return { status: 'unknown', reason: 'Only sessions recorded by Claude Code on this computer can be checked against your code.' };
+  }
+  const full = resolveSessionPath(key);
+  if (!full || !fs.existsSync(full)) return { status: 'unknown', reason: 'That session is not on this computer, so its work cannot be checked.' };
+  let mtime = 0;
+  try { mtime = fs.statSync(full).mtimeMs; } catch { /* treated as uncached */ }
+  // Keyed on the transcript alone, a "gone" verdict could never clear: the owner
+  // commits the work, the session file never changes again, and the red bar stays
+  // forever. Time-bound the entry so the answer can catch up with the repo.
+  const ck = key + '@' + mtime;
+  const hit = stickCache.get(ck);
+  if (hit && Date.now() - hit.at < 20000) return hit.value;
+  const out = await computeStickiness(full);
+  stickCache.set(ck, { value: out, at: Date.now() });
+  if (stickCache.size > 60) stickCache.delete(stickCache.keys().next().value);
+  return out;
+}
+
 // ---------- standalone replay export ----------
 
 function buildExport(result, title) {
@@ -1977,6 +2216,16 @@ const server = http.createServer((req, res) => {
     const r = getResult(url.searchParams.get('file') || '');
     if (!r) return json(res, { error: 'not found' }, 404);
     return json(res, { ...r, now: Date.now() });
+  }
+
+  // ---- did it stick: one session vs. git (gated read) ----
+  // Fetched lazily, one session at a time. Deliberately NOT part of /api/fleet:
+  // scoring a whole fleet would fork git dozens of times on every refresh.
+  if (url.pathname === '/api/stickiness' && req.method === 'GET') {
+    if (!metaGate(req, res)) return;
+    return sessionStickiness(url.searchParams.get('file') || '')
+      .then(s => json(res, s))
+      .catch(() => json(res, { status: 'unknown', reason: 'Something went wrong while checking this session against your code.' }));
   }
 
   if (url.pathname === '/api/export') {

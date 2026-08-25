@@ -1132,11 +1132,99 @@ function modelTier(model) {
 }
 const TIER_RATE = { flagship: 50, premium: 25, mid: 15, cheap: 5 }; // rough $/Mtok output, for savings math
 
+// ---------- anatomy of a failure (deterministic — no LLM, no statistics) ----------
+// One plain sentence for what a failed/stalled session got stuck on, computed by
+// pure arithmetic over the event list AMC already parses. No caption beats a wrong
+// one, so this returns null the moment the evidence isn't clean rather than guess.
+function diagSig(e) {
+  // stable short form of the key argument so repeats of the same call compare equal
+  const raw = String(e.full || e.text || '').trim().replace(/\s+/g, ' ');
+  return (e.tool || '') + '::' + raw.slice(0, 160);
+}
+function diagTarget(e) {
+  let s = String(e.full || e.text || '').trim().replace(/\s+/g, ' ');
+  if (/[\\/]/.test(s)) { const seg = s.split(/[\\/]/).filter(Boolean); if (seg.length > 2) s = seg.slice(-2).join('/'); }
+  return s.length > 60 ? s.slice(0, 59) + '…' : s;
+}
+function diagnoseFailure(sessionData) {
+  const events = (sessionData && sessionData.events) || [];
+  const calls = events.filter(e => e.kind === 'tool-call' && e.tool);
+  if (calls.length < 2) return null;
+
+  // a long-pending final tool call with no result, and nothing meaningful after it
+  const lastCall = calls[calls.length - 1];
+  const lastIdx = events.indexOf(lastCall);
+  const after = events.slice(lastIdx + 1);
+  const hasResult = lastCall.toolUseId && after.some(e => e.kind === 'tool-result' && e.toolUseId === lastCall.toolUseId);
+  const movedOn = after.some(e => e.kind === 'tool-call' || e.kind === 'assistant-text' || e.kind === 'tool-result');
+  // OTEL sessions never emit tool-result events at all, so "no result" proves
+  // nothing there and every finished trace looked stalled. Without a correlation
+  // id we cannot tell "hung" from "results aren't recorded" — so say nothing.
+  const canSeeResults = events.some(e => e.kind === 'tool-result');
+  if (lastCall.toolUseId && canSeeResults && !hasResult && !movedOn) {
+    return { kind: 'stalled', tool: lastCall.tool, target: diagTarget(lastCall), count: 1 };
+  }
+
+  // runs of consecutive identical call signatures, and whether any call in the
+  // run was answered with an error (that's what turns a loop into a retry storm)
+  const errored = new Set();
+  for (const e of events) if (e.kind === 'tool-result' && e.error && e.toolUseId) errored.add(e.toolUseId);
+  // Repeatedly editing ONE file is ordinary work, not a symptom — and the event
+  // summary collapses every Edit to its file path, so those runs looked identical
+  // when the actual edits differed. Write-style tools are excluded from run
+  // detection entirely. Runs are also scanned PER AGENT: five agents each calling
+  // a tool once is not one agent calling it five times.
+  const WRITEY = /^(edit|write|multiedit|notebookedit)$/i;
+  const runs = [];
+  const byAgent = {};
+  for (const c of calls) (byAgent[c.agent || 'main'] = byAgent[c.agent || 'main'] || []).push(c);
+  for (const seq of Object.values(byAgent)) {
+    for (let i = 0; i < seq.length;) {
+      let j = i + 1;
+      while (j < seq.length && diagSig(seq[j]) === diagSig(seq[i])) j++;
+      const len = j - i;
+      if (len >= 2 && !WRITEY.test(seq[i].tool || '')) {
+        const slice = seq.slice(i, j);
+        const errs = slice.filter(c => c.toolUseId && errored.has(c.toolUseId)).length;
+        runs.push({ len, errs, hasError: errs > 0, allErrored: errs === len, tool: seq[i].tool, target: diagTarget(seq[i]) });
+      }
+      i = j;
+    }
+  }
+  if (!runs.length) return null;
+  // most recent qualifying run — that's what the session was doing right before it stopped
+  const retryRuns = runs.filter(r => r.hasError);
+  if (retryRuns.length) { const r = retryRuns[retryRuns.length - 1]; return { kind: 'retry-storm', tool: r.tool, target: r.target, count: r.len, errs: r.errs, allErrored: r.allErrored }; }
+  const loopRuns = runs.filter(r => r.len >= 3);
+  if (loopRuns.length) { const r = loopRuns[loopRuns.length - 1]; return { kind: 'looping', tool: r.tool, target: r.target, count: r.len }; }
+  return null;
+}
+function failureSentence(diag) {
+  if (!diag) return '';
+  const tool = diag.tool || 'a tool', target = diag.target;
+  if (diag.kind === 'stalled') return `Stopped waiting on ${tool}${target ? ' (' + target + ')' : ''} — no response ever came back.`;
+  // only claim "failing each time" when every call in the run actually errored
+  if (diag.kind === 'retry-storm') return diag.allErrored
+    ? `Ran the same ${tool}${target ? ' — ' + target : ''} ${diag.count} times, failing each time.`
+    : `Ran the same ${tool}${target ? ' — ' + target : ''} ${diag.count} times, failing ${diag.errs} of them.`;
+  if (diag.kind === 'looping') return `Repeated the same ${tool}${target ? ' to ' + target : ''} ${diag.count} times, then stopped.`;
+  return '';
+}
+// does the currently open session actually look broken? (never caption a healthy one)
+function sessionFailed() {
+  const agents = state.data.agents || [];
+  const evs = state.data.events || [];
+  const now = state.data.now || Date.now();
+  if (evs.some(e => e.error)) return true;
+  return agents.some(a => a.lastErrored || a.retrying || (a.pendingTool && a.pendingTool.since && now - new Date(a.pendingTool.since) > 120000));
+}
+
 function mineFleet() {
   const data = flowsCache || [];
   const norm = n => String(n || '').replace(/\s*#\d+$/, '').replace(/[0-9a-f-]{12,}/g, '·').slice(0, 30);
   const roles = new Map();
   const sessions = [];
+  const insights = []; // built up while walking sessions below, and again after
   const models = new Map(); // model -> {agents, cost, outTok, roles:Set}
   const isTop = t => t === 'flagship' || t === 'premium';
   for (const { s, d } of data) {
@@ -1146,7 +1234,15 @@ function mineFleet() {
     const subTopCost = subs.reduce((n, a) => n + (isTop(modelTier(a.model)) ? (a.cost || 0) : 0), 0);
     const mainCost = main ? (main.cost || 0) : 0;
     const topCost = subTopCost + (main && isTop(modelTier(main.model)) ? mainCost : 0);
-    sessions.push({ s, agents: d.agents.length, errors: d.events.filter(e => e.error).length, mainCost, subCost, subTopCost, topCost, roles: subs.map(a => norm(a.name)) });
+    const sessErrors = d.events.filter(e => e.error).length;
+    sessions.push({ s, agents: d.agents.length, errors: sessErrors, mainCost, subCost, subTopCost, topCost, roles: subs.map(a => norm(a.name)) });
+    // anatomy of a failure: only for sessions that actually broke, and only
+    // when the arithmetic finds real evidence — never a caption on a guess
+    const broke = sessErrors > 0 || s.stalled || s.retrying || d.agents.some(a => a.lastErrored);
+    if (broke) {
+      const diag = diagnoseFailure(d);
+      if (diag) insights.push({ key: 'diag:' + s.session, sev: 'bad', icon: '💥', text: `"${(s.title || s.session.slice(0, 8)).slice(0, 40)}" — ${failureSentence(diag)}`, file: s.file });
+    }
     for (const a of d.agents) {
       if (a.model) {
         const mm = models.get(a.model) || { agents: 0, cost: 0, outTok: 0, roles: new Set(), tier: modelTier(a.model) };
@@ -1166,8 +1262,8 @@ function mineFleet() {
       roles.set(key, r);
     }
   }
-  // insights (rule-based, plain-language)
-  const insights = [];
+  // insights (rule-based, plain-language) — role/economics insights, added to the
+  // per-session failure diagnoses already pushed into `insights` above
   for (const [name, r] of roles) {
     if (r.n >= 3 && r.clean / r.n < 0.7) insights.push({ key: 'failrole:' + name, sev: 'bad', icon: '🛠', text: `"${name}" fails ${Math.round((1 - r.clean / r.n) * 100)}% of the time (${r.n} runs). Its prompt or task definition needs work — open a failed run and read what goes wrong.`, file: r.example?.file, detail: { role: name, runs: r.n, clean: r.clean, byMachine: r.byMachine, models: r.models } });
     const machines = Object.entries(r.byMachine).filter(([, v]) => v.n >= 2);
@@ -2113,6 +2209,7 @@ function connect(file) {
   stopPlay();
   state.live = true; $('liveBtn').classList.add('on');
   $('liveDot').className = 'dot'; $('liveLabel').textContent = 'connecting…';
+  loadStickiness(file); // lazy, one session at a time — never on fleet load
   const es = new EventSource('/api/stream?file=' + encodeURIComponent(file));
   state.es = es;
   es.onmessage = m => {
@@ -2190,6 +2287,67 @@ const fmtAgo = t => {
 };
 const agoClass = t => { const h = (Date.now() - t) / 3.6e6; return h < 6 ? 'ago-fresh' : h < 72 ? 'ago-recent' : 'ago-stale'; };
 
+// ---------- did it stick (is this session's work still in the code?) ----------
+// An agent can report success and leave nothing behind. Asked once per opened
+// session, never for the whole fleet — the server has to run git to answer, so
+// scoring every card on every refresh would be dozens of git runs a minute.
+// A session that edited nothing, or that the server could not prove either way,
+// gets a plain sentence or nothing at all — never a scary badge.
+let stickState = { file: null, data: null };
+async function loadStickiness(file) {
+  stickState = { file, data: null };
+  renderStickbar();
+  if (BAKED) return; // exported replay: no server to ask, and no repo to ask about
+  try {
+    const d = await (await fetch('/api/stickiness?file=' + encodeURIComponent(file))).json();
+    if (stickState.file !== file) return; // opened something else while we waited
+    stickState.data = d;
+  } catch { /* stay silent rather than guess */ }
+  renderStickbar();
+}
+function stickSentence(d) {
+  const n = d.changed, miss = (d.missing || []).length;
+  const files = n === 1 ? '1 file' : `${n} files`;
+  if (miss === 0) return `Changed ${files} — ${n === 1 ? 'that change is' : `all ${n} of those changes are`} in your code now.`;
+  if (d.landed === 0) return `Changed ${files} — ${n === 1 ? 'that change is not' : 'none of those changes are'} in your code now.`;
+  return `Changed ${files} — ${d.landed} of those changes ${d.landed === 1 ? 'is' : 'are'} in your code now, ${miss} ${miss === 1 ? 'is' : 'are'} not.`;
+}
+function renderStickbar() {
+  const bar = $('stickbar');
+  const d = stickState.data;
+  if (!d || OVERVIEW.includes(state.view)) { bar.style.display = 'none'; return; }
+  const scored = d.status === 'stuck' || d.status === 'partial' || d.status === 'gone';
+  if (!scored) {
+    // 'unknown' / 'not-scored': the plain reason, no colour, no verdict
+    if (!d.reason) { bar.style.display = 'none'; return; }
+    bar.className = '';
+    bar.innerHTML = `<span class="stick-note">${esc(d.reason)}</span>`;
+    bar.style.display = '';
+    return;
+  }
+  const names = (d.missing || []).slice(0, 4).map(p => esc(p.split('/').pop()));
+  const more = (d.missing || []).length - names.length;
+  bar.className = d.status === 'gone' ? 'stick-bad' : d.status === 'partial' ? 'stick-partial' : 'stick-good';
+  bar.innerHTML =
+    `<div><b>${d.status === 'gone' ? 'This session reported work, but nothing it wrote in this project is in your code now.' : esc(stickSentence(d))}</b></div>` +
+    `<div class="stick-note">${d.status === 'gone' ? esc(stickSentence(d)) + ' ' : ''}` +
+    (names.length ? `Unchanged: ${names.join(', ')}${more > 0 ? ` and ${more} more` : ''}. ` : '') +
+    `${esc(d.reason || '')}</div>`;
+  bar.style.display = '';
+}
+
+// one plain sentence on what a broken session got stuck on — reuses the same
+// deterministic detector Playbook Studio uses, computed client-side (no fetch)
+function renderFailbar() {
+  const bar = $('failbar');
+  if (!bar) return;
+  if (OVERVIEW.includes(state.view) || !state.data.events.length || !sessionFailed()) { bar.style.display = 'none'; return; }
+  const diag = diagnoseFailure(state.data);
+  if (!diag) { bar.style.display = 'none'; return; }
+  bar.innerHTML = `💥 ${esc(failureSentence(diag))}`;
+  bar.style.display = '';
+}
+
 // ---------- render ----------
 const OVERVIEW = ['fleet', 'table', 'projects', 'usage', 'flows', 'playbooks', 'brain', 'audit', 'constellation', 'machines'];
 function setTabs() {
@@ -2204,6 +2362,8 @@ function setTabs() {
   $('feed').style.display = overview ? 'none' : '';
   document.querySelector('footer').style.display = overview ? 'none' : '';
   $('statbar').style.display = overview ? 'none' : '';
+  renderStickbar(); // hides itself on the overview tabs
+  renderFailbar(); // ditto
   stopConstellation();
   if (state.view === 'fleet') loadFleet();
   else if (state.view === 'table') loadTable();
@@ -2220,6 +2380,8 @@ function setTabs() {
 function render() {
   if (OVERVIEW.includes(state.view)) return;
   renderStatbar();
+  renderStickbar();
+  renderFailbar();
   if (state.view === 'board') renderBoard();
   else if (state.view === 'waterfall') renderWaterfall();
   else if (state.view === 'lanes') renderLanes();
