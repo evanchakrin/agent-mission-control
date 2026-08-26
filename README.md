@@ -282,7 +282,7 @@ node server.js --token <secret>
 npx github:evanchakrin/agent-mission-control --relay http://<hub-ip>:4173 --token <secret> --name office-pc
 ```
 
-Relayed sessions appear in the hub's Fleet labeled `⇄ <machine>`. The token guards both `/v1/relay` and `/v1/traces`; open TCP port 4173 on the hub's firewall for remote machines. **Relays are outbound-only by design** — the hub never opens a connection back to a relay, so a relayed machine exposes no inbound surface.
+Relayed sessions appear in the hub's Fleet labeled `⇄ <machine> · <project>` — the relay sends the project each session actually ran in (`proj: {slug, cwd}` on the POST body), and the machine stays in front of it so two machines with a folder of the same name never merge into one project. A relay too old to send that field falls back to `⇄ <machine>`, exactly as before. The token guards both `/v1/relay` and `/v1/traces`; open TCP port 4173 on the hub's firewall for remote machines. **Relays are outbound-only by design** — the hub never opens a connection back to a relay, so a relayed machine exposes no inbound surface.
 
 ### Full-transcript archive (optional)
 

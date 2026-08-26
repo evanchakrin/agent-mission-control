@@ -163,7 +163,7 @@ function renderPicker(filter = '') {
   const q = filter.toLowerCase();
   const items = sessionsCache
     .filter(s => !(s.stableKey && metaMap[s.stableKey] && metaMap[s.stableKey].archived)) // active only
-    .filter(s => !q || ((s.title || '') + ' ' + (s.machine || '') + ' ' + s.project).toLowerCase().includes(q))
+    .filter(s => !q || ((s.title || '') + ' ' + (s.machine || '') + ' ' + machineLabel(s.machine) + ' ' + s.project).toLowerCase().includes(q))
     .slice(0, 80);
   $('spickerList').innerHTML = items.map(s => {
     const col = kindColor(s.kind);
@@ -173,7 +173,7 @@ function renderPicker(filter = '') {
       <div class="sp-title">${m.pinned ? '★ ' : ''}${esc(s.title || s.session.slice(0, 8))}</div>
       <div class="sp-meta"><span class="kind-badge" style="background:${col}22;color:${col}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span>
         ${proj ? `<span class="mini-badge" style="background:${proj.color}22;color:${proj.color}">${esc(proj.name)}</span>` : ''}
-        <span>${esc(s.machine || '')}</span><span class="ago ${agoClass(s.mtime)}">${fmtAgo(s.mtime)}</span>${s.agentCount ? `<span>${s.agentCount} agents</span>` : ''}</div>
+        <span title="${esc(machineTitle(s.machine))}">${esc(machineLabel(s.machine))}</span><span class="ago ${agoClass(s.mtime)}">${fmtAgo(s.mtime)}</span>${s.agentCount ? `<span>${s.agentCount} agents</span>` : ''}</div>
     </div>`;
   }).join('') || '<div class="sp-empty">no active sessions match</div>';
   $('spickerList').querySelectorAll('.sp-item').forEach(el => el.onclick = () => { closePicker(); openSession(el.dataset.file); });
@@ -202,13 +202,20 @@ let metaTags = [];
 let metaCsrf = null;
 let metaVersion = -1;
 let metaReadOnly = false;
+let metaMachineNames = {}; // real machine name -> friendly display name
 async function loadMeta() {
   try {
     const m = await (await fetch('/api/meta')).json();
     metaMap = m.sessions || {}; metaProjects = m.projects || []; metaTags = m.tags || [];
     metaCsrf = m.csrf; metaVersion = m.metaVersion; metaReadOnly = !!m.readOnly;
+    metaMachineNames = m.machineNames || {};
   } catch { /* first load may race boot */ }
 }
+// Friendly label for a machine, everywhere one is shown — falls back to the
+// real name when no rename has been set. Real name always stays available in
+// a tooltip (machineTitle) so nothing becomes untraceable.
+function machineLabel(name) { return metaMachineNames[name] || name || ''; }
+function machineTitle(name) { const d = metaMachineNames[name]; return d ? `real name: ${name}` : ''; }
 function metaOf(s) { return (s && s.stableKey && metaMap[s.stableKey]) || {}; }
 function projectById(id) { return metaProjects.find(p => p.id === id); }
 async function metaPost(path, body) {
@@ -251,7 +258,7 @@ $('soInput').onkeydown = async e => {
   $('soResults').innerHTML = data.hits.length
     ? `<div class="so-count">${data.hits.length} hits across ${data.scanned} sessions</div>` + data.hits.map(h => `
       <div class="so-hit" data-file="${esc(h.file)}" data-seq="${h.seq}" style="border-left:3px solid ${kindColor(h.kind)}">
-        <div class="so-t">${esc((h.title || '').slice(0, 60))} <span class="dim">· ${esc(h.machine)} · ${fmtAgo(h.mtime)}${h.tool ? ' · ' + esc(h.tool) : ''}</span></div>
+        <div class="so-t">${esc((h.title || '').slice(0, 60))} <span class="dim">· ${esc(machineLabel(h.machine))} · ${fmtAgo(h.mtime)}${h.tool ? ' · ' + esc(h.tool) : ''}</span></div>
         <div class="so-s">${esc(h.snippet)}</div>
       </div>`).join('')
     : `<div class="sp-empty">no matches in ${data.scanned} sessions</div>`;
@@ -303,7 +310,7 @@ function startNotifications() {
     notifTimer = setInterval(pollNotifications, 15000);
   });
 }
-const machineSeen = new Map(); // name -> wasFresh
+const machineSeen = new Map(); // name -> wasQuiet (learned-rhythm silence, not a flat timeout)
 let updateNotified = false, budgetNotifiedDay = null;
 async function pollNotifications() {
   let fleet;
@@ -325,14 +332,22 @@ async function pollNotifications() {
     }
     notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: nowActive, stalled: s.stalled });
   }
-  // machine silence: a live machine stopped reporting
+  // machine silence: a live machine broke its OWN normal check-in rhythm.
+  // Uses the same learned-rhythm signal as the Machines view — a flat timeout
+  // can't tell a machine that just broke its rhythm from one that's merely
+  // between check-ins (that used to fire a false "went silent" bell for any
+  // machine that only reports occasionally). The bell fires once on the
+  // transition into quiet; the persistent banner (renderMachineWarnBar) stays
+  // up the whole time it's true, so seeing it never depends on the tab being
+  // open at the exact moment the line was crossed.
   try {
     const ms = await (await fetch('/api/machines')).json();
+    renderMachineWarnBar(ms);
     for (const m of ms.filter(x => x.remote)) {
-      const freshNow = Date.now() - m.lastSeen < 600000; // 10 min: tolerant of relays that predate the boot-poll heartbeat
+      const isQuiet = !!(m.quiet && m.quiet.quiet);
       const was = machineSeen.get(m.name);
-      if (was === true && !freshNow) pushNotif('error', 'machine went silent — relay stopped reporting', { title: m.name, file: '', machine: m.name, kind: 'claude', session: m.name });
-      machineSeen.set(m.name, freshNow);
+      if (was === false && isQuiet) pushNotif('error', `hasn't checked in for ${fmtDurWords(m.quiet.silenceMs)} — usually every ${fmtDurWords(m.quiet.medianGapMs)}`, { title: machineLabel(m.name), file: '', machine: m.name, kind: 'claude', session: m.name });
+      machineSeen.set(m.name, isQuiet);
     }
   } catch { /* ignore */ }
   // update available (once per page load) — name each stale instance + action
@@ -365,7 +380,7 @@ function pushNotif(type, msg, s) {
   if (notifs.length > 40) notifs.pop();
   renderBell();
   if ('Notification' in window && Notification.permission === 'granted') {
-    try { new Notification(`${type === 'error' ? '⚠️' : '✅'} ${n.title}`, { body: `${msg} · ${n.machine || ''}`, silent: type !== 'error' }); } catch { /* blocked */ }
+    try { new Notification(`${type === 'error' ? '⚠️' : '✅'} ${n.title}`, { body: `${msg} · ${n.machine ? machineLabel(n.machine) : ''}`, silent: type !== 'error' }); } catch { /* blocked */ }
   }
 }
 function renderBell() {
@@ -376,7 +391,7 @@ function renderBell() {
   $('notifList').innerHTML = notifs.length ? notifs.map(n => `
     <div class="notif ${n.type}" data-file="${esc(n.file)}">
       <span class="ni">${n.type === 'error' ? '⚠️' : '✅'}</span>
-      <div><div class="nt">${esc(n.title)}</div><div class="nm">${esc(n.msg)} · ${esc(n.machine || '')}</div></div>
+      <div><div class="nt">${esc(n.title)}</div><div class="nm">${esc(n.msg)} · ${esc(machineLabel(n.machine))}</div></div>
       <span class="ndot" style="background:${kindColor(n.kind)}"></span>
     </div>`).join('') : '<div class="notif-empty">No alerts yet. Errors and finished long runs show here.</div>';
   $('notifList').querySelectorAll('.notif[data-file]').forEach(el => el.onclick = () => { $('notifPanel').classList.remove('open'); if (el.dataset.file) openSession(el.dataset.file); });
@@ -438,11 +453,16 @@ function renderFleet() {
     `<div class="fleet-grid">` + shown.map(s => {
       const col = kindColor(s.kind);
       const m = metaOf(s);
+      // machine · project, with the project half dropped when it IS the machine
+      // (a relay too old to name projects) so the line never says it twice. The
+      // inline strip this used to do ate the leading "C" of a Windows slug —
+      // cleanProjLabel() is the one place that gets that order right.
+      const proj = cleanProjLabel(s.project, s.machine);
       return `
       <div class="fcard${m.archived ? ' is-archived' : ''}" data-file="${esc(s.file)}" data-sk="${esc(s.stableKey || '')}" draggable="true" style="border-left:3px solid ${col}">
         ${s.stableKey ? `<div class="fcard-actions"><button class="fcard-arch" title="${m.archived ? 'unarchive' : 'archive'}">${m.archived ? '⤴' : '🗄'}</button><button class="fcard-menu" title="organize">⋯</button></div>` : ''}
         <h3>${esc(s.title || s.session.slice(0, 8))}</h3>
-        <div class="fproj"><span class="kind-badge" style="background:${col}22;color:${col}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span> ${esc(s.machine || '')} · ${esc(s.project.replace(/^[Cc⇄]+\s?[·]?\s?/, '').replace(/^[Cc]--Users-[^-]+-/, ''))}</div>
+        <div class="fproj"${s.projPath ? ` title="${esc(s.projPath)}"` : ''}><span class="kind-badge" style="background:${col}22;color:${col}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span> <span${machineTitle(s.machine) ? ` title="${esc(machineTitle(s.machine))}"` : ''}>${esc(machineLabel(s.machine))}</span>${proj && proj !== s.machine ? ' · ' + esc(proj) : ''}</div>
         ${cardBadges(s) ? `<div class="fbadges">${cardBadges(s)}</div>` : ''}
         ${modelChips(s)}
         <div class="fstats">
@@ -493,7 +513,7 @@ function fleetControls(shownN, totalN, agents, cost) {
     <div class="seg" id="kindSeg">${kinds.map(k => `<button data-k="${k}" class="${fleetKind === k ? 'on' : ''}" ${k !== 'all' ? `style="--c:${kindColor(k)}"` : ''}>${k === 'all' ? 'All' : AGENT_KIND[k].label}</button>`).join('')}</div>
     <div class="seg" id="archSeg">${arch.map(([v, l]) => `<button data-a="${v}" class="${fleetArchived === v ? 'on' : ''}">${l}</button>`).join('')}</div>
     <select id="projSel"><option value="all">all projects</option><option value="unassigned" ${fleetProject === 'unassigned' ? 'selected' : ''}>unassigned</option>${metaProjects.map(p => `<option value="${esc(p.id)}" ${fleetProject === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>
-    <select id="machineSel"><option value="all">all machines</option>${machinesInFleet.map(m => `<option value="${esc(m)}" ${fleetMachine === m ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select>
+    <select id="machineSel"><option value="all">all machines</option>${machinesInFleet.map(m => `<option value="${esc(m)}" ${fleetMachine === m ? 'selected' : ''}>${esc(machineLabel(m))}</option>`).join('')}</select>
   </div>`;
 }
 function wireFleetControls(rerender, root) {
@@ -596,7 +616,7 @@ function renderTable() {
       return `<tr data-file="${esc(s.file)}"${m.archived ? ' class="row-archived"' : ''}>
         <td class="tsess">${esc(s.title || s.session.slice(0, 8))}</td>
         <td><span class="kind-badge" style="background:${c}22;color:${c}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span></td>
-        <td>${esc(s.machine || '')}</td>
+        <td${machineTitle(s.machine) ? ` title="${esc(machineTitle(s.machine))}"` : ''}>${esc(machineLabel(s.machine))}</td>
         <td class="tmodels">${modelChips(s, { max: 3 }) || '<span class="dim">—</span>'}</td>
         <td class="num" title="${esc(tierMixTooltip(s))}">${tts == null ? '—' : Math.round(tts * 100) + '%'}</td>
         <td class="num">${s.agents}</td><td class="num">${s.events}</td><td class="num">${s.toolCalls}</td>
@@ -641,7 +661,7 @@ function renderProjects() {
         <div class="proj-drop">${c.sessions.map(s => `
           <div class="pchip" draggable="true" data-sk="${esc(s.stableKey || '')}" data-file="${esc(s.file)}" style="border-left:3px solid ${kindColor(s.kind)}">
             <div class="pchip-t">${esc(s.title || s.session.slice(0, 8))}</div>
-            <div class="pchip-m">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label} · ${esc(s.machine || '')} · ~${fmtUsd(s.cost)}</div>
+            <div class="pchip-m">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label} · ${esc(machineLabel(s.machine))} · ~${fmtUsd(s.cost)}</div>
           </div>`).join('') || '<div class="proj-empty">drop sessions here</div>'}</div>
       </div>`).join('') + `</div>`;
   // wire drag + drop
@@ -1065,7 +1085,7 @@ function calDayPanelHtml(key, days) {
       const c = kindColor(s.kind);
       return `<div class="cal-day-item" data-file="${esc(s.file)}" style="border-left:3px solid ${c}">
         <span class="cdi-t">${esc(s.title || s.session.slice(0, 8))}</span>
-        <span class="cdi-m">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label} · ${esc(s.machine || '')} · ~${fmtUsd(s.cost)}${s.errors ? ` · ${s.errors} err` : ''}</span>
+        <span class="cdi-m">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label} · ${esc(machineLabel(s.machine))} · ~${fmtUsd(s.cost)}${s.errors ? ` · ${s.errors} err` : ''}</span>
       </div>`;
     }).join('') || '<div class="dim">no sessions this day</div>'}</div>
   </div>`;
@@ -1216,10 +1236,17 @@ function ringWeekStart(ts) {
 // Order matters: the old prefix strip ate the leading "C" that the Windows-path
 // pattern needs, so every local project rendered mangled. Try the path form first
 // and only fall through to the source-prefix strip when it does not match.
-function cleanProjLabel(raw) {
+// A relayed project now arrives as "⇄ <machine> · <folder>". Every caller here
+// prints the machine separately, so strip that half when we know it rather than
+// render "trifecta-erp · trifecta-erp · BukkakERP". Only the PREFIX is stripped:
+// a label that is nothing BUT the machine means the relay never named a project
+// (an older build), and the caller needs to be able to see that.
+function cleanProjLabel(raw, machine) {
   const s = String(raw || '');
   const win = s.replace(/^[Cc]--Users-[^-]+-/, '');
-  return (win !== s ? win : s.replace(/^(⇄|Codex)\s*·?\s*/, '')) || 'Unknown';
+  let out = (win !== s ? win : s.replace(/^(⇄|Codex)\s*·?\s*/, ''));
+  if (machine && out.startsWith(machine + ' · ')) out = out.slice(machine.length + 3);
+  return out || 'Unknown';
 }
 function ringDiscSvg(sessions, metric) {
   const anchor = ringWeekStart(sessions[sessions.length - 1].mtime); // sessions pre-sorted ascending
@@ -1283,10 +1310,19 @@ function renderRings() {
     (discs.length === 0
       ? `<div class="fp-empty">No sessions yet — once you run something, its project gets a ring disc here.</div>`
       : `<div class="rings-grid">` + discs.map(d => {
-        // A relayed session's "project" is its MACHINE name, so every remote repo
-        // collapses into one disc. Say that plainly rather than let it read as a repo.
+        // A relayed session's "project" used to be its MACHINE name, so every
+        // remote repo collapsed into one disc. Relays now send the real project,
+        // so a disc is a project again — with the machine kept in front of it so
+        // two machines' "web" never blur together. A relay too old to name its
+        // projects still lands on the machine name, and the caption says so
+        // plainly rather than letting one disc read as a single repo.
         const remote = d.sessions.every(s => /^(relay|otel|archive):/.test(s.file || ''));
-        const label = (remote ? '🖥 ' : '') + cleanProjLabel(d.proj) + (remote ? ' — all remote work' : '');
+        const mach = d.sessions.every(s => String(s.file || '').startsWith('relay:')) ? (d.sessions[0].machine || '') : '';
+        const proj = cleanProjLabel(d.proj, mach);
+        const named = proj !== mach;
+        const label = (remote ? '🖥 ' : '') + (mach && named ? machineLabel(mach) + ' · ' : '') + proj
+          + (remote && !named ? ' — all remote work (this relay is too old to name projects)' : '');
+        const where = (d.sessions.find(s => s.projPath) || {}).projPath || '';
         const n = d.sessions.length;
         // The disc only draws the last RING_MAX_WEEKS weeks, so the caption has to
         // describe that same window — an all-time total under a truncated picture
@@ -1301,7 +1337,7 @@ function renderRings() {
           ? `${sn} session${sn === 1 ? '' : 's'} shown — not enough runs to say yet`
           : `${sn} sessions shown, ~${fmtUsd(sCost)}${sRough ? `, ${sRough} rough run${sRough === 1 ? '' : 's'}` : ', all clean'}`)
           + (older ? ` · ${older} older not shown` : '');
-        return `<div class="ring-card" data-proj="${esc(d.proj)}" title="Click to see ${esc(label)} in Fleet">
+        return `<div class="ring-card" data-proj="${esc(d.proj)}" title="${esc((where ? where + ' — ' : '') + 'click to see ' + label + ' in Fleet')}">
           ${ringDiscSvg(d.sessions, ringMetric)}
           <div class="ring-name">${esc(label)}</div>
           <div class="ring-summary">${esc(summary)}</div>
@@ -1778,7 +1814,7 @@ function renderGraveyard() {
         <span class="gy-when" title="${esc(fmtAgo(m.ts))}">${esc(graveDate(m.ts))}</span>
         <span class="gy-icon" title="${esc(m.cmd)}">${GRAVE_ICON[m.kind] || '🗑'}</span>
         <div class="gy-main">
-          <div class="gy-what">${esc(m.what)}<span class="dim"> — in “${esc(m.title || 'a session')}” on ${esc(m.machine || 'this computer')}</span></div>
+          <div class="gy-what">${esc(m.what)}<span class="dim"> — in “${esc(m.title || 'a session')}” on ${esc(m.machine ? machineLabel(m.machine) : 'this computer')}</span></div>
           ${graveFilesHTML(m)}
           <code class="gy-cmd" title="${esc(m.whole || m.command)}">${esc(m.command)}</code>
         </div>
@@ -1873,7 +1909,7 @@ async function handleTriageForMe(insights, mined) {
 
       ${failures.length ? `<h4 class="hm-h">🛠 ${failures.length} failing role${failures.length !== 1 ? 's' : ''} — one investigation per machine</h4>
         <p class="dim">Roles failing in the same repo almost always share a few root causes. Send each machine ONE systemic investigation, not a list of every role.</p>
-        ${machineActions.map((m, i) => `<div class="hm-machine"><div class="hm-m-head"><b>🖥 ${esc(m.machine)}</b><span class="dim">${m.count} role${m.count !== 1 ? 's' : ''}</span><button class="mini-btn hm-copy" data-t="fail" data-i="${i}" style="margin-left:auto">📋 copy</button></div><pre class="hm-paste">${esc(m.paste)}</pre></div>`).join('')}` : ''}
+        ${machineActions.map((m, i) => `<div class="hm-machine"><div class="hm-m-head"><b>🖥 ${esc(machineLabel(m.machine))}</b><span class="dim">${m.count} role${m.count !== 1 ? 's' : ''}</span><button class="mini-btn hm-copy" data-t="fail" data-i="${i}" style="margin-left:auto">📋 copy</button></div><pre class="hm-paste">${esc(m.paste)}</pre></div>`).join('')}` : ''}
 
       ${costs.length ? `<h4 class="hm-h">💸 ${costs.length} cost / efficiency finding${costs.length !== 1 ? 's' : ''} — not prompt bugs</h4>
         <p class="dim">These are spend, not failures. The fix is architectural: let the orchestrator plan and delegate the grunt work to cheaper models. Copy the tiered playbook and use it going forward.</p>
@@ -3060,6 +3096,7 @@ function humanizeAudit(e) {
   if (k === 'kill') return { icon: '🛑', text: `Stopped a running ${esc(e.agent || 'agent')} session`, kind: 'control' };
   if (k === 'approval') return { icon: '☑', text: `${e.decision === 'approved' ? 'Approved' : 'Denied'} an agent request${e.tool ? ' (' + esc(e.tool) + ')' : ''}`, sub: e.machine, kind: 'control' };
   if (k === 'enqueue') return { icon: '📤', text: `Queued a ${esc(e.cmd || 'command')} for ${esc(e.machine || 'a machine')}`, kind: 'control' };
+  if (k === 'machine-rename') return e.displayName ? { icon: '✏️', text: `Renamed <b>${esc(e.name)}</b> to <b>${esc(e.displayName)}</b>`, kind: 'control' } : { icon: '✏️', text: `Cleared the display name for <b>${esc(e.name)}</b>`, kind: 'control' };
   return { icon: '•', text: esc(k), sub: JSON.stringify(e).slice(0, 80), kind: 'other' };
 }
 let auditFilter = 'all';
@@ -3567,12 +3604,16 @@ function renderBrain() {
 // ---------- AUDIT view (immutable record of state-changing actions) ----------
 const AUDIT_ICON = { 'brain-write': '✍️', launch: '🚀', 'launch-end': '🏁', kill: '🛑', approval: '✅', enqueue: '📤' };
 // ---------- MACHINES view ----------
+// Mirrors RHYTHM_MIN_SESSIONS in server.js — only used here as a display
+// fallback if an older hub response ever omits `needed`.
+const MACHINE_RHYTHM_MIN_SESSIONS = 5;
 async function loadMachines() {
   const [machinesData, fleet] = await Promise.all([
     fetch('/api/machines').then(r => r.json()),
     fleetCache ? Promise.resolve(fleetCache) : fetch('/api/fleet').then(r => r.json()),
   ]);
   fleetCache = fleet;
+  renderMachineWarnBar(machinesData);
   const byMachine = {};
   for (const s of fleet) {
     const m = s.machine || 'unknown';
@@ -3582,28 +3623,78 @@ async function loadMachines() {
     byMachine[m].lastMs = Math.max(byMachine[m].lastMs, s.mtime);
   }
   const known = new Set(machinesData.map(m => m.name));
-  for (const m of Object.keys(byMachine)) if (!known.has(m)) machinesData.push({ name: m, ips: [], lastSeen: byMachine[m].lastMs, remote: true });
+  // A machine we only know about via cached session data (no /api/machines entry
+  // yet) hasn't got a rhythm computed for it either — say so rather than guess.
+  for (const m of Object.keys(byMachine)) if (!known.has(m)) machinesData.push({ name: m, ips: [], lastSeen: byMachine[m].lastMs, remote: true, quiet: { enoughHistory: false, quiet: false, sessions: 0 } });
   const archives = await (await fetch('/api/archive')).json().catch(() => ({ archives: [] }));
   const archByMachine = {}; for (const a of (archives.archives || [])) archByMachine[a.machine] = a;
   $('machines').innerHTML =
     `<div class="fleet-head"><h2>Machines — ${machinesData.length}</h2></div>` +
     `<div class="machine-grid">` + machinesData.map(m => {
       const st = byMachine[m.name] || { sessions: 0, agents: 0, cost: 0, kinds: {} };
+      const q = m.quiet || { enoughHistory: false, quiet: false };
       const fresh = Date.now() - m.lastSeen < 120000;
       const kindDots = Object.entries(st.kinds).map(([k, n]) => `<span class="mkind" style="color:${kindColor(k)}">● ${(AGENT_KIND[k] || AGENT_KIND.claude).label} ${n}</span>`).join('');
       const hubV = machinesData.find(x => !x.remote)?.version;
       const drift = m.version && hubV && m.version !== hubV;
       const arch = archByMachine[safeName(m.name)] || archByMachine[m.name];
-      return `<div class="mcard ${fresh ? 'fresh' : ''}">
-        <h3>${m.remote ? '⇄' : '★'} ${esc(m.name)} ${m.version ? `<span class="mver ${drift ? 'drift' : ''}" title="${drift ? 'version differs from hub v' + esc(hubV) : 'app version'}">v${esc(m.version)}${drift ? ' ⚠' : ''}</span>` : ''} <span class="mstatus ${fresh ? 'on' : ''}">${fresh ? 'live' : 'idle'}</span></h3>
+      const disp = machineLabel(m.name);
+      const renamed = disp !== m.name;
+      // "quiet" (rhythm-broken silence) outranks the plain live/idle read —
+      // idle is normal for a machine between runs, quiet is not.
+      const statusLabel = q.quiet ? 'not checking in' : fresh ? 'live' : 'idle';
+      const statusClass = q.quiet ? 'quiet' : fresh ? 'on' : '';
+      return `<div class="mcard ${fresh ? 'fresh' : ''}${q.quiet ? ' mcard-quiet' : ''}">
+        <h3${renamed ? ` title="real name: ${esc(m.name)}"` : ''}>${m.remote ? '⇄' : '★'} ${esc(disp)}
+          ${m.remote ? `<button class="mini-btn mrename" data-machine="${esc(m.name)}" title="rename this machine">✏️</button>` : ''}
+          ${m.version ? `<span class="mver ${drift ? 'drift' : ''}" title="${drift ? 'version differs from hub v' + esc(hubV) : 'app version'}">v${esc(m.version)}${drift ? ' ⚠' : ''}</span>` : ''}
+          <span class="mstatus ${statusClass}">${statusLabel}</span></h3>
         <div class="mips">${(m.ips || []).map(ip => `<span class="ip">${esc(ip)}</span>`).join('') || '<span class="ip dim">no IPs reported</span>'}</div>
         <div class="mstats"><span><b>${st.sessions}</b> sessions</span><span><b>${st.agents}</b> agents</span><span class="fcost"><b>~${fmtUsd(st.cost)}</b></span></div>
         <div class="mkinds">${kindDots}</div>
+        ${machineQuietBlockHTML(m, q)}
         ${arch && arch.files ? `<button class="mini-btn arch-browse" data-machine="${esc(arch.machine)}">📚 ${arch.files} archived transcripts · ${fmtBytes(arch.bytes)} — browse</button>` : ''}
         <div class="fdate">last seen ${new Date(m.lastSeen).toLocaleString()}</div>
       </div>`;
     }).join('') + `</div>`;
   $('machines').querySelectorAll('.arch-browse').forEach(b => b.onclick = () => openArchiveBrowser(b.dataset.machine));
+  $('machines').querySelectorAll('.mrename').forEach(b => b.onclick = async e => {
+    e.stopPropagation();
+    const real = b.dataset.machine;
+    const name = prompt('Rename machine (blank = use its real name):', metaMachineNames[real] || '');
+    if (name === null) return;
+    // Metadata only — this can never rename anything on the relay machine
+    // itself (the hub never opens a connection out to one), and sessions stay
+    // keyed on `real` the whole time.
+    await metaPost('/api/meta/machine', { name: real, displayName: name });
+    loadMachines();
+  });
+}
+// The one line that would have saved two days: a plain sentence, not a status
+// dot, plus the honest caveat that the hub can only ever watch, never reach
+// back out to ask why.
+function machineQuietBlockHTML(m, q) {
+  if (!m.remote) return '';
+  if (!q.enoughHistory) {
+    return `<div class="mquiet-note">Not enough check-ins yet (${q.sessions || 0}/${q.needed || MACHINE_RHYTHM_MIN_SESSIONS}) to know this machine's normal rhythm — no verdict until then.</div>`;
+  }
+  if (!q.quiet) return '';
+  return `<div class="mquiet-warn">
+    <div><b>⚠️ ${esc(machineLabel(m.name))} has not checked in for ${fmtDurWords(q.silenceMs)}</b> — it usually reports every ${fmtDurWords(q.medianGapMs)}.</div>
+    <div class="mquiet-caveat">AMC only ever watches this machine — it never reaches back out to it, so it can't tell you why. Worth checking: is the machine powered on and online? Is the relay still running there? Any VPN or network change on that end?</div>
+  </div>`;
+}
+// ---------- fleet-level "machine went quiet" banner ----------
+// Persistent, not a one-off bell ping — visible whenever the owner looks,
+// not only if the tab happened to be open the moment the line was crossed.
+function renderMachineWarnBar(machinesData) {
+  const bar = $('machineWarnBar');
+  if (!bar) return;
+  const quiet = (machinesData || []).filter(m => m.remote && m.quiet && m.quiet.quiet);
+  if (!quiet.length) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  bar.style.display = '';
+  bar.innerHTML = quiet.map(m => `<div class="mwarn-row">⚠️ <b>${esc(machineLabel(m.name))}</b> has not checked in for ${fmtDurWords(m.quiet.silenceMs)} — it usually reports every ${fmtDurWords(m.quiet.medianGapMs)}. AMC can't tell why, only that it's quiet. <button class="mini-btn mwarn-go">check Machines</button></div>`).join('');
+  bar.querySelectorAll('.mwarn-go').forEach(b => b.onclick = () => { state.view = 'machines'; setTabs(); });
 }
 const fmtBytes = n => n >= 1e9 ? (n / 1e9).toFixed(1) + 'GB' : n >= 1e6 ? (n / 1e6).toFixed(0) + 'MB' : (n / 1e3).toFixed(0) + 'KB';
 function safeName(m) { return String(m || '').replace(/[^\w.-]+/g, '_').slice(0, 60); }
@@ -3652,7 +3743,7 @@ async function loadConstellation() {
   const suns = new Map();
   machineNames.forEach((m, i) => {
     const ang = (i / machineNames.length) * Math.PI * 2;
-    suns.set(m, { id: 'm:' + m, machine: m, sun: true, x: W / 2 + Math.cos(ang) * 180, y: H / 2 + Math.sin(ang) * 140, vx: 0, vy: 0, r: 16, label: m });
+    suns.set(m, { id: 'm:' + m, machine: m, sun: true, x: W / 2 + Math.cos(ang) * 180, y: H / 2 + Math.sin(ang) * 140, vx: 0, vy: 0, r: 16, label: machineLabel(m) });
   });
   const maxCost = Math.max(...fleetCache.map(s => s.cost), 1);
   const stars = fleetCache.map(s => {
@@ -3835,6 +3926,18 @@ const fmtDur = ms => {
   const s = Math.round(ms / 1000);
   return s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m` : s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
 };
+// same idea as fmtDur but in words, for a plain sentence a non-technical owner
+// reads once and understands — "45 hours", "usually every 4 minutes", etc.
+function fmtDurWords(ms) {
+  if (!ms || ms < 0) return 'a while';
+  const m = Math.round(ms / 60000);
+  if (m < 1) return 'under a minute';
+  if (m < 90) return `${m} minute${m === 1 ? '' : 's'}`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h} hour${h === 1 ? '' : 's'}`;
+  const d = Math.round(h / 24);
+  return `${d} day${d === 1 ? '' : 's'}`;
+}
 // relative "time ago" — coarse, human
 const fmtAgo = t => {
   const s = Math.round((Date.now() - t) / 1000);
@@ -4200,7 +4303,7 @@ function renderDejaResults() {
             <span class="deja-badge" style="color:${b.color}" title="${b.label}">${b.icon}</span>
             <div class="deja-main">
               <div class="deja-task">${esc(a.task)}</div>
-              <div class="dim">${esc(a.name || 'subagent')} in "${esc(s.title || s.session || '')}" · ${esc(s.machine || 'local')} · ${fmtAgo(s.mtime)} · ${fmtUsd(a.cost || 0)} · <span style="color:${b.color}">${b.label}</span></div>
+              <div class="dim">${esc(a.name || 'subagent')} in "${esc(s.title || s.session || '')}" · ${esc(s.machine ? machineLabel(s.machine) : 'local')} · ${fmtAgo(s.mtime)} · ${fmtUsd(a.cost || 0)} · <span style="color:${b.color}">${b.label}</span></div>
             </div>
           </div>`;
         }).join('');
@@ -5107,4 +5210,5 @@ if (BAKED) {
   loadMeta().then(() => setTabs());
   startNotifications();
   loadAppVersion();
+  fetch('/api/machines').then(r => r.json()).then(renderMachineWarnBar).catch(() => { /* offline at boot */ });
 }

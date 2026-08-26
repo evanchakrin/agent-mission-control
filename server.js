@@ -737,10 +737,10 @@ function persistRelay(rec) {
   try {
     fs.mkdirSync(RELAY_DIR(), { recursive: true });
     let events = rec.result.events.length > RELAY_EVENT_CAP ? rec.result.events.slice(-RELAY_EVENT_CAP) : rec.result.events;
-    let payload = JSON.stringify({ id: rec.id, machine: rec.machine, meta: rec.meta, ips: rec.ips, at: rec.at, result: { ...rec.result, events } });
+    let payload = JSON.stringify({ id: rec.id, machine: rec.machine, meta: rec.meta, proj: rec.proj, ips: rec.ips, at: rec.at, result: { ...rec.result, events } });
     while (payload.length > RELAY_MAX_BYTES && events.length > 200) { // keep the disk cache bounded
       events = events.slice(Math.ceil(events.length / 2));
-      payload = JSON.stringify({ id: rec.id, machine: rec.machine, meta: rec.meta, ips: rec.ips, at: rec.at, result: { ...rec.result, events } });
+      payload = JSON.stringify({ id: rec.id, machine: rec.machine, meta: rec.meta, proj: rec.proj, ips: rec.ips, at: rec.at, result: { ...rec.result, events } });
     }
     const tmp = relayFileFor(rec.id) + '.tmp';
     fs.writeFileSync(tmp, payload);
@@ -819,24 +819,48 @@ function loadRelayCache() {
     try {
       const r = JSON.parse(fs.readFileSync(path.join(RELAY_DIR(), f), 'utf8'));
       if (!r.id || !r.result) continue;
-      relaySessions.set(r.id, { id: r.id, machine: r.machine, meta: r.meta || {}, version: 1, result: r.result, ips: r.ips, at: r.at });
-      if (r.machine) machines.set(r.machine, { name: r.machine, ips: Array.isArray(r.ips) ? r.ips : [], lastSeen: r.at || Date.now(), remote: true, cached: true });
+      // r.proj is absent in every file written before the project field existed —
+      // null is correct there, and relayProjLabel() falls back on its own.
+      relaySessions.set(r.id, { id: r.id, machine: r.machine, meta: r.meta || {}, proj: sanitizeProj(r.proj), version: 1, result: r.result, ips: r.ips, at: r.at });
+      if (r.machine) {
+        // max(), not last-wins: readdir order is arbitrary, and this value now drives
+        // both the quiet verdict and the number shown to the owner
+        const prev = machines.get(r.machine);
+        const at = r.at || 0;
+        if (!prev || at > (prev.lastData || 0)) {
+          machines.set(r.machine, { name: r.machine, ips: Array.isArray(r.ips) ? r.ips : [], lastSeen: at || Date.now(), lastData: at || undefined, remote: true, cached: true });
+        }
+      }
       n++;
     } catch { /* skip bad file */ }
   }
   if (n) console.log(`Restored ${n} relayed sessions from cache (${RELAY_DIR()})`);
 }
 
+// body.proj — the relay's own view of WHICH PROJECT this session belongs to.
+// Sanitised here because this is the network trust boundary: control bytes go,
+// both halves are hard length-capped, and "absent" stays a first-class answer
+// (null) rather than something guessed at — an older relay simply omits it.
+function sanitizeProj(p) {
+  if (!p || typeof p !== 'object') return null;
+  const slug = clean(p.slug, 200), cwd = clean(p.cwd, 400);
+  return slug || cwd ? { slug: slug || null, cwd: cwd || null } : null;
+}
+
 function ingestRelay(body) {
   const id = 'relay:' + body.machine + ':' + body.file;
   const prev = relaySessions.get(id);
   const rec = {
-    id, machine: body.machine, meta: body.meta || {},
+    id, machine: body.machine, meta: body.meta || {}, proj: sanitizeProj(body.proj),
     version: (prev ? prev.version : 0) + 1, result: body.result,
     ips: Array.isArray(body.ips) ? body.ips : [], at: Date.now(),
   };
   relaySessions.set(id, rec);
-  machines.set(body.machine, { name: body.machine, ips: rec.ips, lastSeen: Date.now(), remote: true, version: body.version || null });
+  // lastData is the ONLY signal the quiet detector may use. lastSeen is liveness
+  // (the 5s heartbeat) and stays fresh while the relay process is alive even if it
+  // has stopped sending anything — which is exactly the failure this must catch.
+  const prevM = machines.get(body.machine);
+  machines.set(body.machine, { name: body.machine, ips: rec.ips, lastSeen: Date.now(), lastData: Date.now(), remote: true, version: body.version || (prevM && prevM.version) || null });
   persistRelay(rec);
   return id;
 }
@@ -850,10 +874,110 @@ function localIPs() {
     .map(i => i.address);
 }
 
+// WHY: DESKTOP-OCVTL8Q means nothing to a human, and a renamed machine must
+// never touch the relay (WATCH-ONLY/OUTBOUND-ONLY — the hub never reaches out
+// to a relay machine, so it can't rename anything there even if it wanted to).
+// So the friendly name lives ONLY in hub metadata (metaState.machineNames),
+// keyed by the machine's real name — the real name stays the join key
+// everywhere sessions get matched to a machine, and the rename can't ever
+// desync a relay from what the hub calls it.
+function machineDisplayName(name) {
+  const dn = metaState && metaState.machineNames && metaState.machineNames[name];
+  return (typeof dn === 'string' && dn) ? dn : null;
+}
+
 function machineList() {
   const localName = os.hostname();
   const local = { name: localName, ips: localIPs(), lastSeen: Date.now(), remote: false, version: APP_VERSION };
-  return [local, ...[...machines.values()].filter(m => m.name !== localName)];
+  const list = [local, ...[...machines.values()].filter(m => m.name !== localName)];
+  // Bucket check-in timestamps per machine from each session's OWN recorded
+  // mtime (s.meta.mtime — the transcript's real last-activity time, organic
+  // and spread across the machine's whole history). Deliberately NOT
+  // relaySessions' `.at` (hub receipt time): a relay does a full resend of
+  // every session it holds whenever it notices the hub rebooted (boot-ID
+  // check on /v1/boot), which stamps `.at` on ALL of a machine's sessions
+  // within the same few minutes — that would make "this machine's rhythm"
+  // reset to near-zero on every hub restart. A session with no meta.mtime
+  // (pre-dates that field) is skipped rather than defaulted to "now", which
+  // would inject a fake, ever-shifting data point into real history.
+  const byMachine = {};
+  for (const s of relaySessions.values()) {
+    const t = s.meta && s.meta.mtime;
+    if (!s.machine || !t) continue;
+    (byMachine[s.machine] = byMachine[s.machine] || []).push(t);
+  }
+  return list.map(m => ({ ...m, displayName: machineDisplayName(m.name), quiet: machineQuietState(m, byMachine[m.name] || []) }));
+}
+
+// ---------- machine check-in rhythm (learned quiet-machine detection) ----------
+// WHY: a flat "no ping in N minutes" test can't tell a machine that normally
+// reports every few minutes and just went dark from one that only ever checks
+// in once a day — a threshold tight enough to catch the first flags the second
+// as broken every single day, and a threshold loose enough to spare the second
+// misses the first for hours (this is exactly what happened: trifecta-erp's
+// relay died and the dashboard just showed "idle", indistinguishable from a
+// machine that's merely quiet, for two days). So: learn each machine's own
+// rhythm from the gaps between the timestamps of its OWN past sessions — not
+// the ~5s relay-tick /v1/boot heartbeat, which is nearly constant whenever the
+// relay process is merely alive and says nothing about how often work actually
+// happens (a constant liveness ping, not a signal of how often WORK happens)
+// — then flag only when live silence is far outside that machine's own
+// history, and only once there's enough history to trust the number.
+//
+// The median gap alone is NOT a safe basis for the threshold: real usage is
+// bursty (many short gaps during a working stretch, a long natural gap
+// overnight or over a weekend) — a machine actually reports on real fleet
+// history a median gap of ~27min but a 90th-percentile gap over 18h, so
+// "8x the median" would flag perfectly ordinary weekend silence as broken.
+// The median stays the right number for the human sentence ("usually every
+// X") — typical is exactly what "usually" means — but the ALARM threshold is
+// built from the 90th-percentile gap instead: "far outside anything this
+// machine's own history has shown, with a safety margin," which tolerates
+// its normal long pauses while still catching truly unprecedented silence.
+const RHYTHM_MIN_SESSIONS = 5;        // need at least this many sessions (4 gaps) before either statistic means anything
+const RHYTHM_P90_MULTIPLIER = 2;      // flag once silence exceeds 2x this machine's own 90th-percentile gap
+const RHYTHM_FLOOR_MS = 30 * 60e3;    // ...but never below 30min, so a tight rhythm can't cry wolf over ordinary jitter
+const RHYTHM_CEILING_MS = 6 * 3600e3; // ...and never above 6h: past that the alarm is too late to be worth having
+const RHYTHM_MIN_SPAN_MS = 7 * 864e5; // a week of history before any rhythm claim — 5 sessions in one afternoon is not a rhythm
+function median(nums) {
+  const a = [...nums].sort((x, y) => x - y);
+  const n = a.length;
+  if (!n) return 0;
+  return n % 2 ? a[(n - 1) / 2] : (a[n / 2 - 1] + a[n / 2]) / 2;
+}
+// nearest-rank percentile; sortedAsc must already be sorted ascending.
+function percentile(sortedAsc, p) {
+  if (!sortedAsc.length) return 0;
+  const idx = Math.min(sortedAsc.length - 1, Math.max(0, Math.ceil(p * sortedAsc.length) - 1));
+  return sortedAsc[idx];
+}
+// m: an entry from the `machines` map ({name, lastSeen, remote, ...}).
+// mtimes: this machine's known session check-in timestamps, any order.
+function machineQuietState(m, mtimes) {
+  if (!m.remote) return { enoughHistory: true, quiet: false }; // the hub is never "quiet" on itself
+  // silence = time since DATA last arrived; falls back to lastSeen only when this
+  // machine has never delivered anything in this hub's lifetime
+  const silenceMs = Date.now() - (m.lastData || m.lastSeen || 0);
+  if (mtimes.length < RHYTHM_MIN_SESSIONS) {
+    return { enoughHistory: false, sessions: mtimes.length, needed: RHYTHM_MIN_SESSIONS, silenceMs, quiet: false };
+  }
+  const sorted = [...mtimes].sort((a, b) => a - b);
+  const gaps = [];
+  for (let i = 1; i < sorted.length; i++) gaps.push(sorted[i] - sorted[i - 1]);
+  const gapsSorted = [...gaps].sort((a, b) => a - b);
+  const medianGapMs = median(gaps);                    // for the sentence: "usually reports every X"
+  const p90GapMs = percentile(gapsSorted, 0.9);         // for the alarm: this machine's own worst-normal gap
+  // Ceiling matters: 2x a machine's near-largest gap reached ~36h on real data,
+  // barely better than the two-day miss that prompted this. Learned rhythm sets the
+  // floor of sensitivity; RHYTHM_CEILING_MS caps how long it may ever stay silent.
+  const thresholdMs = Math.min(RHYTHM_CEILING_MS, Math.max(RHYTHM_FLOOR_MS, RHYTHM_P90_MULTIPLIER * p90GapMs));
+  // Count is not history. Five sessions from one afternoon says nothing about a
+  // machine's rhythm, and would pin a permanent red banner on a box used once.
+  const spanMs = sorted[sorted.length - 1] - sorted[0];
+  if (spanMs < RHYTHM_MIN_SPAN_MS) {
+    return { enoughHistory: false, sessions: mtimes.length, needed: RHYTHM_MIN_SESSIONS, spanMs, needSpanMs: RHYTHM_MIN_SPAN_MS, silenceMs, quiet: false };
+  }
+  return { enoughHistory: true, sessions: mtimes.length, medianGapMs, p90GapMs, thresholdMs, silenceMs, quiet: silenceMs > thresholdMs };
 }
 
 // Which agent kind produced a session, from its source-prefixed file id.
@@ -877,7 +1001,7 @@ let metaState = null;   // { v, metaVersion, machineId, projects, tags, savedFil
 let metaReadOnly = false;
 
 function defaultState() {
-  return { v: 1, metaVersion: 0, machineId: crypto.randomUUID(), projects: [], tags: [], savedFilters: [], sessions: {} };
+  return { v: 1, metaVersion: 0, machineId: crypto.randomUUID(), projects: [], tags: [], savedFilters: [], sessions: {}, machineNames: {} };
 }
 function loadState() {
   try { fs.mkdirSync(STATE_DIR, { recursive: true }); } catch { /* ignore */ }
@@ -1432,6 +1556,34 @@ function applySessionPatch(next, key, patch) {
 // monotonic-ish clock without Date.now() at module top (allowed inside handlers)
 function metaClock() { return Date.now(); }
 
+// WHY: a relayed session used to be labelled with its MACHINE, because that was
+// the only identity the hub had — one relay's 205 sessions all read
+// "⇄ trifecta-erp" and no remote session could be told apart by folder, while
+// local ones showed real project slugs. The relay now sends the project it
+// already knows (proj.cwd / proj.slug); this reduces that to one folder name a
+// person can read. Three sources, best first, so nothing is ever orphaned:
+//   1. proj.cwd  — the true working directory, so "BukkakERP" not a slug
+//   2. proj.slug — the project-directory slug, when the cwd was unresolvable
+//   3. meta.project — what EVERY relay ever built already sends inside meta, so
+//      sessions cached before this field existed get real names too
+//   4. nothing   — label stays exactly what it is today: just the machine
+function relayProjLabel(s) {
+  const p = s.proj || {};
+  const cwd = clean(p.cwd, 400).replace(/[\\/]+$/, '');
+  if (cwd) { const base = cwd.split(/[\\/]+/).pop(); if (base) return base.slice(0, 60); }
+  const slug = clean(p.slug || (s.meta && s.meta.project) || '', 200);
+  const label = slug.replace(/^Codex\s*·\s*/, '').replace(/^[Cc]--Users-[^-]+-/, '').slice(0, 60);
+  // Some relayed Codex sessions carry no project at all, and their meta.project is
+  // derived from the session TITLE — which produced labels like "can" out of "can i
+  // use this model…". The tell is that the label is just the start of the title; a
+  // real folder name almost never is. A meaningless word is worse than admitting we
+  // don't know, so those are refused.
+  if (!label || /\s/.test(label)) return '';
+  const title = String((s.meta && s.meta.title) || '').toLowerCase();
+  if (label.length < 12 && title.startsWith(label.toLowerCase())) return '';
+  return label;
+}
+
 function relayList() {
   return [...relaySessions.values()].map(s => {
     let title = s.meta.title;
@@ -1439,8 +1591,14 @@ function relayList() {
       const firstUser = s.result.events.find(e => (e.kind === 'user-text' || e.kind === 'user-queued') && e.text && !e.text.startsWith('<'));
       title = firstUser ? clip(firstUser.text.replace(/\s+/g, ' ').trim(), 70) : s.id.split(':').pop().slice(0, 12);
     }
+    // The machine stays in FRONT of the project: it is what keeps two machines
+    // that both have a folder called "web" — or a remote folder that matches a
+    // local one — from collapsing into a single project everywhere the UI
+    // groups by this string. Machine also remains its own field + filter.
+    const proj = relayProjLabel(s);
     return {
-      project: '⇄ ' + s.machine, file: s.id, session: s.meta.session || s.id, machine: s.machine,
+      project: '⇄ ' + s.machine + (proj ? ' · ' + proj : ''), projPath: (s.proj && s.proj.cwd) || null,
+      file: s.id, session: s.meta.session || s.id, machine: s.machine,
       title: title + ' · ' + s.machine,
       size: s.result.events.length, mtime: s.meta.mtime || Date.now(), agentCount: s.result.agents.length - 1,
     };
@@ -1475,9 +1633,14 @@ function getResult(fileParam) {
   return readSession(full);
 }
 
+// The hub refuses any body past this. ARCHIVE_SEND_CAP is derived from it rather
+// than hardcoded, because they drifted apart once and cost a production server 6GB
+// of RAM: the relay happily accepted a 107MB transcript, base64 inflated it past
+// this limit, the hub destroyed the request, and the relay retried it forever.
+const BODY_MAX_BYTES = 50e6;
 function readBody(req, cb) {
   let b = '';
-  req.on('data', c => { b += c; if (b.length > 50e6) req.destroy(); });
+  req.on('data', c => { b += c; if (b.length > BODY_MAX_BYTES) req.destroy(); });
   req.on('end', () => cb(b));
 }
 
@@ -1580,7 +1743,7 @@ function sessionSummary(meta) {
   const first = evs.find(e => e.ts), last = [...evs].reverse().find(e => e.ts);
   const machine = meta.file.startsWith('relay:') ? meta.file.split(':')[1] : os.hostname();
   return {
-    file: meta.file, project: meta.project, session: meta.session, title: meta.title, mtime: meta.mtime,
+    file: meta.file, project: meta.project, projPath: meta.projPath || null, session: meta.session, title: meta.title, mtime: meta.mtime,
     kind: agentKindOf(meta.file), machine, stableKey: stableKeyForItem(meta),
     agents: r.agents.length, events: evs.length,
     toolCalls: evs.filter(e => e.kind === 'tool-call' || e.kind === 'spawn').length,
@@ -2907,6 +3070,8 @@ const server = http.createServer((req, res) => {
     const hb = req.headers['x-relay-machine'];
     if (hb && authorized) {
       const prev = machines.get(hb) || { name: hb, ips: [], remote: true };
+      // deliberately does NOT set lastData: a heartbeat proves the process is up,
+      // not that any work is being reported
       machines.set(hb, { ...prev, lastSeen: Date.now(), version: req.headers['x-relay-version'] || prev.version || null });
     }
     return json(res, { boot: BOOT_ID, version: APP_VERSION });
@@ -3262,6 +3427,27 @@ const server = http.createServer((req, res) => {
       } catch (e) { metaErr(res, e); }
     });
   }
+  // Rename a machine — metadata only. Keyed by the machine's REAL name (never
+  // the display name), so it's stable across relay re-sends/hub restarts and
+  // never confused with the identity sessions are actually keyed on. Blank
+  // displayName clears the override back to the real name.
+  if (url.pathname === '/api/meta/machine' && req.method === 'POST') {
+    if (!writeGate(req, res)) return;
+    return readBody(req, body => {
+      try {
+        const b = JSON.parse(body);
+        const name = clean(b.name, LIM.name);
+        if (!name) throw new Error('need name');
+        const displayName = clean(b.displayName, LIM.name);
+        const v = commit(next => {
+          if (b.baseVersion != null && b.baseVersion !== metaState.metaVersion) { const e = new Error('stale — refetch'); e.status409 = true; throw e; }
+          if (displayName) next.machineNames[name] = displayName; else delete next.machineNames[name];
+        });
+        appendAudit({ kind: 'machine-rename', name, displayName: displayName || null });
+        json(res, { ok: true, machineNames: metaState.machineNames, metaVersion: v });
+      } catch (e) { metaErr(res, e); }
+    });
+  }
 
   // deep search: full-text across every session's events (cached parses)
   if (url.pathname === '/api/search') {
@@ -3474,6 +3660,13 @@ async function runRelay(hub, machineName) {
         hubBoot = b.boot;
       }
     } catch { /* hub down; sends below will fail and retry */ }
+    // WHY: the hub cannot work out which project a relayed session belongs to —
+    // it only ever sees what arrives here, which is why every remote session
+    // used to be labelled with this machine's name instead. Only THIS side knows
+    // the answer, so send it: the project-directory slug, plus the true working
+    // directory when it can be resolved (claudeProjectCwd / Codex session_meta).
+    // Two short strings per session; the parsed result dwarfs them.
+    let codexCwds = null; // built once per tick, and only if a Codex session actually changed
     for (const meta of [...listSessions(), ...codexList()]) {
       const isCodex = meta.file.startsWith('codex:');
       const sig = isCodex ? codexSignature(meta.file.slice(6)) : sessionSignature(resolveSessionPath(meta.file));
@@ -3481,12 +3674,18 @@ async function runRelay(hub, machineName) {
       let result;
       try { result = getResult(meta.file); } catch (e) { console.error(`parse failed ${meta.file}: ${e.message}`); continue; }
       if (!result) continue;
+      if (isCodex && !codexCwds) codexCwds = new Map(codexFiles().map(f => [f.uuid, codexMeta(f).cwd || null]));
+      const proj = {
+        slug: meta.project || null,
+        cwd: (isCodex ? codexCwds.get(meta.file.slice(6))
+          : meta.project ? claudeProjectCwd(path.join(PROJECTS_DIR, meta.project)) : null) || null,
+      };
       // keep POSTs under the hub's body cap — trim oldest events if needed
       const ips = localIPs();
-      let body = JSON.stringify({ machine: machineName, file: meta.file, meta, result, ips, version: APP_VERSION });
+      let body = JSON.stringify({ machine: machineName, file: meta.file, meta, proj, result, ips, version: APP_VERSION });
       while (body.length > 35e6 && result.events.length > 500) {
         result = { ...result, events: result.events.slice(Math.ceil(result.events.length / 2)) };
-        body = JSON.stringify({ machine: machineName, file: meta.file, meta, result, ips, version: APP_VERSION });
+        body = JSON.stringify({ machine: machineName, file: meta.file, meta, proj, result, ips, version: APP_VERSION });
       }
       try {
         const r = await fetch(hub + '/v1/relay', {
@@ -3517,7 +3716,12 @@ async function runRelay(hub, machineName) {
   // included only with --archive-codex (they can be hundreds of MB each).
   if (process.argv.includes('--archive')) {
     const withCodex = process.argv.includes('--archive-codex');
-    const FILE_CAP = 120 * 1024 * 1024;
+    // base64 inflates by 4/3 and the JSON envelope adds a little; leave 15% headroom.
+    // Anything above this CANNOT be accepted, so sending it is guaranteed waste.
+    const FILE_CAP = Math.floor((50e6 * 0.85) * 3 / 4);
+    const failed = new Map();          // relPath -> consecutive failures
+    const FAIL_GIVE_UP = 2;            // stop after this many; never retry into the ground
+    const skipped = [];
     const collect = () => {
       const files = [];
       const walk = (dir, relBase) => {
@@ -3539,7 +3743,11 @@ async function runRelay(hub, machineName) {
       catch { return; }
       let sent = 0;
       for (const f of collect()) {
-        if (f.size > FILE_CAP) continue;
+        if (f.size > FILE_CAP) {
+          if (!skipped.includes(f.rel)) { skipped.push(f.rel); console.log(`archive: skipping ${f.rel} (${Math.round(f.size / 1048576)}MB) — larger than this hub can accept`); }
+          continue;
+        }
+        if ((failed.get(f.rel) || 0) >= FAIL_GIVE_UP) continue; // already refused twice; stop burning memory on it
         if (manifest[f.rel] === f.size) continue; // hub already has this exact file
         try {
           const data = fs.readFileSync(f.full).toString('base64');
@@ -3547,9 +3755,20 @@ async function runRelay(hub, machineName) {
             method: 'POST', headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
             body: JSON.stringify({ machine: machineName, relPath: f.rel, data }),
           });
-          if (r.ok) { sent++; if (sent % 10 === 0) console.log(`archived ${sent} transcripts…`); }
+          if (r.ok) { sent++; failed.delete(f.rel); if (sent % 10 === 0) console.log(`archived ${sent} transcripts…`); }
           else if (r.status === 400) { const e = await r.json().catch(() => ({})); if (/archive full/.test(e.error || '')) { console.error('hub archive full — stopping'); return; } }
-        } catch (e) { console.error('archive upload failed', f.rel, e.message); }
+          else {
+            // Remember the refusal. Retrying a file the hub will never accept is what
+            // allocated ~4x its size every tick until the machine ran out of memory.
+            const n = (failed.get(f.rel) || 0) + 1;
+            failed.set(f.rel, n);
+            console.error(`archive: ${f.rel} refused (${r.status})${n >= FAIL_GIVE_UP ? ' — giving up on it' : ''}`);
+          }
+        } catch (e) {
+          const n = (failed.get(f.rel) || 0) + 1;
+          failed.set(f.rel, n);
+          console.error('archive upload failed', f.rel, e.message, n >= FAIL_GIVE_UP ? '— giving up on it' : '');
+        }
         await new Promise(r => setTimeout(r, 50)); // gentle pacing
       }
       if (sent) console.log(`archive pass done: ${sent} new/changed transcripts uploaded`);

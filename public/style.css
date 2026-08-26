@@ -139,14 +139,21 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .machine-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
 .mcard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; box-shadow: 0 4px 16px rgba(0,0,0,.3); }
 .mcard.fresh { border-color: var(--green); box-shadow: 0 0 18px rgba(52,211,153,.15); }
+.mcard.mcard-quiet { border-color: var(--red); box-shadow: 0 0 18px rgba(248,113,113,.15); }
 .mcard h3 { font-size: 14px; display: flex; align-items: center; gap: 8px; }
+.mrename { padding: 1px 6px; font-size: 11px; line-height: 1.6; }
 .mstatus { margin-left: auto; font-size: 9.5px; padding: 2px 8px; border-radius: 9px; text-transform: uppercase; background: rgba(138,147,168,.15); color: var(--dim); }
 .mstatus.on { background: rgba(52,211,153,.15); color: var(--green); }
+.mstatus.quiet { background: rgba(248,113,113,.18); color: var(--red); }
 .mips { display: flex; flex-wrap: wrap; gap: 6px; margin: 9px 0; }
 .ip { font-family: Consolas, monospace; font-size: 11px; background: var(--panel2); border: 1px solid var(--line); border-radius: 5px; padding: 2px 7px; color: var(--accent); }
 .ip.dim { color: var(--dim); }
 .mstats { display: flex; gap: 14px; font-size: 12px; color: var(--dim); } .mstats b { color: var(--text); } .mstats .fcost b { color: var(--accent); }
 .mkinds { display: flex; gap: 12px; margin-top: 8px; font-size: 11px; } .mkind { font-weight: 600; }
+.mquiet-note { font-size: 11px; margin-top: 9px; color: var(--dim); }
+.mquiet-warn { margin-top: 9px; padding: 8px 10px; border-radius: 7px; background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.3); font-size: 12px; line-height: 1.5; }
+.mquiet-warn b { color: var(--red); }
+.mquiet-caveat { margin-top: 5px; color: var(--dim); font-size: 11px; line-height: 1.45; }
 
 .prune-chip { position: absolute; top: 10px; left: 12px; z-index: 5; background: var(--panel); border: 1px solid var(--accent); color: var(--accent); border-radius: 14px; padding: 4px 13px; font-size: 11px; font-weight: 600; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
 .prune-chip:hover { background: var(--panel2); }
@@ -609,6 +616,15 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 /* anatomy of a failure — one plain sentence on what a broken session got stuck
    on, next to (not instead of) the "did it stick" bar above. */
 #failbar { padding: 7px 16px; font-size: 12px; line-height: 1.45; color: var(--text); border-bottom: 1px solid var(--line); background: rgba(248,113,113,.08); border-left: 3px solid var(--red); }
+
+/* fleet-level "machine went quiet" banner — persistent (unlike the bell) so it
+   is visible whenever the owner looks, not only if the tab was open the exact
+   moment a machine broke its own check-in rhythm. Always on screen, any view. */
+#machineWarnBar { padding: 2px 16px; border-bottom: 1px solid var(--line); background: rgba(248,113,113,.08); }
+.mwarn-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; font-size: 12px; line-height: 1.45; color: var(--text); }
+.mwarn-row:not(:last-child) { border-bottom: 1px solid rgba(248,113,113,.18); }
+.mwarn-row b { color: var(--red); }
+.mwarn-row .mwarn-go { margin-left: auto; flex-shrink: 0; }
 
 main { flex: 1; display: grid; grid-template-columns: 1fr 350px; min-height: 0; }
 main.no-feed { grid-template-columns: 1fr; }
