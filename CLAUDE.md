@@ -20,7 +20,7 @@ _Planted by Agent Mission Control. Retire it from the dashboard rather than hand
 
 **Set `model` explicitly on EVERY agent call. Never let a subagent inherit the orchestrator's model.** Omitting `model:` is silent, and it is where cost actually leaks — not in how many agents you spawn.
 
-Measured on this fleet: an 18-agent session put **97% of ~$1,155 on the flagship tier** purely because `model:` was left off the agent calls. The three agents that *were* set explicitly cost **$3.70 combined**.
+Measured across five weeks of this fleet's own transcripts (1,418 files, counted exactly — not sampled): **about 90% of agent launches name no model at all**, so they inherit the orchestrator's. One verified 18-agent workflow ran every single agent on the premium tier. The cheap tiers are effectively unused — Sonnet is ~1% of spend and Haiku essentially none.
 
 Tier by the work being done, not by who spawned it:
 
