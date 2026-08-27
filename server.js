@@ -94,10 +94,21 @@ function processLine(o, agentId, ctx) {
   const content = msg.content;
 
   if (o.type === 'assistant') {
+    // COUNT EACH REPLY ONCE. A single assistant message is written to the
+    // transcript once per content block — text, then each tool_use — and every
+    // one of those lines carries the SAME usage object. Summing them all counted
+    // the same tokens repeatedly: 2.3x on a typical session and over 100x on a
+    // subagent that made many tool calls off one reply. Every cost this tool has
+    // ever shown was inflated by exactly that duplication.
     const usage = msg.usage || {};
-    agent.inTokens += usage.input_tokens || 0;
-    agent.cacheTokens += usage.cache_read_input_tokens || 0;
-    agent.outTokens += usage.output_tokens || 0;
+    const id = msg.id;
+    const already = id && ctx.seenMsg && ctx.seenMsg.has(id);
+    if (id && ctx.seenMsg) ctx.seenMsg.add(id);
+    if (!already) {
+      agent.inTokens += usage.input_tokens || 0;
+      agent.cacheTokens += usage.cache_read_input_tokens || 0;
+      agent.outTokens += usage.output_tokens || 0;
+    }
     if (msg.model && !agent.model) agent.model = msg.model;
 
     const text = textOfContent(content);
@@ -205,7 +216,7 @@ function postProcessLifecycle(result) {
 // mainLines: JSONL lines of the orchestrator transcript.
 // subFiles: [{id, lines, group}] — one per subagents/**/agent-*.jsonl file.
 function normalize(mainLines, subFiles, wfNames = new Map()) {
-  const ctx = { agents: new Map(), events: [], spawnCalls: [], pending: new Map() };
+  const ctx = { agents: new Map(), events: [], spawnCalls: [], pending: new Map(), seenMsg: new Set() };
   ctx.agents.set('main', { ...newAgent('main', 'main'), name: 'Orchestrator' });
 
   // --- main file (with legacy inline-sidechain grouping) ---
@@ -553,7 +564,7 @@ function readCodexSession(uuid) {
   const files = codexFiles();
   const file = files.find(f => f.uuid === uuid);
   if (!file) return null;
-  const ctx = { agents: new Map(), events: [], pending: new Map(), subThreads: new Map() };
+  const ctx = { agents: new Map(), events: [], pending: new Map(), subThreads: new Map(), seenMsg: new Set() };
   const meta = codexMeta(file);
   ctx.agents.set('main', { ...newAgent('main', 'main'), name: (meta.cwd ? path.basename(meta.cwd) : 'Codex') + ' /root' });
   parseCodexLines(readCappedLines(file.path, file.size), 'main', ctx);
