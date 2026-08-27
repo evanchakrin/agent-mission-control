@@ -31,7 +31,9 @@ const APP_VERSION = (() => {
   catch { return '6.3.0'; }
 })();
 
-// $/MTok, matched by substring of the model id; cache reads bill at 0.1x input.
+// $/MTok, matched by substring of the model id. Cache reads bill at 0.1x input;
+// cache WRITES bill at 1.25x input and are a real line item -- on this fleet's own
+// archive they were ~21% of the true bill, and omitting them made every figure low.
 // OpenAI rows are family-level estimates (gpt-5 launch pricing) so Codex
 // sessions get a ballpark instead of $0; all UI cost is prefixed "~".
 const PRICING = [
@@ -39,10 +41,43 @@ const PRICING = [
   { m: 'opus', in: 5, out: 25 }, { m: 'sonnet', in: 3, out: 15 }, { m: 'haiku', in: 1, out: 5 },
   { m: 'gpt-5', in: 1.25, out: 10 }, { m: 'gpt-4', in: 2.5, out: 10 }, { m: 'o3', in: 2, out: 8 }, { m: 'o4', in: 1.1, out: 4.4 },
 ];
+function rateFor(model) { return PRICING.find(x => (model || '').includes(x.m)) || null; }
+function priceBucket(b, p) {
+  return (b.inTokens / 1e6) * p.in
+       + (b.cacheTokens / 1e6) * p.in * 0.1
+       + (b.cacheWriteTokens / 1e6) * p.in * 1.25
+       + (b.outTokens / 1e6) * p.out;
+}
+// An agent is not one model. A session that starts on one and switches bills at
+// BOTH rates, so pricing an agent's whole lifetime at whichever model happened to
+// speak first is wrong twice over: the dollar figure, and the tier split that the
+// tiering standing order is argued from. Price each model's own tokens; fall back
+// to the flat totals only for sources that never reported a per-reply model.
 function costOf(a) {
-  const p = PRICING.find(x => (a.model || '').includes(x.m));
+  const buckets = a.usageByModel && Object.keys(a.usageByModel);
+  if (buckets && buckets.length) {
+    let sum = 0;
+    for (const m of buckets) {
+      const p = rateFor(m);
+      if (p) sum += priceBucket(a.usageByModel[m], p);   // unknown model: no guess
+    }
+    return sum;
+  }
+  const p = rateFor(a.model);
   if (!p) return 0; // unknown model (e.g. non-Claude via OTLP): no estimate rather than a wrong one
-  return (a.inTokens / 1e6) * p.in + (a.cacheTokens / 1e6) * p.in * 0.1 + (a.outTokens / 1e6) * p.out;
+  return priceBucket({ inTokens: a.inTokens, cacheTokens: a.cacheTokens,
+                       cacheWriteTokens: a.cacheWriteTokens || 0, outTokens: a.outTokens }, p);
+}
+// Add one reply's usage to the agent's flat totals AND to that model's own bucket.
+function addUsage(agent, model, inTok, cacheRead, cacheWrite, outTok) {
+  agent.inTokens += inTok; agent.cacheTokens += cacheRead;
+  agent.cacheWriteTokens += cacheWrite; agent.outTokens += outTok;
+  if (!model) return;
+  if (!agent.usageByModel) agent.usageByModel = {};   // relayed/rehydrated agents
+  const b = agent.usageByModel[model] ||
+    (agent.usageByModel[model] = { inTokens: 0, cacheTokens: 0, cacheWriteTokens: 0, outTokens: 0, replies: 0 });
+  b.inTokens += inTok; b.cacheTokens += cacheRead;
+  b.cacheWriteTokens += cacheWrite; b.outTokens += outTok; b.replies++;
 }
 
 // ---------- helpers ----------
@@ -74,7 +109,8 @@ function newAgent(id, type) {
   return {
     id, name: null, type, task: '', model: null,
     firstTs: null, lastTs: null, events: 0, tools: {},
-    inTokens: 0, cacheTokens: 0, outTokens: 0, errors: 0, cost: 0, done: false, lastKind: null,
+    inTokens: 0, cacheTokens: 0, cacheWriteTokens: 0, outTokens: 0, usageByModel: {},
+    errors: 0, cost: 0, done: false, lastKind: null,
   };
 }
 
@@ -105,9 +141,9 @@ function processLine(o, agentId, ctx) {
     const already = id && ctx.seenMsg && ctx.seenMsg.has(id);
     if (id && ctx.seenMsg) ctx.seenMsg.add(id);
     if (!already) {
-      agent.inTokens += usage.input_tokens || 0;
-      agent.cacheTokens += usage.cache_read_input_tokens || 0;
-      agent.outTokens += usage.output_tokens || 0;
+      addUsage(agent, msg.model || agent.model, usage.input_tokens || 0,
+        usage.cache_read_input_tokens || 0, usage.cache_creation_input_tokens || 0,
+        usage.output_tokens || 0);
     }
     if (msg.model && !agent.model) agent.model = msg.model;
 
@@ -524,9 +560,8 @@ function parseCodexLines(lines, agentId, ctx) {
     } else if (o.type === 'event_msg') {
       if (p.type === 'token_count' && p.info && p.info.last_token_usage) {
         const u = p.info.last_token_usage;
-        agent.inTokens += Math.max(0, (u.input_tokens || 0) - (u.cached_input_tokens || 0));
-        agent.cacheTokens += u.cached_input_tokens || 0;
-        agent.outTokens += u.output_tokens || 0;
+        addUsage(agent, agent.model, Math.max(0, (u.input_tokens || 0) - (u.cached_input_tokens || 0)),
+          u.cached_input_tokens || 0, 0, u.output_tokens || 0);
       } else if (p.type === 'sub_agent_activity' && p.agent_path && p.agent_path !== '/root') {
         const name = p.agent_path.split('/').filter(Boolean).pop();
         const subId = 'sub:' + p.agent_path;
@@ -1692,13 +1727,22 @@ function modelBreakdown(agents) {
   let agentsNoModel = 0;
   for (const a of agents) {
     if (!a.model) { agentsNoModel++; continue; }
-    const tier = modelTier(a.model);
-    const row = by.get(a.model) || { id: a.model, tier, agents: 0, cost: 0, outTokens: 0 };
-    row.agents++;
-    row.cost += a.cost || 0;
-    row.outTokens += a.outTokens || 0;
-    by.set(a.model, row);
-    tierMix[tier] += a.cost || 0;
+    // One agent can appear under several models — that IS the finding when a
+    // default changes mid-run, so don't collapse it back to the first one seen.
+    const ids = a.usageByModel && Object.keys(a.usageByModel).length
+      ? Object.keys(a.usageByModel) : [a.model];
+    for (const id of ids) {
+      const b = (a.usageByModel && a.usageByModel[id]) || null;
+      const p = rateFor(id);
+      const cost = b && p ? priceBucket(b, p) : (ids.length === 1 ? (a.cost || 0) : 0);
+      const tier = modelTier(id);
+      const row = by.get(id) || { id, tier, agents: 0, cost: 0, outTokens: 0 };
+      row.agents++;
+      row.cost += cost;
+      row.outTokens += b ? b.outTokens : (a.outTokens || 0);
+      by.set(id, row);
+      tierMix[tier] += cost;
+    }
   }
   const total = TIERS.reduce((n, t) => n + tierMix[t], 0);
   const top = TOP_TIERS.reduce((n, t) => n + tierMix[t], 0);
@@ -1762,6 +1806,7 @@ function sessionSummary(meta) {
     durationMs: first && last ? new Date(last.ts) - new Date(first.ts) : 0,
     tokensIn: r.agents.reduce((n, a) => n + a.inTokens, 0),           // fresh input only
     tokensCache: r.agents.reduce((n, a) => n + (a.cacheTokens || 0), 0), // cache reads (re-billed prefix, 0.1x rate)
+    tokensCacheWrite: r.agents.reduce((n, a) => n + (a.cacheWriteTokens || 0), 0), // cache writes (stored prefix, 1.25x rate)
     tokensOut: r.agents.reduce((n, a) => n + a.outTokens, 0),
     cost: Math.round(r.agents.reduce((n, a) => n + (a.cost || 0), 0) * 100) / 100,
     retrying: r.agents.some(a => a.retrying),

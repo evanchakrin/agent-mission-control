@@ -729,8 +729,8 @@ function renderUsage() {
     b[s.kind] = (b[s.kind] || 0) + v; b.total += v; b.sessions++;
   }
   const keys = [...buckets.keys()].sort();
-  const totAll = { cost: 0, tokensIn: 0, tokensCache: 0, tokensOut: 0, agents: 0, sessions: data.length };
-  for (const s of data) { totAll.cost += s.cost || 0; totAll.tokensIn += s.tokensIn || 0; totAll.tokensCache += s.tokensCache || 0; totAll.tokensOut += s.tokensOut || 0; totAll.agents += s.agents || 0; }
+  const totAll = { cost: 0, tokensIn: 0, tokensCache: 0, tokensCacheWrite: 0, tokensOut: 0, agents: 0, sessions: data.length };
+  for (const s of data) { totAll.cost += s.cost || 0; totAll.tokensIn += s.tokensIn || 0; totAll.tokensCache += s.tokensCache || 0; totAll.tokensCacheWrite += s.tokensCacheWrite || 0; totAll.tokensOut += s.tokensOut || 0; totAll.agents += s.agents || 0; }
   const range = data.length ? `${new Date(Math.min(...data.map(s => s.mtime))).toLocaleDateString()} – ${new Date(Math.max(...data.map(s => s.mtime))).toLocaleDateString()}` : '—';
 
   // summary tiles
@@ -738,6 +738,7 @@ function renderUsage() {
     <div class="utile"><div class="ul">Total est. cost</div><div class="uv accent">~${fmtUsd(totAll.cost)}</div></div>
     <div class="utile"><div class="ul">Fresh in / out</div><div class="uv">${fmtTok(totAll.tokensIn)} / ${fmtTok(totAll.tokensOut)}</div></div>
     <div class="utile"><div class="ul">Cache reads <span title="cached prefix re-read each turn, billed at 0.1×">ⓘ</span></div><div class="uv small" style="font-size:16px">${fmtTok(totAll.tokensCache)}</div></div>
+    <div class="utile"><div class="ul">Cache writes <span title="context stored for the next turn, billed at 1.25× — the expensive half of hauling context around">ⓘ</span></div><div class="uv small" style="font-size:16px">${fmtTok(totAll.tokensCacheWrite)}</div></div>
     <div class="utile"><div class="ul">Agents</div><div class="uv">${totAll.agents}</div></div>
     <div class="utile"><div class="ul">Sessions</div><div class="uv">${totAll.sessions}</div></div>
     <div class="utile"><div class="ul">Range</div><div class="uv small">${range}</div></div>
@@ -4685,6 +4686,7 @@ function renderStatbar() {
   const evs = state.data.events;
   const inT = a.reduce((n, x) => n + (x.inTokens || 0), 0);
   const cacheT = a.reduce((n, x) => n + (x.cacheTokens || 0), 0);
+  const cacheW = a.reduce((n, x) => n + (x.cacheWriteTokens || 0), 0);
   const outT = a.reduce((n, x) => n + (x.outTokens || 0), 0);
   const cost = a.reduce((n, x) => n + (x.cost || 0), 0);
   const toolCalls = evs.filter(e => e.kind === 'tool-call' || e.kind === 'spawn').length;
@@ -4694,7 +4696,7 @@ function renderStatbar() {
   $('statbar').innerHTML =
     `<span>agents <b>${a.length}</b></span><span>events <b>${evs.length}</b></span>` +
     `<span>tool calls <b>${toolCalls}</b></span><span>duration <b>${fmtDur(dur)}</b></span>` +
-    `<span>tokens in <b>${fmtTok(inT)}</b> · cache <b>${fmtTok(cacheT)}</b> · out <b>${fmtTok(outT)}</b></span>` +
+    `<span>tokens in <b>${fmtTok(inT)}</b> · cache read <b>${fmtTok(cacheT)}</b> · cache write <b>${fmtTok(cacheW)}</b> · out <b>${fmtTok(outT)}</b></span>` +
     `<span>est. cost <b>~${fmtUsd(cost)}</b></span>` +
     (errs ? `<span style="color:var(--red)">errors <b style="color:var(--red)">${errs}</b></span>` : '');
 }
