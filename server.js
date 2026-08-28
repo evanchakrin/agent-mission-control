@@ -3701,8 +3701,15 @@ async function fetchLatestVersion() {
 // `--relay http://hub:4173 [--token secret] [--name machine-name]`
 // No UI here: every few seconds, any local session whose files changed is
 // parsed and POSTed to the hub, where it appears in the fleet.
+// The archive path refuses oversized files on their stat size, but the LIVE path
+// did not, and both scan the same directory. readSession() does a whole-file
+// readFileSync + split, so one 108MB transcript peaks at several hundred MB —
+// which is how this relay took a production box to a heap OOM. Same rule, both
+// paths: decide from the stat, never from the contents.
+const RELAY_PARSE_CAP = 64 * 1024 * 1024;
 async function runRelay(hub, machineName) {
   const sent = new Map(); // file -> last signature
+  const tooBig = new Set(); // logged once each, not every 5-second tick
   let hubBoot = null;     // hub restarts wipe its in-memory store; resend everything when its boot id changes
   console.log(`Relaying local sessions → ${hub}/v1/relay as "${machineName}"`);
   console.log(`Watching transcripts in ${PROJECTS_DIR}`);
@@ -3727,6 +3734,17 @@ async function runRelay(hub, machineName) {
       const isCodex = meta.file.startsWith('codex:');
       const sig = isCodex ? codexSignature(meta.file.slice(6)) : sessionSignature(resolveSessionPath(meta.file));
       if (!sig || sent.get(meta.file) === sig) continue;
+      if (!isCodex) {
+        let sz = 0;
+        try { sz = fs.statSync(resolveSessionPath(meta.file)).size; } catch { /* gone; skip below */ }
+        if (sz > RELAY_PARSE_CAP) {
+          if (!tooBig.has(meta.file)) {
+            tooBig.add(meta.file);
+            console.log(`skipping ${meta.file} (${Math.round(sz / 1048576)}MB) — too large to parse safely`);
+          }
+          continue;
+        }
+      }
       let result;
       try { result = getResult(meta.file); } catch (e) { console.error(`parse failed ${meta.file}: ${e.message}`); continue; }
       if (!result) continue;
