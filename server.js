@@ -560,7 +560,7 @@ function parseCodexLines(lines, agentId, ctx) {
     } else if (o.type === 'event_msg') {
       if (p.type === 'token_count' && p.info && p.info.last_token_usage) {
         const u = p.info.last_token_usage;
-        addUsage(agent, agent.model, Math.max(0, (u.input_tokens || 0) - (u.cached_input_tokens || 0)),
+        addUsage(agent, agent.model || ctx.model, Math.max(0, (u.input_tokens || 0) - (u.cached_input_tokens || 0)),
           u.cached_input_tokens || 0, 0, u.output_tokens || 0);
       } else if (p.type === 'sub_agent_activity' && p.agent_path && p.agent_path !== '/root') {
         const name = p.agent_path.split('/').filter(Boolean).pop();
@@ -647,20 +647,53 @@ function sessionSignature(sessionPath) {
 
 // Parse cache: whole-file reparse only when the signature changes; every open
 // SSE client, the REST endpoints, and the fleet view share the parsed result.
-const cache = new Map(); // sessionPath -> {sig, result}
+const cache = new Map(); // sessionPath -> {sig, result}  (LRU; see readSession)
+const SESSION_CACHE_MAX = 48;
+// The size guard belongs HERE, not at each caller. It was first added only to the
+// relay's send loop, which left the same unbounded read reachable from the local
+// view, the archive replay, SSE, export and four background scans — every one of
+// them calling readSession with a path and no idea how big it is. One cap inside
+// the function covers all of them.
+const SESSION_READ_CAP = 64 * 1024 * 1024;
+const overCap = new Set();          // logged once per file, not once per read
+function readTail(p, size, cap) {
+  if (size <= cap) return fs.readFileSync(p, 'utf8');
+  const fd = fs.openSync(p, 'r');
+  try {
+    const buf = Buffer.alloc(cap);
+    fs.readSync(fd, buf, 0, cap, size - cap);
+    const text = buf.toString('utf8');
+    return text.slice(text.indexOf('\n') + 1); // drop the partial leading record
+  } finally { fs.closeSync(fd); }
+}
 function readSession(sessionPath) {
   const sig = sessionSignature(sessionPath);
   const hit = cache.get(sessionPath);
-  if (hit && hit.sig === sig) return hit.result;
-  const text = fs.readFileSync(sessionPath, 'utf8');
+  // Refresh recency on a hit. Map iterates in INSERTION order and set() on an
+  // existing key does not reorder it, so without this the eviction below is FIFO:
+  // walking a session list longer than the cap evicts each entry just before it is
+  // needed again — a 0% hit rate rather than a degraded one.
+  if (hit && hit.sig === sig) { cache.delete(sessionPath); cache.set(sessionPath, hit); return hit.result; }
+  let size = 0;
+  try { size = fs.statSync(sessionPath).size; } catch { /* fall through to the read */ }
+  const truncated = size > SESSION_READ_CAP;
+  if (truncated && !overCap.has(sessionPath)) {
+    overCap.add(sessionPath);
+    console.log(path.basename(sessionPath) + ' is ' + Math.round(size / 1048576) +
+      'MB — reading only the most recent ' + (SESSION_READ_CAP / 1048576) + 'MB');
+  }
+  const text = readTail(sessionPath, size, SESSION_READ_CAP);
   const subs = subagentFiles(sessionPath).map(sf => {
     let t = '';
-    try { t = fs.readFileSync(sf.path, 'utf8'); } catch { /* ignore */ }
+    try { t = readTail(sf.path, fs.statSync(sf.path).size, SESSION_READ_CAP); } catch { /* ignore */ }
     return { id: sf.id, lines: t.split('\n'), group: sf.group };
   });
   const result = normalize(text.split('\n'), subs, workflowNames(sessionPath));
+  // Say so rather than presenting a partial read as a whole session. A number that
+  // looks complete and is not is the worst thing this tool can produce.
+  if (truncated) result.truncated = { readBytes: SESSION_READ_CAP, totalBytes: size };
   cache.set(sessionPath, { sig, result });
-  if (cache.size > 8) cache.delete(cache.keys().next().value);
+  if (cache.size > SESSION_CACHE_MAX) cache.delete(cache.keys().next().value);
   return result;
 }
 
@@ -699,6 +732,10 @@ function ingestTraces(body) {
     }
     const sess = otelSessions.get(sid);
     sess.version++;
+    // Every other session type bounds its event list — Codex at CODEX_EVENT_CAP,
+    // relayed sessions at RELAY_EVENT_CAP. OTLP was the one that grew forever, so a
+    // long-lived instrumented agent pushed spans into this array until the hub died.
+    if (sess.events.length > OTEL_EVENT_CAP) sess.events = sess.events.slice(-OTEL_EVENT_CAP);
     for (const ss of rs.scopeSpans || []) {
       for (const span of ss.spans || []) {
         spans++;
@@ -766,6 +803,7 @@ function otelList() {
 // Remote machines run `--relay http://hub:4173 --token <secret>`: they tail
 // their own transcripts and POST parsed sessions here. Stored in memory,
 // keyed "relay:<machine>:<file>", and shown in the fleet like local sessions.
+const OTEL_EVENT_CAP = 15000;    // matches the Codex cap; newest events win
 const relaySessions = new Map(); // id -> {id, meta, version, result, machine, ips, at}
 const BOOT_ID = Math.random().toString(36).slice(2); // hub identity; new relays resend when this changes
 
@@ -3037,8 +3075,12 @@ function buildExport(result, title) {
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
 
+// No Access-Control-Allow-Origin. It used to be '*' on every response, which is
+// what turned "the read routes forgot metaGate" into "any web page you visit can
+// read your transcripts off localhost". The UI is same-origin and relays are Node
+// fetch clients that ignore CORS entirely, so nothing needed it.
 function json(res, obj, code = 200) {
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  res.writeHead(code, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(obj));
 }
 
@@ -3133,11 +3175,15 @@ const server = http.createServer((req, res) => {
     return json(res, { boot: BOOT_ID, version: APP_VERSION });
   }
 
-  if (url.pathname === '/api/machines') return json(res, machineList());
+  if (url.pathname === '/api/machines') {
+    if (!metaGate(req, res)) return;
+    return json(res, machineList());
+  }
 
   // update check: latest version on GitHub main (cached 6h). Hub never
   // self-updates (a UI you're using shouldn't swap under you) — it just tells.
   if (url.pathname === '/api/update-check') {
+    if (!metaGate(req, res)) return;
     const now = Date.now();
     if (updateCache.at && now - updateCache.at < 6 * 3600e3) return json(res, updateCache.data);
     return fetchLatestVersion().then(v => {
@@ -3507,6 +3553,7 @@ const server = http.createServer((req, res) => {
 
   // deep search: full-text across every session's events (cached parses)
   if (url.pathname === '/api/search') {
+    if (!metaGate(req, res)) return;
     const q = (url.searchParams.get('q') || '').toLowerCase();
     if (q.length < 2) return json(res, { hits: [], scanned: 0 });
     const all = [...relayList(), ...otelList(), ...listSessions(), ...codexList()].sort((a, b) => b.mtime - a.mtime);
@@ -3537,12 +3584,14 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/api/sessions' || url.pathname === '/api/fleet') {
+    if (!metaGate(req, res)) return;
     const all = [...relayList(), ...otelList(), ...listSessions(), ...codexList()].sort((a, b) => b.mtime - a.mtime);
     if (url.pathname === '/api/fleet') return json(res, all.map(sessionSummary).filter(Boolean));
     return json(res, all.map(it => ({ ...it, kind: agentKindOf(it.file), machine: it.machine || (it.file.startsWith('relay:') ? it.file.split(':')[1] : os.hostname()), stableKey: stableKeyForItem(it) })));
   }
 
   if (url.pathname === '/api/session') {
+    if (!metaGate(req, res)) return;
     const r = getResult(url.searchParams.get('file') || '');
     if (!r) return json(res, { error: 'not found' }, 404);
     return json(res, { ...r, now: Date.now() });
@@ -3608,6 +3657,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/api/export') {
+    if (!metaGate(req, res)) return;
     const fileParam = url.searchParams.get('file') || '';
     const r = getResult(fileParam);
     if (!r) { res.writeHead(404); res.end(); return; }
@@ -3621,6 +3671,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/api/stream') {
+    if (!metaGate(req, res)) return;
     const fileParam = url.searchParams.get('file') || '';
     const isOtel = fileParam.startsWith('otel:');
     if (!getResult(fileParam)) { res.writeHead(404); res.end(); return; }
@@ -3628,7 +3679,6 @@ const server = http.createServer((req, res) => {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
     });
     let lastSig = null;
     const tick = () => {

@@ -250,6 +250,8 @@ select { background: var(--panel2); color: var(--text); border: 1px solid var(--
 .rt-name b { position: relative; z-index: 1; font-weight: 600; }
 .rt-s { font-weight: 700; }
 .rt-s.ok { color: var(--green); } .rt-s.warn { color: var(--amber); } .rt-s.bad { color: var(--red); }
+/* too few runs to call a rate: show the raw counts, in a colour that claims nothing */
+.rt-s.dim { color: var(--dim); font-weight: 500; }
 .fc-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .fc-why { font-size: 10.5px; color: var(--dim); }
 .fc-outlier-err { border-color: rgba(248,113,113,.45); }
@@ -967,3 +969,6 @@ footer button.on { border-color: var(--accent); color: var(--accent); }
 .hp-refused b { display: block; font-size: 12.5px; color: var(--text); margin-bottom: 4px; }
 .hp-refused span { font-size: 12px; line-height: 1.6; color: var(--dim); }
 .hp-refused span b { display: inline; color: var(--text); margin: 0; }
+
+/* a session read only in part — never let its totals look complete */
+.trunc-warn { color: var(--amber); cursor: help; }

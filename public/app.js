@@ -875,12 +875,18 @@ function renderFlows() {
       <div class="role-table">
         <div class="rt-head"><span>Role</span><span title="how many times this role was spawned">Used</span><span title="share of runs that finished with zero errors — under 80% means this role's prompt or task needs work">Success</span><span title="average time this role runs before finishing">Avg time</span><span title="total estimated spend on this role across all sessions">Total cost</span><span title="which of your machines this role ran on">Machines</span><span title="most recent session using this role — click to open">Last seen</span></div>
         ${topRoles.map(([name, r]) => {
+          // A rate needs enough runs behind it to mean anything. One clean run is
+          // not '100% success' — it is 'no idea yet', and colouring it green is a
+          // claim the data cannot support. Every other rate here is gated; this
+          // one was not.
+          const enough = r.n >= ROLE_MIN_RUNS;
           const success = Math.round(r.clean / r.n * 100);
-          const sCls = success >= 80 ? 'ok' : success >= 50 ? 'warn' : 'bad';
+          const sCls = !enough ? 'dim' : success >= 80 ? 'ok' : success >= 50 ? 'warn' : 'bad';
+          const sTxt = enough ? success + '%' : r.clean + '/' + r.n;
           return `<div class="rt-row" data-file="${esc(r.example?.file || '')}" title="Click to open the most recent session that used ${esc(name)}">
             <span class="rt-name"><span class="rt-bar" style="width:${Math.max(6, r.n / maxN * 100)}%"></span><b>${esc(name)}</b></span>
             <span>×${r.n}</span>
-            <span class="rt-s ${sCls}">${success}%</span>
+            <span class="rt-s ${sCls}" title="${enough ? '' : 'only ' + r.n + ' run' + (r.n === 1 ? '' : 's') + ' so far — not enough to call a success rate'}">${sTxt}</span>
             <span>${r.durN ? fmtDur(r.durMs / r.durN) : '—'}</span>
             <span class="fcost">~${fmtUsd(r.cost)}</span>
             <span class="dim">${[...r.machines].join(', ')}</span>
@@ -2587,6 +2593,7 @@ function sessionFailed() {
   return agents.some(a => a.lastErrored || a.retrying || (a.pendingTool && a.pendingTool.since && now - new Date(a.pendingTool.since) > 120000));
 }
 
+const ROLE_MIN_RUNS = 5;   // below this, show the raw counts instead of a rate
 function mineFleet() {
   const data = flowsCache || [];
   const norm = n => String(n || '').replace(/\s*#\d+$/, '').replace(/[0-9a-f-]{12,}/g, '·').slice(0, 30);
@@ -2612,7 +2619,22 @@ function mineFleet() {
       if (diag) insights.push({ key: 'diag:' + s.session, sev: 'bad', icon: '💥', text: `"${(s.title || s.session.slice(0, 8)).slice(0, 40)}" — ${failureSentence(diag)}`, file: s.file });
     }
     for (const a of d.agents) {
-      if (a.model) {
+      // Attribute per model the agent ACTUALLY used, not just the first one it
+      // reported. The server fixed this in costOf()/modelBreakdown() by keeping
+      // per-model buckets; reading only a.model here quietly undid it in the UI,
+      // so an agent that switched models showed all its spend under model one.
+      const buckets = a.usageByModel && Object.keys(a.usageByModel).length ? a.usageByModel : null;
+      if (buckets) {
+        const totalOut = Object.values(buckets).reduce((n, b) => n + (b.outTokens || 0), 0);
+        for (const [id, b] of Object.entries(buckets)) {
+          const mm = models.get(id) || { agents: 0, cost: 0, outTok: 0, roles: new Set(), tier: modelTier(id) };
+          mm.agents++; mm.outTok += b.outTokens || 0;
+          // split the agent's cost across its models in proportion to output
+          mm.cost += totalOut ? (a.cost || 0) * ((b.outTokens || 0) / totalOut) : 0;
+          if (a.id !== 'main') mm.roles.add(norm(a.name));
+          models.set(id, mm);
+        }
+      } else if (a.model) {
         const mm = models.get(a.model) || { agents: 0, cost: 0, outTok: 0, roles: new Set(), tier: modelTier(a.model) };
         mm.agents++; mm.cost += a.cost || 0; mm.outTok += a.outTokens || 0;
         if (a.id !== 'main') mm.roles.add(norm(a.name));
@@ -4698,6 +4720,12 @@ function renderStatbar() {
     `<span>tool calls <b>${toolCalls}</b></span><span>duration <b>${fmtDur(dur)}</b></span>` +
     `<span>tokens in <b>${fmtTok(inT)}</b> · cache read <b>${fmtTok(cacheT)}</b> · cache write <b>${fmtTok(cacheW)}</b> · out <b>${fmtTok(outT)}</b></span>` +
     `<span>est. cost <b>~${fmtUsd(cost)}</b></span>` +
+    // A transcript too large to read whole is shown from its most recent part only.
+    // Say so on the same line as the numbers it affects — a silent partial read is
+    // exactly the kind of confident-looking wrong answer this tool must not give.
+    (state.data.truncated
+      ? `<span class="trunc-warn" title="This session's transcript is ${fmtBytes(state.data.truncated.totalBytes)}, too large to read in full. Everything above is counted from the most recent ${fmtBytes(state.data.truncated.readBytes)} only, so the real totals are higher.">⚠ partial — newest ${fmtBytes(state.data.truncated.readBytes)} of ${fmtBytes(state.data.truncated.totalBytes)}</span>`
+      : '') +
     (errs ? `<span style="color:var(--red)">errors <b style="color:var(--red)">${errs}</b></span>` : '');
 }
 
