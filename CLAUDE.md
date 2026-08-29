@@ -2,7 +2,7 @@
 
 ## Project invariants (do not break these)
 
-- **Zero dependencies.** Node builtins only (`http`, `fs`, `path`, `os`, `crypto`, `child_process`). No npm packages, ever.
+- **Prefer zero dependencies.** Node builtins only (`http`, `fs`, `path`, `os`, `crypto`, `child_process`) is the default and has held so far. It is a strong preference, not a commandment: the project exists to serve its owner, and if a dependency clearly serves him better, take it and say why. Tools already on the machine (the C# compiler that ships with Windows, for example) are not dependencies.
 - **Watch-only.** The dashboard never launches, steers, or kills an agent. This is a permanent design stance and the core of the product's safety story.
 - **Relays are outbound-only.** The hub must never open a connection to a relay. Directive distribution happens through **git**, not a hub→relay push channel — see the rejected "relay mailbox" design.
 - **Never write `settings.json` or hooks remotely, or in bulk.** Guidance files (`CLAUDE.md` / `AGENTS.md`) hold words an agent reads; settings files hold commands the machine runs. Standing orders distribute words only. Hook edits stay deliberate, local, and one at a time through the Brain tab.
