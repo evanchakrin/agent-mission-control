@@ -3707,10 +3707,55 @@ async function fetchLatestVersion() {
 // which is how this relay took a production box to a heap OOM. Same rule, both
 // paths: decide from the stat, never from the contents.
 const RELAY_PARSE_CAP = 64 * 1024 * 1024;
+
+// What this relay has already delivered, remembered across restarts.
+// WHY: `sent` used to live only in memory, so every restart looked at a machine
+// with hundreds of finished sessions and decided all of them were new — reparsing
+// and re-POSTing the lot, including transcripts far too large to read safely.
+// That startup storm, not steady-state tailing, is what exhausted a production
+// box. The hub already persists what it receives, so resending on restart bought
+// nothing. Keyed to hub+machine: point a relay somewhere else and it starts fresh.
+const SENT_FILE = () => path.join(STATE_DIR, 'relay-sent.json');
+const SENT_MAX = 5000;              // bounded; oldest entries drop first
+function loadSent(hub, machineName) {
+  try {
+    const j = JSON.parse(fs.readFileSync(SENT_FILE(), 'utf8'));
+    if (j.hub !== hub || j.machine !== machineName) return { sent: new Map(), boot: null };
+    return { sent: new Map(Object.entries(j.sent || {})), boot: j.boot || null };
+  } catch { return { sent: new Map(), boot: null }; }
+}
+function saveSent(hub, machineName, sent, boot) {
+  try {
+    let entries = [...sent.entries()];
+    if (entries.length > SENT_MAX) entries = entries.slice(-SENT_MAX);
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    const tmp = SENT_FILE() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ hub, machine: machineName, boot, sent: Object.fromEntries(entries) }));
+    fs.renameSync(tmp, SENT_FILE());
+  } catch { /* a relay that cannot remember still works, it just rescans */ }
+}
+
 async function runRelay(hub, machineName) {
-  const sent = new Map(); // file -> last signature
+  const restored = loadSent(hub, machineName);
+  const sent = restored.sent;  // file -> last signature
   const tooBig = new Set(); // logged once each, not every 5-second tick
-  let hubBoot = null;     // hub restarts wipe its in-memory store; resend everything when its boot id changes
+  // Persist AS WE GO, not at the end of the pass. The very first pass on a busy
+  // machine is the long one — hundreds of sessions, minutes of work — and it is
+  // the one most likely to be interrupted. Saving only at the end meant a relay
+  // killed mid-pass remembered nothing and stormed all over again on restart.
+  let dirty = false, lastSave = 0;
+  const SAVE_EVERY_MS = 2000;
+  const flush = force => {
+    if (!dirty) return;
+    const now = Date.now();
+    if (!force && now - lastSave < SAVE_EVERY_MS) return;
+    saveSent(hub, machineName, sent, hubBoot);
+    lastSave = now; dirty = false;
+  };
+  // A clean shutdown should not throw away a pass's worth of progress either.
+  for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { flush(true); process.exit(0); });
+  if (sent.size) console.log(`Resuming: ${sent.size} sessions already delivered to this hub — only changes will be sent`);
+  let hubBoot = restored.boot; // remembered, so a hub restart while we were down is still caught
   console.log(`Relaying local sessions → ${hub}/v1/relay as "${machineName}"`);
   console.log(`Watching transcripts in ${PROJECTS_DIR}`);
   const tick = async () => {
@@ -3719,7 +3764,8 @@ async function runRelay(hub, machineName) {
     try {
       const b = await fetch(hub + '/v1/boot', { headers: { 'x-relay-machine': machineName, 'x-relay-version': APP_VERSION, ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) } }).then(r => r.json()).catch(() => null);
       if (b && b.boot) {
-        if (hubBoot && b.boot !== hubBoot) { sent.clear(); console.log('hub restarted — resending all sessions'); }
+        if (hubBoot && b.boot !== hubBoot) { sent.clear(); dirty = true; console.log('hub restarted — resending all sessions'); }
+        if (b.boot !== hubBoot) dirty = true;
         hubBoot = b.boot;
       }
     } catch { /* hub down; sends below will fail and retry */ }
@@ -3769,6 +3815,8 @@ async function runRelay(hub, machineName) {
         });
         if (r.ok) {
           sent.set(meta.file, sig);
+          dirty = true;
+          flush(false);   // debounced; keeps a long first pass durable
           const info = await r.json().catch(() => ({}));
           if (info.boot && hubBoot && info.boot !== hubBoot) { sent.clear(); sent.set(meta.file, sig); }
           if (info.boot) hubBoot = info.boot;
@@ -3781,6 +3829,7 @@ async function runRelay(hub, machineName) {
         // keep going: one bad session must not block the rest
       }
     }
+    flush(true);
   };
   await tick();
   setInterval(tick, 5000);
