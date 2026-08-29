@@ -1625,6 +1625,13 @@ function applySessionPatch(next, key, patch) {
     if (patch.projectId !== null && !next.projects.some(p => p.id === patch.projectId)) throw new Error('no such project');
     cur.projectId = patch.projectId;
   }
+  // A session's own title is whatever its first prompt happened to say, which is
+  // often a paragraph of pasted context. Let it be renamed. null clears the
+  // override and the derived title comes back.
+  if ('name' in patch) {
+    const n = patch.name === null ? null : clean(patch.name, LIM.name);
+    if (n) cur.name = n; else delete cur.name;
+  }
   if ('archived' in patch) cur.archived = !!patch.archived;
   if ('pinned' in patch) cur.pinned = !!patch.pinned;
   if ('note' in patch) cur.note = clean(patch.note, LIM.note);
@@ -1835,9 +1842,15 @@ function sessionSummary(meta) {
   const evs = r.events;
   const first = evs.find(e => e.ts), last = [...evs].reverse().find(e => e.ts);
   const machine = meta.file.startsWith('relay:') ? meta.file.split(':')[1] : os.hostname();
+  const sKey = stableKeyForItem(meta);
+  // Substitute the custom name HERE, at the one place a summary is built, so every
+  // one of the ~32 spots the UI prints a title inherits the rename for free.
+  // autoTitle keeps the derived one, so the rename box can show what it falls back to.
+  const custom = (metaState && metaState.sessions && metaState.sessions[sKey] && metaState.sessions[sKey].name) || null;
   return {
-    file: meta.file, project: meta.project, projPath: meta.projPath || null, session: meta.session, title: meta.title, mtime: meta.mtime,
-    kind: agentKindOf(meta.file), machine, stableKey: stableKeyForItem(meta),
+    file: meta.file, project: meta.project, projPath: meta.projPath || null, session: meta.session,
+    title: custom || meta.title, autoTitle: meta.title, renamed: !!custom, mtime: meta.mtime,
+    kind: agentKindOf(meta.file), machine, stableKey: sKey,
     agents: r.agents.length, events: evs.length,
     toolCalls: evs.filter(e => e.kind === 'tool-call' || e.kind === 'spawn').length,
     errors: evs.filter(e => e.error).length,

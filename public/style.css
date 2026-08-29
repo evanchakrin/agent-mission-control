@@ -972,3 +972,11 @@ footer button.on { border-color: var(--accent); color: var(--accent); }
 
 /* a session read only in part — never let its totals look complete */
 .trunc-warn { color: var(--amber); cursor: help; }
+/* rename a session in place: the pencil only appears on hover so the table stays calm */
+td.tsess { position: relative; }
+.tsess-t { vertical-align: middle; }
+.row-rename { opacity: 0; background: none; border: 0; color: var(--dim); cursor: pointer; font-size: 12px; padding: 0 4px; }
+tr:hover .row-rename { opacity: 1; }
+.row-rename:hover { color: var(--accent); }
+.rename-input { width: 100%; box-sizing: border-box; background: var(--bg2, #11161f); color: var(--text);
+  border: 1px solid var(--accent); border-radius: 4px; padding: 3px 6px; font: inherit; }

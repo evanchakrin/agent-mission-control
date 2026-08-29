@@ -614,7 +614,7 @@ function renderTable() {
       const spend = s.tierMix ? TIERS.reduce((a, t) => a + (s.tierMix[t] || 0), 0) : 0;
       const tts = spend < 0.01 ? null : s.topTierShare;
       return `<tr data-file="${esc(s.file)}"${m.archived ? ' class="row-archived"' : ''}>
-        <td class="tsess">${esc(s.title || s.session.slice(0, 8))}</td>
+        <td class="tsess" data-sk="${esc(s.stableKey || '')}" title="${s.renamed ? 'renamed — was: ' + esc(s.autoTitle || '') : 'double-click to rename'}"><span class="tsess-t">${esc(s.title || s.session.slice(0, 8))}</span>${s.stableKey ? '<button class="row-rename" title="rename">✎</button>' : ''}</td>
         <td><span class="kind-badge" style="background:${c}22;color:${c}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span></td>
         <td${machineTitle(s.machine) ? ` title="${esc(machineTitle(s.machine))}"` : ''}>${esc(machineLabel(s.machine))}</td>
         <td class="tmodels">${modelChips(s, { max: 3 }) || '<span class="dim">—</span>'}</td>
@@ -634,8 +634,46 @@ function renderTable() {
     if (arch && s) arch.onclick = e => { e.stopPropagation(); setSessionMeta(s.stableKey, { archived: !metaOf(s).archived }); };
     const menu = tr.querySelector('.row-menu');
     if (menu && s) menu.onclick = e => showCardMenu(e, s);
+    const cell = tr.querySelector('td.tsess');
+    if (cell && s && s.stableKey) {
+      const start = e => { e.stopPropagation(); beginRename(cell, s, renderTable); };
+      cell.ondblclick = start;
+      const pen = cell.querySelector('.row-rename');
+      if (pen) pen.onclick = start;
+    }
   });
   wireFleetControls(renderTable, $('tableView'));
+}
+
+// Rename a session in place. A session title is just whatever its first prompt
+// happened to say, which is often a paragraph of pasted context — so being able to
+// call it something short and true matters more here than in most tools.
+// Empty input clears the override and the original title comes back.
+function beginRename(cell, s, redraw) {
+  if (cell.querySelector('input')) return;
+  const current = s.renamed ? s.title : (s.autoTitle || s.title || '');
+  const input = document.createElement('input');
+  input.className = 'rename-input';
+  input.value = s.renamed ? s.title : '';
+  input.placeholder = (s.autoTitle || s.title || 'name this session').slice(0, 60);
+  input.maxLength = 120;
+  cell.innerHTML = '';
+  cell.appendChild(input);
+  input.focus(); input.select();
+  let settled = false;
+  const finish = async save => {
+    if (settled) return; settled = true;
+    const val = input.value.trim();
+    if (save && val !== (s.renamed ? s.title : '')) {
+      // metaPost already reports its own failures and refreshes the overview.
+      await setSessionMeta(s.stableKey, { name: val || null });
+      fleetCache = await (await fetch('/api/fleet')).json();
+    }
+    redraw();
+  };
+  input.onkeydown = e => { e.stopPropagation(); if (e.key === 'Enter') finish(true); else if (e.key === 'Escape') finish(false); };
+  input.onblur = () => finish(true);
+  input.onclick = e => e.stopPropagation();
 }
 
 // ---------- PROJECTS view (drag sessions into colored columns) ----------
