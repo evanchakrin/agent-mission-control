@@ -3962,7 +3962,8 @@ function installPaths() {
     dest: path.join(process.env.LOCALAPPDATA, 'AgentMissionControl'),
     startupVbs: path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'AgentMissionControl.vbs'),
     desktopUrl: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.url'), // legacy, removed on install
-    desktopLnk: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.lnk'),
+    desktopLnk: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.lnk'),   // legacy, removed on install
+    desktopExe: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.exe'),
   };
 }
 
@@ -3971,7 +3972,9 @@ function installWindows() {
     console.log('--install is Windows-only for now. On Mac/Linux, add "node server.js" to launchd/systemd.');
     process.exit(1);
   }
-  const { dest, startupVbs, desktopUrl, desktopLnk } = installPaths();
+  const { dest, startupVbs, desktopUrl, desktopLnk, desktopExe } = installPaths();
+  const CRLF = String.fromCharCode(13) + String.fromCharCode(10);
+  let builtExe = false;
   fs.mkdirSync(dest, { recursive: true });
   fs.copyFileSync(__filename, path.join(dest, 'server.js'));
   fs.cpSync(path.join(__dirname, 'public'), path.join(dest, 'public'), { recursive: true });
@@ -4034,31 +4037,53 @@ function installWindows() {
       iconArg = path.join(dest, 'icon.ico') + ',0';
     } catch { /* no icon: Windows uses its default, the shortcut still works */ }
 
+    // A REAL PROGRAM on the desktop, not a .lnk pointing at wscript pointing at a
+    // .vbs. That chain had four ways to fail and hit three of them: the icon rendered
+    // blank because Explorer cached a miss against the .ico path, the shortcut file
+    // vanished on its own, and double-clicking gave "cannot find". An .exe carries its
+    // icon inside the file, needs no Windows Script Host, and has no shortcut arrow.
     try {
-      const mk = path.join(dest, 'mkshortcut.vbs');
-      fs.writeFileSync(mk, [
-        'Dim sh, lnk',
-        'Set sh = CreateObject(' + Q + 'WScript.Shell' + Q + ')',
-        'Set lnk = sh.CreateShortcut(' + Q + desktopLnk + Q + ')',
-        'lnk.TargetPath = ' + Q + 'wscript.exe' + Q,
-        'lnk.Arguments = ' + Q + Q + Q + path.join(dest, 'launch.vbs') + Q + Q + Q,
-        'lnk.WorkingDirectory = ' + Q + dest + Q,
-        iconArg ? 'lnk.IconLocation = ' + Q + iconArg + Q : '',
-        'lnk.Description = ' + Q + 'Agent Mission Control - starts the dashboard if it is not running, then opens it' + Q,
-        'lnk.WindowStyle = 1',
-        'lnk.Save',
-      ].filter(Boolean).join('\r\n') + '\r\n');
-      require('child_process').execFileSync('cscript', ['//nologo', mk], { windowsHide: true, timeout: 15000 });
-      try { fs.unlinkSync(desktopUrl); } catch { /* no legacy shortcut to clean up */ }
+      const args = ['--out', dest, '--server', path.join(dest, 'server.js'), '--port', String(PORT)];
+      const tok = argValue('--token');
+      if (tok) args.push('--token', tok);
+      if (iconArg) args.push('--icon', path.join(dest, 'icon.ico'));
+      require('child_process').execFileSync(process.execPath,
+        [path.join(__dirname, 'tools', 'make-launcher.js')].concat(args),
+        { windowsHide: true, timeout: 60000, stdio: 'pipe' });
+      fs.copyFileSync(path.join(dest, 'Agent Mission Control.exe'), desktopExe);
+      builtExe = true;
+      for (const stale of [desktopUrl, desktopLnk]) {
+        try { fs.unlinkSync(stale); } catch { /* nothing stale to remove */ }
+      }
     } catch {
-      // couldn't build a .lnk: fall back to the old behaviour rather than nothing
-      try { fs.writeFileSync(desktopUrl, `[InternetShortcut]\r\nURL=http://localhost:${PORT}\r\n`); } catch { /* no Desktop dir */ }
+      // No C# compiler (a very old Windows): fall back to the shortcut rather than
+      // leaving the desktop empty. It is the worse option, but it is not nothing.
+      try {
+        const mk = path.join(dest, 'mkshortcut.vbs');
+        fs.writeFileSync(mk, [
+          'Dim sh, lnk',
+          'Set sh = CreateObject(' + Q + 'WScript.Shell' + Q + ')',
+          'Set lnk = sh.CreateShortcut(' + Q + desktopLnk + Q + ')',
+          'lnk.TargetPath = ' + Q + 'wscript.exe' + Q,
+          'lnk.Arguments = ' + Q + Q + Q + path.join(dest, 'launch.vbs') + Q + Q + Q,
+          'lnk.WorkingDirectory = ' + Q + dest + Q,
+          iconArg ? 'lnk.IconLocation = ' + Q + iconArg + Q : '',
+          'lnk.WindowStyle = 1',
+          'lnk.Save',
+        ].filter(Boolean).join(CRLF) + CRLF);
+        require('child_process').execFileSync('cscript', ['//nologo', mk], { windowsHide: true, timeout: 15000 });
+        try { fs.unlinkSync(desktopUrl); } catch { /* no legacy shortcut */ }
+      } catch {
+        try { fs.writeFileSync(desktopUrl, '[InternetShortcut]' + CRLF + 'URL=http://localhost:' + PORT + CRLF); } catch { /* no Desktop dir */ }
+      }
     }
   }
 
   require('child_process').spawn('wscript', [path.join(dest, 'start.vbs')], { detached: true, stdio: 'ignore' }).unref();
   console.log(`Installed. Runs now and at every login (${RELAY_TO ? 'relay → ' + RELAY_TO : 'dashboard at http://localhost:' + PORT}).`);
-  if (!RELAY_TO) console.log('Desktop shortcut created: "Agent Mission Control".');
+  if (!RELAY_TO) console.log(builtExe
+    ? 'Desktop program created: "Agent Mission Control".'
+    : 'Desktop shortcut created (no C# compiler found, so a .lnk was used instead).');
   console.log('Remove any time with: --uninstall');
   process.exit(0);
 }
