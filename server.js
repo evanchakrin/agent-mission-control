@@ -696,7 +696,11 @@ function sessionSignature(sessionPath) {
 // Parse cache: whole-file reparse only when the signature changes; every open
 // SSE client, the REST endpoints, and the fleet view share the parsed result.
 const cache = new Map(); // sessionPath -> {sig, result}  (LRU; see readSession)
-const SESSION_CACHE_MAX = 48;
+// 48 suits the HUB, where the fleet view revisits every session each poll. A
+// RELAY sends each parsed session once per change and never looks back — on a
+// production box, 48 retained full parses were hundreds of idle MB sitting
+// under the archive pass, and the sum took the process to a heap OOM.
+const SESSION_CACHE_MAX = RELAY_TO ? 4 : 48;
 // The size guard belongs HERE, not at each caller. It was first added only to the
 // relay's send loop, which left the same unbounded read reachable from the local
 // view, the archive replay, SSE, export and four background scans — every one of
@@ -3398,6 +3402,37 @@ const server = http.createServer((req, res) => {
     if (!authorized) return json(res, { error: 'bad token' }, 401);
     return json(res, { manifest: archiveManifest(url.searchParams.get('machine') || '') });
   }
+  // Raw streaming variant: bytes straight from the relay's disk to a temp file
+  // here, 64KB at a time. The JSON+base64 route holds ~4 copies of a file in
+  // relay memory (read, base64, JSON body, request) — that appetite, on top of
+  // everything else a relay holds, is what OOM'd a production box mid-archive.
+  if (url.pathname === '/v1/archive/raw' && req.method === 'POST') {
+    if (!authorized) return json(res, { error: 'bad token' }, 401);
+    const machine = String(req.headers['x-archive-machine'] || '');
+    let relPath = '';
+    try { relPath = decodeURIComponent(String(req.headers['x-archive-path'] || '')); } catch { /* refused below */ }
+    if (!machine || !relPath) return json(res, { error: 'need x-archive-machine and x-archive-path' }, 400);
+    const tmp = path.join(os.tmpdir(), 'mc-arch-' + crypto.randomBytes(8).toString('hex') + '.tmp');
+    const out = fs.createWriteStream(tmp);
+    let got = 0, over = false;
+    req.on('data', c => {
+      got += c.length;
+      if (got > ARCHIVE_FILE_CAP) { over = true; req.destroy(); out.destroy(); fs.unlink(tmp, () => {}); }
+    });
+    req.pipe(out);
+    req.on('error', () => { out.destroy(); fs.unlink(tmp, () => {}); });
+    out.on('finish', () => {
+      if (over) return;
+      try {
+        // reuse every guard storeArchiveFile has (path escape, .jsonl-only,
+        // per-file and total caps) by handing it the buffered temp file
+        storeArchiveFile(machine, relPath, fs.readFileSync(tmp));
+        json(res, { ok: true });
+      } catch (e) { json(res, { error: e.message }, 400); }
+      fs.unlink(tmp, () => {});
+    });
+    return;
+  }
   if (url.pathname === '/v1/archive' && req.method === 'POST') {
     if (!authorized) return json(res, { error: 'bad token' }, 401);
     return readBody(req, body => {
@@ -4229,11 +4264,23 @@ async function runRelay(hub, machineName) {
         if ((failed.get(f.rel) || 0) >= FAIL_GIVE_UP) continue; // already refused twice; stop burning memory on it
         if (manifest[f.rel] === f.size) continue; // hub already has this exact file
         try {
-          const data = fs.readFileSync(f.full).toString('base64');
-          const r = await fetch(hub + '/v1/archive', {
-            method: 'POST', headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
-            body: JSON.stringify({ machine: machineName, relPath: f.rel, data }),
-          });
+          // Stream from disk: constant memory instead of ~4x the file size. An
+          // older hub without /v1/archive/raw answers 404 and we fall back to
+          // the base64 route it does understand.
+          let r = await fetch(hub + '/v1/archive/raw', {
+            method: 'POST', duplex: 'half',
+            headers: { 'Content-Type': 'application/octet-stream',
+              'x-archive-machine': machineName, 'x-archive-path': encodeURIComponent(f.rel),
+              ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
+            body: require('stream').Readable.toWeb(fs.createReadStream(f.full)),
+          }).catch(() => null);
+          if (!r || r.status === 404) {
+            const data = fs.readFileSync(f.full).toString('base64');
+            r = await fetch(hub + '/v1/archive', {
+              method: 'POST', headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
+              body: JSON.stringify({ machine: machineName, relPath: f.rel, data }),
+            });
+          }
           if (r.ok) { sent++; failed.delete(f.rel); if (sent % 10 === 0) console.log(`archived ${sent} transcripts…`); }
           else if (r.status === 400) { const e = await r.json().catch(() => ({})); if (/archive full/.test(e.error || '')) { console.error('hub archive full — stopping'); return; } }
           else {
