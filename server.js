@@ -1680,6 +1680,20 @@ function applySessionPatch(next, key, patch) {
     const n = patch.name === null ? null : clean(patch.name, LIM.name);
     if (n) cur.name = n; else delete cur.name;
   }
+  // Rename one AGENT inside this session (the Orchestrator card, a subagent
+  // card). Stored per (session, agent id); the parsed transcripts are never
+  // touched — this is a label the owner chose, layered on at read time.
+  if ('agentName' in patch) {
+    const an = patch.agentName || {};
+    if (typeof an.id !== 'string' || !an.id || an.id.length > 200) throw new Error('bad agent id');
+    cur.agentNames = cur.agentNames || {};
+    const nm = an.name === null || an.name === undefined ? null : clean(String(an.name), LIM.name);
+    if (nm) {
+      if (Object.keys(cur.agentNames).length >= 200 && !cur.agentNames[an.id]) throw new Error('too many renamed agents');
+      cur.agentNames[an.id] = nm;
+    } else delete cur.agentNames[an.id];
+    if (!Object.keys(cur.agentNames).length) delete cur.agentNames;
+  }
   if ('archived' in patch) cur.archived = !!patch.archived;
   if ('pinned' in patch) cur.pinned = !!patch.pinned;
   if ('note' in patch) cur.note = clean(patch.note, LIM.note);

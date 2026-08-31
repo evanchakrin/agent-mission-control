@@ -974,8 +974,11 @@ footer button.on { border-color: var(--accent); color: var(--accent); }
 .trunc-warn { color: var(--amber); cursor: help; }
 /* rename a session in place: the pencil only appears on hover so the table stays calm */
 td.tsess { position: relative; }
-.tsess-t { vertical-align: middle; }
-.row-rename { opacity: 0; background: none; border: 0; color: var(--dim); cursor: pointer; font-size: 12px; padding: 0 4px; }
+/* The title text gets its OWN clipping box so a long title can no longer shove
+   the pencil past the cell's ellipsis edge — which made the rename button look
+   like a feature only one lucky short-titled row had. */
+.tsess-t { display: inline-block; max-width: calc(100% - 24px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+.row-rename { opacity: 0.3; background: none; border: 0; color: var(--dim); cursor: pointer; font-size: 12px; padding: 0 4px; }
 tr:hover .row-rename { opacity: 1; }
 .row-rename:hover { color: var(--accent); }
 .rename-input { width: 100%; box-sizing: border-box; background: var(--bg2, #11161f); color: var(--text);

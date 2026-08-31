@@ -3950,6 +3950,9 @@ function openSession(file) {
 
 function connect(file) {
   state.file = file;
+  // the session's metadata key, for agent renames — resolved from the fleet
+  // cache when we have it; a deep link without it just can't rename (rare)
+  state.stableKey = ((fleetCache || []).find(x => x.file === file) || {}).stableKey || null;
   if (state.es) state.es.close();
   state.lastSeq = -1;
   state.hot.forEach(t => clearTimeout(t)); state.hot.clear();
@@ -3964,6 +3967,7 @@ function connect(file) {
     if (typeof next.metaVersion === 'number' && next.metaVersion !== metaVersion) loadMeta(); // cross-tab freshness
     const fresh = next.events.filter(e => e.seq > state.lastSeq);
     state.lastSeq = next.events.length ? next.events[next.events.length - 1].seq : state.lastSeq;
+    applyAgentNames(next);
     state.data = next;
     for (const e of fresh.slice(-12)) heat(e.agent);
     $('liveDot').className = 'dot live'; $('liveLabel').textContent = 'live';
@@ -5034,6 +5038,31 @@ function sparkline(recentTs, firstTs, lastTs) {
 const SESSION_PANES = ['board', 'timeline', 'waterfall', 'lanes', 'costflow', 'story'];
 function showPane(id) { for (const p of SESSION_PANES) $(p).style.display = p === id ? '' : 'none'; }
 
+function applyAgentNames(data) {
+  const names = (state.stableKey && metaMap && metaMap[state.stableKey] && metaMap[state.stableKey].agentNames) || null;
+  if (!names || !data || !data.agents) return;
+  for (const ag of data.agents) {
+    const ov = names[ag.id];
+    if (ov) { ag.autoName = ag.autoName || ag.name || ag.id; ag.name = ov; ag.renamed = true; }
+  }
+}
+// prompt(), not an inline input, on purpose: a live board re-renders on every
+// stream event and would blow away an open editor mid-keystroke. prompt() is
+// synchronous and survives redraws — the machine rename set the precedent.
+async function renameAgent(ag) {
+  if (!state.stableKey) { alert('This session is not in the fleet metadata yet — open it from the fleet view once.'); return; }
+  const cur = ag.renamed ? ag.name : '';
+  const name = prompt('Rename this agent (blank = original name "' + (ag.autoName || ag.name || ag.id) + '"):', cur);
+  if (name === null) return;
+  await setSessionMeta(state.stableKey, { agentName: { id: ag.id, name: name.trim() || null } });
+  // Mutate the ORIGINAL agent record, not the card's copy — agentStateAt()
+  // spreads each agent per render, so a copy's rename evaporates on the next
+  // redraw. Found because the test asserted the card text, not just the API.
+  const real = (state.data.agents || []).find(x => x.id === ag.id) || ag;
+  if (name.trim()) { real.autoName = real.autoName || real.name || real.id; real.name = name.trim(); real.renamed = true; }
+  else if (real.renamed) { real.name = real.autoName; real.renamed = false; }
+  renderBoard();
+}
 function renderBoard() {
   showPane('board');
   const stage = $('stage'), cards = $('cards'), svg = $('edges');
@@ -5117,7 +5146,7 @@ function renderBoard() {
     const costTag = a.cost >= 0.005 ? `<span>~<b>${fmtUsd(a.cost)}</b></span>` : '';
     if (compact && a.id !== 'main') {
       el.innerHTML =
-        `<h2>🤖 <span class="nm">${esc(a.name || a.id)}</span> <span class="status ${st}">${st}</span></h2>` +
+        `<h2>🤖 <span class="nm" title="double-click to rename this agent">${esc(a.name || a.id)}</span> <span class="status ${st}">${st}</span></h2>` +
         `<div class="meta"><span>ev <b>${a.events}</b></span><span>out <b>${fmtTok(a.outTokens)}</b></span><span><b>${fmtDur(dur)}</b></span>${costTag}` +
         (a.errors ? `<span class="err">err <b>${a.errors}</b></span>` : '') + `</div>`;
     } else {
@@ -5139,7 +5168,7 @@ function renderBoard() {
         }).join('') + `</div>`;
       }
       el.innerHTML =
-        `<h2>${a.id === 'main' ? '🛰️' : '🤖'} <span class="nm">${esc(a.name || a.id)}</span> <span class="status ${st}">${st}</span></h2>` +
+        `<h2>${a.id === 'main' ? '🛰️' : '🤖'} <span class="nm" title="double-click to rename this agent">${esc(a.name || a.id)}</span> <span class="status ${st}">${st}</span></h2>` +
         (a.task ? `<div class="task">${esc(a.task)}</div>` : '') +
         `<div class="meta"><span>ev <b>${a.events}</b></span><span>out <b>${fmtTok(a.outTokens)}</b></span><span><b>${fmtDur(dur)}</b></span>${costTag}` +
         (a.errors ? `<span class="err">err <b>${a.errors}</b></span>` : '') + `</div>` +
@@ -5148,6 +5177,8 @@ function renderBoard() {
         (chips ? `<div class="chips">${chips}</div>` : '');
     }
     el.querySelectorAll('.mc-line').forEach(l => l.onclick = ev2 => { ev2.stopPropagation(); openDrawer(Number(l.dataset.seq)); });
+    const nmEl = el.querySelector('.nm');
+    if (nmEl) nmEl.ondblclick = ev2 => { ev2.stopPropagation(); renameAgent(a); };
     cards.appendChild(el);
   }
 
