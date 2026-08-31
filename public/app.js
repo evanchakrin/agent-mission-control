@@ -462,7 +462,7 @@ function renderFleet() {
       return `
       <div class="fcard${m.archived ? ' is-archived' : ''}" data-file="${esc(s.file)}" data-sk="${esc(s.stableKey || '')}" draggable="true" style="border-left:3px solid ${col}">
         ${s.stableKey ? `<div class="fcard-actions"><button class="fcard-arch" title="${m.archived ? 'unarchive' : 'archive'}">${m.archived ? '⤴' : '🗄'}</button><button class="fcard-menu" title="organize">⋯</button></div>` : ''}
-        <h3>${esc(s.title || s.session.slice(0, 8))}</h3>
+        <h3 class="fcard-title" title="${s.renamed ? 'renamed — was: ' + esc(s.autoTitle || '') : 'double-click to rename'}">${esc(s.title || s.session.slice(0, 8))}</h3>
         <div class="fproj"${s.projPath ? ` title="${esc(s.projPath)}"` : ''}><span class="kind-badge" style="background:${col}22;color:${col}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span> <span${machineTitle(s.machine) ? ` title="${esc(machineTitle(s.machine))}"` : ''}>${esc(machineLabel(s.machine))}</span>${proj && proj !== s.machine ? ' · ' + esc(proj) : ''}</div>
         ${cardBadges(s) ? `<div class="fbadges">${cardBadges(s)}</div>` : ''}
         ${modelChips(s)}
@@ -484,6 +484,10 @@ function renderFleet() {
     const arch = c.querySelector('.fcard-arch');
     if (arch && s) arch.onclick = e => { e.stopPropagation(); setSessionMeta(s.stableKey, { archived: !metaOf(s).archived }); };
     if (s && s.stableKey) c.ondragstart = e => e.dataTransfer.setData('text/plain', s.stableKey);
+    // Rename where the eye already is: double-click the card's own title.
+    // Same editor as the Table view — beginRename owns save/cancel/clear.
+    const h = c.querySelector('.fcard-title');
+    if (h && s && s.stableKey) wireRenameTitle(h, s, renderFleet, () => openSession(c.dataset.file));
   });
   wireFleetControls(renderFleet, $('fleet'));
 }
@@ -637,10 +641,9 @@ function renderTable() {
     if (menu && s) menu.onclick = e => showCardMenu(e, s);
     const cell = tr.querySelector('td.tsess');
     if (cell && s && s.stableKey) {
-      const start = e => { e.stopPropagation(); beginRename(cell, s, renderTable); };
-      cell.ondblclick = start;
+      wireRenameTitle(cell, s, renderTable, () => openSession(tr.dataset.file));
       const pen = cell.querySelector('.row-rename');
-      if (pen) pen.onclick = start;
+      if (pen) pen.onclick = e => { e.stopPropagation(); beginRename(cell, s, renderTable); };
     }
   });
   wireFleetControls(renderTable, $('tableView'));
@@ -650,6 +653,17 @@ function renderTable() {
 // happened to say, which is often a paragraph of pasted context — so being able to
 // call it something short and true matters more here than in most tools.
 // Empty input clears the override and the original title comes back.
+// A double-click on a renameable title fires a SINGLE click first, and the row
+// or card underneath opens the session on that first click — yanking the title
+// out from under the second. So renameable titles own their clicks: a single
+// click waits 280ms and then opens as usual; a double-click cancels the open
+// and starts the editor. Synthetic dblclick events in tests never caught this
+// because they skip the leading click a real mouse sends.
+function wireRenameTitle(el, s, redraw, open) {
+  let t = null;
+  el.onclick = e => { e.stopPropagation(); clearTimeout(t); t = setTimeout(open, 280); };
+  el.ondblclick = e => { e.stopPropagation(); clearTimeout(t); beginRename(el, s, redraw); };
+}
 function beginRename(cell, s, redraw) {
   if (cell.querySelector('input')) return;
   const current = s.renamed ? s.title : (s.autoTitle || s.title || '');
