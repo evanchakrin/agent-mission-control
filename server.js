@@ -562,6 +562,11 @@ function parseCodexLines(lines, agentId, ctx) {
         const u = p.info.last_token_usage;
         addUsage(agent, agent.model || ctx.model, Math.max(0, (u.input_tokens || 0) - (u.cached_input_tokens || 0)),
           u.cached_input_tokens || 0, 0, u.output_tokens || 0);
+        // Codex also writes a CUMULATIVE total on every event. In a tail-capped
+        // read the summed deltas only cover the window, but the last cumulative
+        // total covers the whole session since turn one — the authoritative
+        // number has been sitting inside the bytes we already read. Keep it.
+        if (p.info.total_token_usage) agent.codexTotal = p.info.total_token_usage;
       } else if (p.type === 'sub_agent_activity' && p.agent_path && p.agent_path !== '/root') {
         const name = p.agent_path.split('/').filter(Boolean).pop();
         const subId = 'sub:' + p.agent_path;
@@ -610,7 +615,50 @@ function readCodexSession(uuid) {
       try { parseCodexLines(readCappedLines(tf.path, tf.size), subId, ctx); } catch { /* ignore */ }
     }
   }
-  for (const a of ctx.agents.values()) { if (!a.model && ctx.model) a.model = ctx.model; a.cost = Math.round(costOf(a) * 10000) / 10000; }
+  // Codex writes a CUMULATIVE token counter on every event — but it is a
+  // SESSION-WIDE counter: every sub-thread rollout carries the same global
+  // figure, snapshotted at slightly different moments. (Assigning it per agent,
+  // the obvious move, multiplied one session by its ~70 files. Ground truth
+  // caught it before it shipped.) So it is applied ONCE: the largest snapshot
+  // is the true session total, and the per-agent window sums — which carry the
+  // real relative attribution — are scaled up to meet it. Totals become exact
+  // no matter how little of each file the tail read saw; the split between
+  // agents stays as good as the windows, which is disclosed, not hidden.
+  let auth = null;
+  const win = { in: 0, cache: 0, out: 0 };
+  for (const a of ctx.agents.values()) {
+    const t = a.codexTotal;
+    if (t && (!auth || (t.total_tokens || 0) > (auth.total_tokens || 0))) auth = t;
+    delete a.codexTotal;
+    win.in += a.inTokens; win.cache += a.cacheTokens; win.out += a.outTokens;
+  }
+  let scale = null;
+  if (auth && win.out > 0) {
+    const authFresh = Math.max(0, (auth.input_tokens || 0) - (auth.cached_input_tokens || 0));
+    // No clamp, either direction: the per-file windows all replay the SAME global
+    // event stream, so their sums OVERCOUNT by roughly the file count — 6x on the
+    // session that proved it. auth/win is the correction, whichever side of 1.
+    scale = {
+      in: win.in > 0 ? authFresh / win.in : 1,
+      cache: win.cache > 0 ? (auth.cached_input_tokens || 0) / win.cache : 1,
+      out: (auth.output_tokens || 0) / win.out,
+    };
+  }
+  for (const a of ctx.agents.values()) {
+    if (!a.model && ctx.model) a.model = ctx.model;
+    if (scale) {
+      a.inTokens = Math.round(a.inTokens * scale.in);
+      a.cacheTokens = Math.round(a.cacheTokens * scale.cache);
+      a.outTokens = Math.round(a.outTokens * scale.out);
+      for (const b of Object.values(a.usageByModel || {})) {
+        b.inTokens = Math.round(b.inTokens * scale.in);
+        b.cacheTokens = Math.round(b.cacheTokens * scale.cache);
+        b.outTokens = Math.round(b.outTokens * scale.out);
+      }
+      a.costAuthoritative = true;
+    }
+    a.cost = Math.round(costOf(a) * 10000) / 10000;
+  }
   ctx.events.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
   const events = ctx.events.length > CODEX_EVENT_CAP ? ctx.events.slice(-CODEX_EVENT_CAP) : ctx.events;
   events.forEach((e, i) => { e.seq = i; });

@@ -4769,7 +4769,7 @@ function renderEconomics() {
     <div class="flows-panel">
       <h3>What this means</h3>
       ${findings.map(f => `<div class="econ-finding">${f}</div>`).join('')}
-      ${codexSessions ? `<div class="dim" style="margin-top:10px">Honesty note: ${codexSessions} Codex session${codexSessions === 1 ? ' is' : 's are'} costed from a partial read of very large files, so their share is undercounted here.</div>` : ''}
+      ${codexSessions ? `<div class="dim" style="margin-top:10px">Note: Codex token totals come from each session's own cumulative counter, so the dollars are exact even for huge files — but the per-agent split within a Codex session is approximate, and its event timeline shows only the most recent part.</div>` : ''}
       ${unpricedAgents ? `<div class="dim" style="margin-top:4px">${unpricedAgents.toLocaleString()} agent${unpricedAgents === 1 ? '' : 's'} ran on models this tool has no price for — they are left out of the cost-per-turn table rather than shown as free.</div>` : ''}
     </div>`;
 
