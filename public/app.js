@@ -361,6 +361,11 @@ async function pollNotifications() {
       for (const m of ms.filter(x => x.remote && x.version && u.latest && x.version !== u.latest && x.version !== u.current)) {
         stale.push(`${m.name} (v${m.version} → send it the update paste)`);
       }
+      // a relay talking RIGHT NOW with no version at all predates version
+      // reporting — flag it loudest instead of skipping it silently
+      for (const m of ms.filter(x => x.remote && !x.version && Date.now() - x.lastSeen < 10 * 60e3)) {
+        stale.push(`${m.name} (version unknown — too old to say; send it the update paste)`);
+      }
       if (stale.length) { updateNotified = true; pushNotif('done', `v${u.latest || u.current} is latest — behind: ${stale.join('; ')}`, { title: 'Version check', file: '', machine: '', kind: 'claude', session: 'update' }); }
     } catch { /* ignore */ }
   }
@@ -3723,7 +3728,15 @@ async function loadMachines() {
       return `<div class="mcard ${fresh ? 'fresh' : ''}${q.quiet ? ' mcard-quiet' : ''}">
         <h3${renamed ? ` title="real name: ${esc(m.name)}"` : ''}>${m.remote ? '⇄' : '★'} ${esc(disp)}
           ${m.remote ? `<button class="mini-btn mrename" data-machine="${esc(m.name)}" title="rename this machine">✏️</button>` : ''}
-          ${m.version ? `<span class="mver ${drift ? 'drift' : ''}" title="${drift ? 'version differs from hub v' + esc(hubV) : 'app version'}">v${esc(m.version)}${drift ? ' ⚠' : ''}</span>` : ''}
+          ${m.version
+            ? `<span class="mver ${drift ? 'drift' : ''}" title="${drift ? 'version differs from hub v' + esc(hubV) : 'app version'}">v${esc(m.version)}${drift ? ' ⚠' : ''}</span>`
+            : m.remote && fresh
+              // A relay that is TALKING but reports no version predates version
+              // reporting entirely — the oldest build on the fleet, not a fine one.
+              // Skipping the badge here is exactly how a 7.7.0 relay ran unnoticed
+              // for weeks: null wore an OK costume.
+              ? `<span class="mver drift" title="this relay is too old to even say its version — update it">version unknown ⚠</span>`
+              : ''}
           <span class="mstatus ${statusClass}">${statusLabel}</span></h3>
         <div class="mips">${(m.ips || []).map(ip => `<span class="ip">${esc(ip)}</span>`).join('') || '<span class="ip dim">no IPs reported</span>'}</div>
         <div class="mstats"><span><b>${st.sessions}</b> sessions</span><span><b>${st.agents}</b> agents</span><span class="fcost"><b>~${fmtUsd(st.cost)}</b></span></div>
