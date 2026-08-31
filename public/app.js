@@ -4773,6 +4773,60 @@ function renderEconomics() {
       ${unpricedAgents ? `<div class="dim" style="margin-top:4px">${unpricedAgents.toLocaleString()} agent${unpricedAgents === 1 ? '' : 's'} ran on models this tool has no price for — they are left out of the cost-per-turn table rather than shown as free.</div>` : ''}
     </div>`;
 
+  // ---- is it getting better? ----
+  // Point-in-time numbers can't say whether the standing orders WORK. This charts
+  // the daily snapshots with plant/remeasure dates marked, so cause and effect
+  // share one axis. Honest at every size: one point renders as a starting line,
+  // not a fake trend.
+  (async () => {
+    let h = null;
+    try { h = await (await fetch('/api/econ-history')).json(); } catch { return; }
+    const hist = (h && h.history) || [];
+    if (!hist.length) return;
+    const holder = document.createElement('div');
+    holder.className = 'flows-panel';
+    holder.style.marginTop = '14px';
+    const first = hist[0], lastS = hist[hist.length - 1];
+    const fmtD = t => new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    if (hist.length < 3) {
+      const started = fmtD(first.at);
+      holder.innerHTML = `
+        <h3>Is it getting better?</h3>
+        <div class="dim">Recording began ${started} — a snapshot a day, kept in econ-history.jsonl. Trends draw themselves here once a few days exist. Today's marks: context ${lastS.ctxShare != null ? Math.round(lastS.ctxShare * 100) + '%' : '—'} of spend, top tiers ${lastS.topTierShare != null ? Math.round(lastS.topTierShare * 100) + '%' : '—'}, ${lastS.oneShotN} one-shot agents, sweet spot ~${lastS.sweetPerTurn != null ? fmtUsd(lastS.sweetPerTurn) : '—'}/turn.</div>`;
+      $('economics').appendChild(holder);
+      return;
+    }
+    // enough points for lines
+    const W = 720, H = 180, PX = 42, PY = 16;
+    const t0 = first.at, t1 = lastS.at || 1;
+    const x = t => PX + (W - PX - 8) * ((t - t0) / Math.max(1, t1 - t0));
+    const y = v => PY + (H - PY - 22) * (1 - v);           // v in 0..1
+    const line = (key, color) => {
+      const pts = hist.filter(s => s[key] != null).map(s => x(s.at).toFixed(1) + ',' + y(s[key]).toFixed(1));
+      return pts.length >= 2 ? `<polyline fill="none" stroke="${color}" stroke-width="2" points="${pts.join(' ')}"/>` : '';
+    };
+    const marks = ((h && h.marks) || []).filter(m => m.at >= t0 - 864e5 && m.at <= t1 + 864e5).map(m =>
+      `<line x1="${x(m.at).toFixed(1)}" y1="${PY}" x2="${x(m.at).toFixed(1)}" y2="${H - 22}" stroke="#818cf8" stroke-dasharray="3,4" stroke-width="1"><title>${esc(m.title)} — ${m.kind} ${fmtD(m.at)}</title></line>`).join('');
+    const grid = [0.25, 0.5, 0.75].map(v =>
+      `<line x1="${PX}" y1="${y(v)}" x2="${W - 8}" y2="${y(v)}" stroke="#ffffff12"/><text x="${PX - 6}" y="${y(v) + 3}" text-anchor="end" fill="var(--dim)" font-size="9">${v * 100}%</text>`).join('');
+    holder.innerHTML = `
+      <h3>Is it getting better? <span class="qi" title="Daily snapshots of the numbers above. Dashed vertical lines mark when a standing order was planted or remeasured — if the orders work, the lines should bend after them.">ⓘ</span></h3>
+      <svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;display:block">
+        ${grid}${marks}
+        ${line('ctxShare', '#fbbf24')}
+        ${line('topTierShare', '#f87171')}
+        <text x="${PX}" y="${H - 6}" fill="var(--dim)" font-size="9">${fmtD(t0)}</text>
+        <text x="${W - 8}" y="${H - 6}" text-anchor="end" fill="var(--dim)" font-size="9">${fmtD(t1)}</text>
+      </svg>
+      <div class="dim" style="display:flex;gap:16px;margin-top:6px;font-size:11.5px">
+        <span><span style="color:#fbbf24">━</span> context share of spend</span>
+        <span><span style="color:#f87171">━</span> top-tier share of spend</span>
+        <span><span style="color:#818cf8">┆</span> standing order planted / remeasured</span>
+        <span>one-shots: ${first.oneShotN} → ${lastS.oneShotN}</span>
+      </div>`;
+    $('economics').appendChild(holder);
+  })();
+
   // ---- keep the standing order honest ----
   // The planted tiering directive carries measured figures that go stale as the
   // fleet works. This regenerates its measured section from the numbers on this

@@ -1817,6 +1817,60 @@ function fleetEconAggregate() {
   return { life, split, tier, oneShotCost, subs, sessions, claudeSessions };
 }
 
+// ---------- economics history ----------
+// The Economics view answers "where does the money go TODAY". This answers the
+// question that actually justifies planting standing orders: did behaviour
+// change after the order landed? One compact snapshot per day, appended to a
+// jsonl nobody edits, charted with the directive plant/remeasure dates marked —
+// cause on the same axis as effect. Recording starts the day this ships;
+// history cannot be backfilled, which is precisely why it must run daily.
+const ECON_HISTORY = () => path.join(STATE_DIR, 'econ-history.jsonl');
+const ECON_SNAP_MIN_GAP_MS = 20 * 3600e3;   // one per day, tolerant of restarts
+function econHistoryRead() {
+  try {
+    return fs.readFileSync(ECON_HISTORY(), 'utf8').split('\n').filter(Boolean)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+function econSnapshot(reason) {
+  const hist = econHistoryRead();
+  const last = hist[hist.length - 1];
+  if (reason === 'timer' && last && Date.now() - last.at < ECON_SNAP_MIN_GAP_MS) return null;
+  const agg = fleetEconAggregate();
+  const total = agg.split.fresh + agg.split.read + agg.split.write + agg.split.out;
+  const tierTotal = Object.values(agg.tier).reduce((a, b) => a + b, 0);
+  const shown = agg.life.map((b, i) => ({ ...b, i })).filter(b => b.n >= 5 && b.turns > 0);
+  const sweet = shown.length >= 3
+    ? shown.reduce((a, b) => (a.cost / a.turns <= b.cost / b.turns ? a : b)) : null;
+  const d2 = n => Math.round(n * 100) / 100;
+  const snap = {
+    at: Date.now(), reason,
+    sessions: agg.sessions, subs: agg.subs,
+    totalUsd: d2(total),
+    ctxShare: total >= 1 ? d2((agg.split.read + agg.split.write) / total) : null,
+    outShare: total >= 1 ? d2(agg.split.out / total) : null,
+    topTierShare: tierTotal >= 10 ? d2((agg.tier.flagship + agg.tier.premium) / tierTotal) : null,
+    cheapUsd: d2(agg.tier.cheap),
+    oneShotN: agg.life[0].n, oneShotCost: d2(agg.oneShotCost),
+    sweetBucket: sweet ? sweet.i : null,
+    sweetPerTurn: sweet ? Math.round(sweet.cost / sweet.turns * 1000) / 1000 : null,
+  };
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.appendFileSync(ECON_HISTORY(), JSON.stringify(snap) + '\n');
+  } catch { return null; }
+  return snap;
+}
+// Daily, off the request path. The first run waits for the parse cache to warm —
+// a cold snapshot would block startup re-reading every transcript at once.
+setTimeout(() => {
+  try { econSnapshot('timer'); } catch (e) { console.error('econ snapshot failed: ' + e.message); }
+  setInterval(() => {
+    try { econSnapshot('timer'); } catch (e) { console.error('econ snapshot failed: ' + e.message); }
+  }, 6 * 3600e3);
+}, 5 * 60e3);
+
+
 const REMEASURE_MIN_SUBS = 200;   // below this, refuse to stamp numbers into a standing order
 function measuredTieringBody(agg) {
   const total = agg.split.fresh + agg.split.read + agg.split.write + agg.split.out;
@@ -3480,6 +3534,19 @@ const server = http.createServer((req, res) => {
   }
 
   // ---- directive registry (gated CRUD; plants standing orders into guidance files) ----
+  if (url.pathname === '/api/econ-history') {
+    if (!metaGate(req, res)) return;
+    // annotate with the moments a standing order was planted or remeasured, so
+    // the chart can show cause on the same axis as effect
+    const marks = [];
+    try {
+      for (const d of loadDirectives().items) {
+        marks.push({ at: d.createdAt, kind: 'planted', title: d.title });
+        if (d.lastReviewedAt && d.lastReviewedAt !== d.createdAt) marks.push({ at: d.lastReviewedAt, kind: 'remeasured', title: d.title });
+      }
+    } catch { /* chart still renders without marks */ }
+    return json(res, { history: econHistoryRead(), marks });
+  }
   if (url.pathname === '/api/directives' && req.method === 'GET') {
     if (!metaGate(req, res)) return;
     // `ok:false` = the folder is gone or no longer valid, so it offers no targets;
@@ -3579,6 +3646,7 @@ const server = http.createServer((req, res) => {
           const results = [];
           for (const t of d.targets || []) results.push({ label: t.label, path: t.path, ...updateInFile(t.path, d) });
           saveDirectives(store);
+          try { econSnapshot('remeasure'); } catch { /* history is best-effort */ }
           appendAudit({ kind: 'directive-remeasure', id: d.id, title: d.title, updated: results.filter(r => r.status === 'updated').length, sessions: agg.sessions, subs: agg.subs });
           return json(res, { ok: true, results, measuredFrom: { sessions: agg.sessions, subs: agg.subs }, body: d.body });
         }
