@@ -119,11 +119,12 @@ const VIEW_META = {
   graveyard:     { label: 'Graveyard',     icon: '🪦', pane: 'graveyard' },
   hookprops:     { label: 'Hook ideas',    icon: '🪝', pane: 'hookprops' },
   dejavu:        { label: 'Deja Vu',       icon: '🔁', pane: 'dejavu' },
+  economics:     { label: 'Economics',     icon: '⚖',  pane: 'economics' },
 };
 const NAV_MENUS = [
   { key: 'sessions', label: 'Sessions', views: ['fleet', 'table', 'constellation', 'calendar', 'fingerprints', 'rings', 'rhythm'] },
   { key: 'health',   label: 'Health',   views: ['trouble', 'unsaved', 'leaks', 'flows', 'divergence', 'graveyard'] },
-  { key: 'improve',  label: 'Improve',  views: ['playbooks', 'brain', 'hookprops', 'dejavu'] },
+  { key: 'improve',  label: 'Improve',  views: ['economics', 'playbooks', 'brain', 'hookprops', 'dejavu'] },
   { key: 'system',   label: 'System',   views: ['machines', 'projects', 'usage', 'audit'] },
 ];
 const OVERVIEW = NAV_MENUS.flatMap(m => m.views);
@@ -4647,12 +4648,142 @@ function renderHookProps() {
 // Markup + dispatch are both driven off NAV_MENUS/VIEW_META (declared up top next
 // to OVERVIEW) so a view only needs adding in one place. #navBar is rebuilt once at
 // boot; setTabs() just toggles classes/labels on the existing elements each switch.
+// ---------- ECONOMICS view (where the money actually goes) ----------
+// This view exists because these exact numbers were measured by hand in scratch
+// scripts, written into a standing order, and immediately began to go stale.
+// The findings it encodes: most spend is context handling rather than output;
+// cost per turn is U-shaped in agent lifetime (briefing cost amortizes while
+// re-reading compounds); one-shot subagents pay a full briefing and die before
+// earning it back. Every judgment below is gated on sample size — a rate with
+// too few runs behind it renders as raw counts, never as a confident verdict.
+const ECON_BUCKET_LABELS = ['1–2', '3–5', '6–10', '11–20', '21–40', '41–80', '81–160', '161+'];  // must match ECON_BUCKETS in server.js
+const ECON_MIN_AGENTS = 5;      // per-bucket floor before a cost/turn is shown as a rate
+const ECON_MIN_SPEND = 1;       // dollars, before percentages of spend mean anything
+
+async function loadEconomics() {
+  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  renderEconomics();
+}
+
+function renderEconomics() {
+  const data = fleetCache || [];
+  // sum the per-session aggregates the server already computed
+  const life = ECON_BUCKET_LABELS.map(() => ({ n: 0, turns: 0, cost: 0 }));
+  const split = { fresh: 0, read: 0, write: 0, out: 0 };
+  let oneShotCost = 0, subs = 0, codexSessions = 0, unpricedAgents = 0;
+  for (const s of data) {
+    const e = s.econ;
+    if (s.kind === 'codex') codexSessions++;
+    if (!e) continue;
+    // The dollar lanes take every session — a dollar is a dollar. The lifetime
+    // curve takes CLAUDE sessions only: there a turn is one assistant reply, a
+    // comparable unit. Codex counts token events (thousands per agent) and bills
+    // at different rates, so mixing it in once crowned a 4,300-'turn' Codex agent
+    // the cheapest work on the fleet. It was neither cheap nor 4,300 turns.
+    if (e.split) { split.fresh += e.split.fresh; split.read += e.split.read; split.write += e.split.write; split.out += e.split.out; }
+    if (s.kind !== 'claude') continue;
+    for (let i = 0; i < life.length; i++) {
+      const b = (e.life || [])[i];
+      if (b) { life[i].n += b.n; life[i].turns += b.turns; life[i].cost += b.cost; }
+    }
+    oneShotCost += e.oneShotCost || 0;
+    subs += e.subs || 0;
+    unpricedAgents += e.unpricedAgents || 0;
+  }
+  const total = split.fresh + split.read + split.write + split.out;
+  const ctx = split.read + split.write;
+  const pct = n => total >= ECON_MIN_SPEND ? Math.round(n / total * 100) + '%' : '—';
+
+  // the four billing lanes, plain-language first
+  const lanes = [
+    { k: 'read', label: 'Re-reading context', hint: 'everything already said, re-read on every turn (cache reads, 0.1× rate)', v: split.read, cls: 'ec-read' },
+    { k: 'write', label: 'Storing context', hint: 'briefings and new material written into the cache (1.25× rate)', v: split.write, cls: 'ec-write' },
+    { k: 'out', label: 'Actual output', hint: 'the words and code the models produced — the thing being paid for', v: split.out, cls: 'ec-out' },
+    { k: 'fresh', label: 'Fresh input', hint: 'brand-new prompt text billed at the full input rate', v: split.fresh, cls: 'ec-fresh' },
+  ].sort((a, b) => b.v - a.v);
+  const maxLane = Math.max(...lanes.map(l => l.v), 0.01);
+
+  // U-curve: cost per turn per lifetime bucket, gated per bucket
+  const rows = life.map((b, i) => ({
+    label: ECON_BUCKET_LABELS[i], n: b.n, turns: b.turns, cost: b.cost,
+    perTurn: b.turns ? b.cost / b.turns : null, gated: b.n < ECON_MIN_AGENTS,
+  }));
+  const shown = rows.filter(r => !r.gated && r.perTurn !== null);
+  const maxPer = Math.max(...shown.map(r => r.perTurn), 0.001);
+  const best = shown.length >= 2 ? shown.reduce((a, b) => (a.perTurn <= b.perTurn ? a : b)) : null;
+
+  // plain-language findings, each earned by its own gate
+  const findings = [];
+  if (total >= ECON_MIN_SPEND) {
+    findings.push(`<b>${pct(ctx)} of spend is moving context around</b> — re-reading and storing what was already said — versus ${pct(split.out)} on actual output. Shorter briefs and shorter agent lifetimes attack the whole ${fmtUsd(ctx)}; a cheaper model only rescales it.`);
+  }
+  if (best && shown.length >= 3) {
+    const worst = shown.reduce((a, b) => (a.perTurn >= b.perTurn ? a : b));
+    if (worst.perTurn > best.perTurn * 1.5) {
+      findings.push(`<b>The cheapest work happens in agents that live ${best.label} turns</b> (~${fmtUsd(best.perTurn)}/turn). Agents in the ${worst.label} bucket cost ${(worst.perTurn / best.perTurn).toFixed(1)}× as much per turn.`);
+    }
+  }
+  if (rows[0].n >= ECON_MIN_AGENTS && rows[0].perTurn && best && rows[0] !== best && rows[0].perTurn > (best.perTurn || 0) * 2) {
+    findings.push(`<b>One-shot agents are the worst value here</b>: ${rows[0].n} agents that lived 1–2 turns spent ${fmtUsd(oneShotCost)}, paying a full briefing each and quitting before it paid off. A single grep or read is cheaper done inline.`);
+  }
+  const tail = rows[rows.length - 1];
+  if (tail.n >= ECON_MIN_AGENTS && tail.cost > total * 0.4) {
+    findings.push(`<b>Most subagent money is in the long tail</b>: agents living ${tail.label} turns spent ${fmtUsd(tail.cost)}. Splitting long-runners costs a briefing or two and typically saves several times that in re-reads.`);
+  }
+  if (!findings.length) findings.push('Not enough runs to say anything with confidence yet — this page fills in as the fleet works.');
+
+  $('economics').innerHTML = `
+    <div class="fleet-head"><h2>Economics — where the money actually goes</h2>
+      <div style="display:flex;gap:8px">${homeButton('economics')}<button id="econRefresh" class="mini-btn">↻ refresh</button></div></div>
+    <div class="dim" style="margin-bottom:12px">Computed live from every parsed session on every machine, using the same corrected accounting as the cost figures elsewhere. All dollar figures are estimates.</div>
+
+    <div class="usage-tiles" style="margin-bottom:14px">
+      <div class="utile"><div class="ul">Attributed spend</div><div class="uv accent">~${fmtUsd(total)}</div></div>
+      <div class="utile"><div class="ul">Context handling</div><div class="uv">${pct(ctx)}</div></div>
+      <div class="utile"><div class="ul">Actual output</div><div class="uv">${pct(split.out)}</div></div>
+      <div class="utile"><div class="ul">Claude subagents measured</div><div class="uv">${subs.toLocaleString()}</div></div>
+      <div class="utile"><div class="ul">One-shot spend</div><div class="uv">${oneShotCost >= 0.01 ? '~' + fmtUsd(oneShotCost) : '—'}</div></div>
+    </div>
+
+    <div class="flows-panel" style="margin-bottom:14px">
+      <h3>Where each dollar goes <span class="qi" title="Every model bill has four lanes. Two of them are just carrying the conversation itself back and forth — that is usually where almost all the money is.">ⓘ</span></h3>
+      ${lanes.map(l => `
+        <div class="ec-lane" title="${esc(l.hint)}">
+          <span class="ec-label">${l.label}</span>
+          <span class="ec-track"><span class="ec-bar ${l.cls}" style="width:${Math.max(1.5, l.v / maxLane * 100)}%"></span></span>
+          <span class="ec-val">~${fmtUsd(l.v)}</span><span class="ec-pct dim">${pct(l.v)}</span>
+        </div>`).join('')}
+    </div>
+
+    <div class="flows-panel" style="margin-bottom:14px">
+      <h3>Cost per turn, by how long an agent lives <span class="dim" style="font-weight:400;font-size:11.5px">Claude agents only — a turn is one reply; other engines count work differently</span> <span class="qi" title="Short-lived agents pay a full briefing and quit before it pays off. Long-lived ones re-read an ever-growing history every turn. The cheap zone is in the middle.">ⓘ</span></h3>
+      <div class="econ-grid">
+        <div class="eg-head"><span>Agent lifetime</span><span>Agents</span><span>Total spent</span><span>Cost per turn</span><span></span></div>
+        ${rows.map(r => r.gated
+          ? `<div class="eg-row eg-gated" title="only ${r.n} agent${r.n === 1 ? '' : 's'} in this range so far — not enough to call a rate"><span>${r.label} turns</span><span>${r.n || '—'}</span><span>${r.cost ? '~' + fmtUsd(r.cost) : '—'}</span><span class="dim">${r.n ? 'too few to say' : 'none yet'}</span><span></span></div>`
+          : `<div class="eg-row${best && r.label === best.label ? ' eg-best' : ''}"><span>${r.label} turns${best && r.label === best.label ? ' ★' : ''}</span><span>${r.n}</span><span>~${fmtUsd(r.cost)}</span><span>~${fmtUsd(r.perTurn)}</span><span class="ec-track"><span class="ec-bar ec-curve" style="width:${Math.max(2, r.perTurn / maxPer * 100)}%"></span></span></div>`).join('')}
+      </div>
+      ${best ? `<div class="dim" style="margin-top:8px">★ the sweet spot — enough turns to absorb the briefing, not so many that re-reading takes over.</div>` : ''}
+    </div>
+
+    <div class="flows-panel">
+      <h3>What this means</h3>
+      ${findings.map(f => `<div class="econ-finding">${f}</div>`).join('')}
+      ${codexSessions ? `<div class="dim" style="margin-top:10px">Honesty note: ${codexSessions} Codex session${codexSessions === 1 ? ' is' : 's are'} costed from a partial read of very large files, so their share is undercounted here.</div>` : ''}
+      ${unpricedAgents ? `<div class="dim" style="margin-top:4px">${unpricedAgents.toLocaleString()} agent${unpricedAgents === 1 ? '' : 's'} ran on models this tool has no price for — they are left out of the cost-per-turn table rather than shown as free.</div>` : ''}
+    </div>`;
+
+  $('econRefresh').onclick = async () => { fleetCache = await (await fetch('/api/fleet')).json(); renderEconomics(); };
+  wireHomeButton($('economics'), 'economics', renderEconomics);
+}
+
 const VIEW_LOADERS = {
   fleet: loadFleet, table: loadTable, fingerprints: loadFingerprints, calendar: loadCalendar,
   rings: loadRings, rhythm: loadRhythm, projects: loadProjects, usage: loadUsage, flows: loadFlows,
   playbooks: loadPlaybooks, brain: loadBrain, audit: loadAudit, constellation: loadConstellation,
   machines: loadMachines, unsaved: loadUnsaved, trouble: loadTrouble, leaks: loadLeaks,
   divergence: loadDivergence, graveyard: loadGraveyard, hookprops: loadHookProps, dejavu: loadDejaVu,
+  economics: loadEconomics,
 };
 let openNavMenu = null;
 function closeNavMenus() {

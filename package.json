@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "7.24.0",
+  "version": "7.25.0",
   "description": "Live dashboard visualizing Claude Code agent sessions — orchestrator, subagents, and workflow fleets from JSONL transcripts",
   "bin": {
     "agent-mission-control": "./server.js"

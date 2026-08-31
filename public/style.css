@@ -980,3 +980,23 @@ tr:hover .row-rename { opacity: 1; }
 .row-rename:hover { color: var(--accent); }
 .rename-input { width: 100%; box-sizing: border-box; background: var(--bg2, #11161f); color: var(--text);
   border: 1px solid var(--accent); border-radius: 4px; padding: 3px 6px; font: inherit; }
+
+/* Economics view: dollar lanes and the lifetime U-curve */
+.ec-lane { display: grid; grid-template-columns: 170px 1fr 90px 46px; gap: 10px; align-items: center; margin: 7px 0; font-size: 12.5px; }
+.ec-label { color: var(--text); }
+.ec-track { display: block; height: 12px; background: #ffffff0d; border-radius: 6px; overflow: hidden; }
+.ec-bar { display: block; height: 100%; border-radius: 6px; }
+.ec-read  { background: #fbbf24; }
+.ec-write { background: #f87171; }
+.ec-out   { background: var(--accent); }
+.ec-fresh { background: #818cf8; }
+.ec-curve { background: #fbbf24; }
+.ec-val { text-align: right; font-weight: 600; }
+.ec-pct { text-align: right; }
+.econ-grid { display: flex; flex-direction: column; gap: 2px; }
+.eg-head, .eg-row { display: grid; grid-template-columns: 130px 70px 110px 110px 1fr; gap: 10px; align-items: center; font-size: 12.5px; padding: 5px 8px; border-radius: 6px; }
+.eg-head { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.eg-row:nth-child(even) { background: #ffffff06; }
+.eg-best { background: #5eead41a !important; box-shadow: inset 2px 0 0 var(--accent); }
+.eg-gated { color: var(--dim); }
+.econ-finding { margin: 9px 0; padding: 9px 12px; background: #ffffff08; border-left: 3px solid var(--accent); border-radius: 0 6px 6px 0; font-size: 13px; line-height: 1.5; }

@@ -1736,6 +1736,55 @@ function readBody(req, cb) {
 }
 
 // ---------- which models actually ran (fleet-wide) ----------
+// ---------- fleet economics ----------
+// WHY: the owner measured, by hand and in scratch scripts, that ~93% of this
+// fleet's spend was context handling rather than model output, that cost per
+// turn is U-shaped in agent lifetime (setup amortizes, re-reading compounds),
+// and that one-shot subagents are the worst per-turn value on the books. Those
+// findings went into a standing order and immediately began to go stale. This
+// computes them live from the same parsed agents the fleet view already holds,
+// so the numbers in front of the owner are always the numbers of record.
+// Cheap on purpose: one pass over r.agents, no extra file reads.
+// The tail is subdivided on purpose. With a single 41+ bucket, a handful of
+// 300-turn monsters averaged in with ordinary 50-turn agents flattened the
+// curve's right side and made the longest-lived agents look like the cheapest
+// work on the fleet — resolution error dressed as a finding.
+const ECON_BUCKETS = [[1, 2], [3, 5], [6, 10], [11, 20], [21, 40], [41, 80], [81, 160], [161, Infinity]];
+function econOf(agents) {
+  const life = ECON_BUCKETS.map(() => ({ n: 0, turns: 0, cost: 0 }));
+  const split = { fresh: 0, read: 0, write: 0, out: 0 };   // dollars, by billing lane
+  let oneShotCost = 0, subs = 0, unpricedAgents = 0;
+  for (const a of agents) {
+    const bm = a.usageByModel || {};
+    let replies = 0, pricedReplies = 0;
+    for (const id of Object.keys(bm)) {
+      const b = bm[id];
+      replies += b.replies || 0;
+      const p = rateFor(id);
+      if (!p) continue;
+      pricedReplies += b.replies || 0;
+      split.fresh += (b.inTokens / 1e6) * p.in;
+      split.read += (b.cacheTokens / 1e6) * p.in * 0.1;
+      split.write += (b.cacheWriteTokens / 1e6) * p.in * 1.25;
+      split.out += (b.outTokens / 1e6) * p.out;
+    }
+    if (a.type === 'main' || !replies) continue;
+    subs++;
+    if (replies <= 2) oneShotCost += a.cost || 0;
+    // Data discipline: an agent whose turns are mostly on models this tool cannot
+    // price would enter the curve as cost 0 over real turns — an unknown wearing a
+    // 'cheap' costume. Those agents are counted, disclosed, and kept OUT of the rate.
+    if (pricedReplies < replies * 0.9) { unpricedAgents++; continue; }
+    const bi = ECON_BUCKETS.findIndex(x => replies >= x[0] && replies <= x[1]);
+    if (bi > -1) { life[bi].n++; life[bi].turns += replies; life[bi].cost += a.cost || 0; }
+  }
+  const d = n => Math.round(n * 100) / 100;
+  return {
+    life: life.map(b => ({ n: b.n, turns: b.turns, cost: d(b.cost) })),
+    split: { fresh: d(split.fresh), read: d(split.read), write: d(split.write), out: d(split.out) },
+    oneShotCost: d(oneShotCost), subs, unpricedAgents,
+  };
+}
 // WHY: /api/fleet reported cost and agent counts but nothing about WHICH models
 // did the work, so a session that put nearly all of its money on the top tier
 // because a model was left unset looked exactly like a cheap one — the only way
@@ -1860,6 +1909,7 @@ function sessionSummary(meta) {
     tokensCacheWrite: r.agents.reduce((n, a) => n + (a.cacheWriteTokens || 0), 0), // cache writes (stored prefix, 1.25x rate)
     tokensOut: r.agents.reduce((n, a) => n + a.outTokens, 0),
     cost: Math.round(r.agents.reduce((n, a) => n + (a.cost || 0), 0) * 100) / 100,
+    econ: econOf(r.agents),
     retrying: r.agents.some(a => a.retrying),
     stalled: r.agents.some(a => a.pendingTool && a.pendingTool.since && now - new Date(a.pendingTool.since) > 120000) && now - meta.mtime < LIVE_WINDOW_MS,
     // model identity — see modelBreakdown()/liveAgentsOf() above
