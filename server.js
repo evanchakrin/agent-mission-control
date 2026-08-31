@@ -1736,6 +1736,102 @@ function readBody(req, cb) {
 }
 
 // ---------- which models actually ran (fleet-wide) ----------
+// ---------- self-updating standing orders ----------
+// The tiering directive's numbers were hand-measured, frozen into prose across a
+// dozen files, and went stale twice in one week — once because the accounting
+// underneath them was wrong, once because the fleet simply kept working. Worse,
+// the registry's stored copy kept the ORIGINAL text, so any later replant would
+// have resurrected numbers that were known to be false. This regenerates the
+// measured section from the same live aggregates the Economics view shows, writes
+// it into the registry, and rewrites the block inside every planted file in place.
+// The policy prose is fixed; only what was MEASURED is remeasured.
+function fleetEconAggregate() {
+  const life = ECON_BUCKETS.map(() => ({ n: 0, turns: 0, cost: 0 }));
+  const split = { fresh: 0, read: 0, write: 0, out: 0 };
+  const tier = { flagship: 0, premium: 0, mid: 0, cheap: 0, unknown: 0 };
+  let oneShotCost = 0, subs = 0, sessions = 0, claudeSessions = 0;
+  for (const meta of [...relayList(), ...otelList(), ...listSessions(), ...codexList()]) {
+    const s = sessionSummary(meta);
+    if (!s || !s.econ) continue;
+    sessions++;
+    const e = s.econ;
+    split.fresh += e.split.fresh; split.read += e.split.read; split.write += e.split.write; split.out += e.split.out;
+    if (s.tierMix) for (const k of Object.keys(tier)) tier[k] += s.tierMix[k] || 0;
+    if (s.kind !== 'claude') continue;   // the lifetime curve only makes sense in reply-turns
+    claudeSessions++;
+    for (let i = 0; i < life.length; i++) {
+      const b = e.life[i];
+      if (b) { life[i].n += b.n; life[i].turns += b.turns; life[i].cost += b.cost; }
+    }
+    oneShotCost += e.oneShotCost || 0;
+    subs += e.subs || 0;
+  }
+  return { life, split, tier, oneShotCost, subs, sessions, claudeSessions };
+}
+
+const REMEASURE_MIN_SUBS = 200;   // below this, refuse to stamp numbers into a standing order
+function measuredTieringBody(agg) {
+  const total = agg.split.fresh + agg.split.read + agg.split.write + agg.split.out;
+  const ctx = agg.split.read + agg.split.write;
+  const tierTotal = Object.values(agg.tier).reduce((a, b) => a + b, 0);
+  const topShare = tierTotal ? Math.round((agg.tier.flagship + agg.tier.premium) / tierTotal * 100) : null;
+  const cheapUsd = agg.tier.cheap;
+  const shown = agg.life
+    .map((b, i) => ({ ...b, label: ['1-2', '3-5', '6-10', '11-20', '21-40', '41-80', '81-160', '161+'][i] }))
+    .filter(b => b.n >= 5 && b.turns > 0)
+    .map(b => ({ ...b, perTurn: b.cost / b.turns }));
+  const best = shown.length >= 3 ? shown.reduce((a, b) => (a.perTurn <= b.perTurn ? a : b)) : null;
+  const first = shown.find(b => b.label === '1-2');
+  const stamp = new Date().toISOString().slice(0, 10);
+
+  const lines = [
+    'When running multi-agent work in this project (Workflow fan-outs, Task/Agent subagents):',
+    '',
+    '**Set `model` explicitly on EVERY agent call. Never let a subagent inherit the orchestrator\'s model.** Omitting `model:` is silent, and inheritance is how a cheap job ends up billed at the orchestrator\'s rate.',
+    '',
+    'Tier by the work being done, not by who spawned it:',
+    '',
+    '- **Orchestrator, final synthesis, adversarial verdict, security-sensitive implementation** → premium (Opus 5). Flagship (Fable 5) only for the hardest long-horizon planning.',
+    '- **Review, research, drafting, analysis workers** → `claude-sonnet-5`.',
+    '- **Pure fetch / grep / read / summarize helpers** → `claude-haiku-4-5`.',
+    '',
+    '**Mind agent lifetime as much as tier.** Do not spawn one-shot subagents for a single grep or read — they pay a full briefing and die before it pays off. Give long-running agents a natural end instead of letting them re-read an ever-growing history every turn.',
+    '',
+    `_Measured ${stamp} by Agent Mission Control from ${agg.sessions} sessions (${agg.subs.toLocaleString()} Claude subagents). These figures refresh from the Economics view; do not hand-edit them:_`,
+    '',
+  ];
+  if (total >= 1) lines.push(`- **${Math.round(ctx / total * 100)}% of spend is context handling** (re-reading + storing what was already said); ${Math.round(agg.split.out / total * 100)}% is actual model output. Shorter briefs and lifetimes attack the whole bill; a cheaper tier only rescales it.`);
+  if (topShare !== null && tierTotal >= 10) lines.push(`- **${topShare}% of spend sits on the top two tiers.** The cheap tier is at $${cheapUsd.toFixed(2)} total — effectively unused.`);
+  if (best && first && first.perTurn > best.perTurn * 1.5) lines.push(`- **Cost per turn is U-shaped in agent lifetime**: ~$${first.perTurn.toFixed(3)}/turn for 1-2 turn agents vs ~$${best.perTurn.toFixed(3)} in the ${best.label}-turn sweet spot (${(first.perTurn / best.perTurn).toFixed(1)}× worse).`);
+  const tail = shown[shown.length - 1];
+  if (tail && best && tail !== best && tail.perTurn > best.perTurn * 1.3) lines.push(`- **The long tail is expensive too**: agents living ${tail.label} turns run ~$${tail.perTurn.toFixed(3)}/turn, ${(tail.perTurn / best.perTurn).toFixed(1)}× the sweet spot, because re-reading compounds.`);
+  lines.push('', 'When a workflow finishes, report a per-tier cost breakdown from the models that **actually ran**, not the ones intended. Configured and actual are different things; only the second one is billed. Check before claiming a tiering strategy worked.');
+  return lines.join('\n');
+}
+
+// Rewrite an already-planted block in place, preserving everything around it.
+function updateInFile(p, d) {
+  const link = linkedAway(p);
+  if (link) return { status: 'error', error: `that file is a ${link} to somewhere else — edit it directly instead` };
+  const m = dirMarker(d.id);
+  let cur;
+  try { cur = fs.readFileSync(p, 'utf8'); } catch { return { status: 'missing-file' }; }
+  const i = cur.indexOf(m.start), j = cur.indexOf(m.end);
+  if (i < 0 || j < 0) return { status: 'not-present' };
+  const block = directiveBlock(d);
+  const next = cur.slice(0, i).replace(/\n+$/, '') + block + cur.slice(j + m.end.length).replace(/^\n+/, '\n');
+  if (Buffer.byteLength(next) > BRAIN_MAX) return { status: 'too-big' };
+  try {
+    fs.copyFileSync(p, p + '.mc-backup');
+    snapshotBrain({ path: p, name: path.basename(p) });
+    const tmp = p + '.mc-tmp';
+    fs.writeFileSync(tmp, next);
+    fs.renameSync(tmp, p);
+    return { status: 'updated' };
+  } catch (e) { return { status: 'error', error: e.message }; }
+}
+
+
 // ---------- fleet economics ----------
 // WHY: the owner measured, by hand and in scratch scripts, that ~93% of this
 // fleet's spend was context handling rather than model output, that cost per
@@ -3420,6 +3516,23 @@ const server = http.createServer((req, res) => {
         if (b.op === 'check') {
           const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');
           return json(res, { ok: true, statuses: checkDirective(d) });
+        }
+        if (b.op === 'remeasure') {
+          // Regenerate the MEASURED half of a standing order from live fleet data,
+          // update the registry copy (so future replants can't resurrect stale
+          // numbers), and rewrite the block inside every planted file in place.
+          const d = store.items.find(x => x.id === String(b.id || ''));
+          if (!d) throw new Error('no such directive');
+          if (d.topic !== 'model-tiering') throw new Error('only the model-tiering order knows how to measure itself (so far)');
+          const agg = fleetEconAggregate();
+          if (agg.subs < REMEASURE_MIN_SUBS) throw new Error('only ' + agg.subs + ' subagents measured — not enough to stamp numbers into a standing order (needs ' + REMEASURE_MIN_SUBS + ')');
+          d.body = measuredTieringBody(agg);
+          d.lastReviewedAt = Date.now();   // just re-verified against reality, which is what a review is
+          const results = [];
+          for (const t of d.targets || []) results.push({ label: t.label, path: t.path, ...updateInFile(t.path, d) });
+          saveDirectives(store);
+          appendAudit({ kind: 'directive-remeasure', id: d.id, title: d.title, updated: results.filter(r => r.status === 'updated').length, sessions: agg.sessions, subs: agg.subs });
+          return json(res, { ok: true, results, measuredFrom: { sessions: agg.sessions, subs: agg.subs }, body: d.body });
         }
         if (b.op === 'reviewed') { // owner looked it over and it's still good — resets the review clock
           const d = store.items.find(x => x.id === b.id); if (!d) throw new Error('not found');

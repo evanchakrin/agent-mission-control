@@ -4773,6 +4773,39 @@ function renderEconomics() {
       ${unpricedAgents ? `<div class="dim" style="margin-top:4px">${unpricedAgents.toLocaleString()} agent${unpricedAgents === 1 ? '' : 's'} ran on models this tool has no price for — they are left out of the cost-per-turn table rather than shown as free.</div>` : ''}
     </div>`;
 
+  // ---- keep the standing order honest ----
+  // The planted tiering directive carries measured figures that go stale as the
+  // fleet works. This regenerates its measured section from the numbers on this
+  // page and rewrites the block in every file it was planted into. The policy
+  // prose never changes — only what was measured is remeasured.
+  (async () => {
+    let reg = null;
+    try { reg = await (await fetch('/api/directives')).json(); } catch { /* panel just stays hidden */ }
+    const d = reg && (reg.items || []).find(x => x.topic === 'model-tiering' && (x.targets || []).length);
+    if (!d) return;
+    const holder = document.createElement('div');
+    holder.className = 'flows-panel';
+    holder.style.marginTop = '14px';
+    const ageDays = Math.floor((Date.now() - (d.lastReviewedAt || d.createdAt)) / 864e5);
+    holder.innerHTML = `
+      <h3>The standing order these numbers feed</h3>
+      <div class="dim" style="margin-bottom:10px">“${esc(d.title)}” is planted in ${(d.targets || []).length} file${(d.targets || []).length === 1 ? '' : 's'} and was last measured ${ageDays === 0 ? 'today' : ageDays + ' day' + (ageDays === 1 ? '' : 's') + ' ago'}. Replanting rewrites only its measured figures — the rules themselves stay as written.</div>
+      <button id="econReplant" class="mini-btn">🛰 Replant with today's numbers</button>
+      <span id="econReplantOut" class="dim" style="margin-left:10px"></span>`;
+    $('economics').appendChild(holder);
+    $('econReplant').onclick = async () => {
+      const out = $('econReplantOut');
+      out.textContent = 'measuring…';
+      try {
+        const r = await fetch('/api/directives', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf }, body: JSON.stringify({ op: 'remeasure', id: d.id }) });
+        const j = await r.json();
+        if (!r.ok || j.error) { out.textContent = j.error || ('failed (' + r.status + ')'); return; }
+        const ok = j.results.filter(x => x.status === 'updated');
+        const bad = j.results.filter(x => x.status !== 'updated');
+        out.textContent = 'updated ' + ok.length + ' file' + (ok.length === 1 ? '' : 's') + ' from ' + j.measuredFrom.sessions + ' sessions' + (bad.length ? ' — ' + bad.map(b => (b.label || b.path) + ': ' + b.status).join(', ') : '');
+      } catch (e) { out.textContent = 'failed: ' + e.message; }
+    };
+  })();
   $('econRefresh').onclick = async () => { fleetCache = await (await fetch('/api/fleet')).json(); renderEconomics(); };
   wireHomeButton($('economics'), 'economics', renderEconomics);
 }
