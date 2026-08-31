@@ -666,7 +666,12 @@ function renderTable() {
 // because they skip the leading click a real mouse sends.
 function wireRenameTitle(el, s, redraw, open) {
   let t = null;
-  el.onclick = e => { e.stopPropagation(); clearTimeout(t); t = setTimeout(open, 280); };
+  // 500ms, matching the Windows double-click allowance. 280ms felt snappier but
+  // fired the single-click open BETWEEN the two clicks of an ordinary relaxed
+  // double-click — reported by the owner within the hour, on real hardware,
+  // after the synthetic tests had passed. The delay only applies to titles;
+  // clicking anywhere else on the row or card still opens instantly.
+  el.onclick = e => { e.stopPropagation(); clearTimeout(t); t = setTimeout(open, 500); };
   el.ondblclick = e => { e.stopPropagation(); clearTimeout(t); beginRename(el, s, redraw); };
 }
 function beginRename(cell, s, redraw) {
