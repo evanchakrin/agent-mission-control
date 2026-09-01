@@ -66,8 +66,11 @@ before(async () => {
   }
 
   // 96MB heap: parsing or buffering the 15MB transcript even once would die here
+  // --archive on purpose: the archive pass fires at +8s and must NOT collide
+  // with live deltas on the same mirror (its tmp+rename used to be able to land
+  // mid-append and duplicate a region — the convergence assertion below would see it)
   relay = spawn(process.execPath, ['--max-old-space-size=96', path.join(ROOT, 'server.js'),
-    '--relay', BASE, '--name', 'soak-test', '--dir', relayProjects, '--codex-dir', emptyCodex],
+    '--relay', BASE, '--name', 'soak-test', '--dir', relayProjects, '--codex-dir', emptyCodex, '--archive'],
     { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, AMC_STATE_DIR: relayState, AMC_RELAY_DEBOUNCE_MS: '1000' } });
   relay.stdout.on('data', d => { relayLog += d; });
   relay.stderr.on('data', d => { relayLog += d; });

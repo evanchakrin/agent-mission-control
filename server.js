@@ -13,6 +13,12 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+// One crafted request or one stray sync throw in a handler must not take the
+// whole dashboard (or a relay) down — log loudly, keep serving. State writes
+// are all atomic (tmp+rename), so surviving is strictly better than dying.
+process.on('uncaughtException', e => console.error('UNCAUGHT:', e && e.stack || e));
+process.on('unhandledRejection', e => console.error('UNHANDLED REJECTION:', e && e.stack || e));
+
 function argValue(flag) {
   const i = process.argv.indexOf(flag);
   return i > -1 ? process.argv[i + 1] : null;
@@ -859,6 +865,8 @@ function otelList() {
 // keyed "relay:<machine>:<file>", and shown in the fleet like local sessions.
 const OTEL_EVENT_CAP = 15000;    // matches the Codex cap; newest events win
 const relaySessions = new Map(); // id -> {id, meta, version, result, machine, ips, at}
+const relayParseQueue = new Map();     // mirror path -> latest {machine, m} awaiting parse
+const relayParseScheduled = new Set(); // mirror paths with a parse already queued
 const BOOT_ID = Math.random().toString(36).slice(2); // hub identity; new relays resend when this changes
 
 // Relayed sessions are cached to disk so a hub restart does NOT lose them.
@@ -3428,43 +3436,79 @@ const server = http.createServer((req, res) => {
     }
     const base = path.resolve(archiveMachineDir(machine));
     const dest = path.resolve(base, relPath.replace(/\\/g, '/'));
-    if (!dest.startsWith(base + path.sep) || !/\.jsonl$/.test(dest)) { req.resume(); return json(res, { error: 'bad path' }, 400); }
+    // null bytes ride through path.resolve untouched and then throw INSIDE fs —
+    // which, unguarded, killed the whole hub with one crafted request
+    if (relPath.includes('\0') || !dest.startsWith(base + path.sep) || !/\.jsonl$/.test(dest)) { req.resume(); return json(res, { error: 'bad path' }, 400); }
     let cur = 0;
     try { cur = fs.statSync(dest).size; } catch { /* new file */ }
     if (offset !== cur && offset !== 0) { req.resume(); return json(res, { error: 'offset mismatch', size: cur }, 409); }
+    // Content anchor: the relay sends a hex digest of the ≤64 bytes just before
+    // its offset. If OUR bytes there differ, the streams have diverged (rewrite,
+    // duplicated region, junk from an aborted lying request) — answer 409 size:0
+    // so the relay replaces from scratch instead of appending onto a wrong prefix.
+    const anchor = String(req.headers['x-relay-anchor'] || '');
+    if (offset > 0 && anchor) {
+      const n = Math.min(64, offset);
+      const buf = Buffer.alloc(n);
+      try {
+        const fd = fs.openSync(dest, 'r');
+        try { fs.readSync(fd, buf, 0, n, offset - n); } finally { fs.closeSync(fd); }
+      } catch { /* unreadable: fall through to mismatch */ }
+      if (crypto.createHash('sha1').update(buf).digest('hex') !== anchor) { req.resume(); return json(res, { error: 'anchor mismatch', size: 0 }, 409); }
+    }
     if (offset + declared > ARCHIVE_FILE_CAP) { req.resume(); return json(res, { error: 'file too large' }, 413); }
     if (declared > 0 && archiveTotalSize() + declared > ARCHIVE_TOTAL_CAP) { req.resume(); return json(res, { error: 'archive full' }, 507); }
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    // Stream straight to disk, 'a' for a true append. A request that dies
-    // mid-body leaves a longer file than the relay's offset — the NEXT attempt
-    // gets a 409 with our size and resumes from there, so no cleanup is needed.
-    const out = fs.createWriteStream(dest, { flags: offset === 0 ? 'w' : 'a' });
+    archSizeCache.total += declared; // count admitted bytes NOW: N requests inside one cache window must not each pass against the same stale total
+    let out;
+    try {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      // Stream straight to disk, 'a' for a true append. A request that dies
+      // mid-body leaves a longer file than the relay's offset — the NEXT attempt
+      // gets a 409 with our size and resumes from there, so no cleanup is needed.
+      out = fs.createWriteStream(dest, { flags: offset === 0 ? 'w' : 'a' });
+    } catch (e) { req.resume(); return json(res, { error: e.message }, 400); }
     let got = 0, killed = false;
     req.on('data', c => {
       got += c.length;
-      if (got > declared + 1024 && !killed) { killed = true; out.destroy(); req.destroy(); } // liar guard: declared size is a promise
+      if (got > declared && !killed) { killed = true; out.destroy(); req.destroy(); } // liar guard: declared size is a promise, and the anchor check catches any junk that already landed
     });
     req.on('error', () => { try { out.destroy(); } catch { /* already gone */ } });
     out.on('error', e => { if (!res.headersSent) json(res, { error: e.message }, 500); });
     out.on('finish', () => {
       let size = 0;
       try { size = fs.statSync(dest).size; } catch { /* vanished */ }
-      let id;
       // The MAIN transcript's append carries the session metadata and triggers
       // the reparse; subagent-file appends arrive bare first, so the hub never
-      // parses a half-updated set.
+      // parses a knowingly half-updated set. The parse itself runs AFTER the
+      // response, coalesced per file — acking a delta must not wait multi-hundred
+      // ms behind readSession, and back-to-back appends parse once, not twice.
       const metaHdr = req.headers['x-relay-meta'];
       if (metaHdr) {
         try {
           const m = JSON.parse(decodeURIComponent(String(metaHdr)));
-          if (m && m.file) {
-            const wf = new Map(Object.entries(m.wf || {}));
-            const result = readSession(dest, wf);
-            id = ingestRelay({ machine, file: m.file, meta: m.meta || {}, proj: m.proj, result, ips: m.ips, version: m.version });
+          // the metadata must describe the file it rode in on — a relay may not
+          // ingest session B built from file A's bytes
+          const claimed = 'claude/' + String(m && m.file || '').replace(/\\/g, '/');
+          if (m && m.file && claimed === relPath.replace(/\\/g, '/')) {
+            relayParseQueue.set(dest, { machine, m });
+            if (!relayParseScheduled.has(dest)) {
+              relayParseScheduled.add(dest);
+              setImmediate(() => {
+                relayParseScheduled.delete(dest);
+                const job = relayParseQueue.get(dest);
+                relayParseQueue.delete(dest);
+                if (!job) return;
+                try {
+                  const wf = new Map(Object.entries(job.m.wf || {}));
+                  const result = readSession(dest, wf);
+                  ingestRelay({ machine: job.machine, file: job.m.file, meta: job.m.meta || {}, proj: job.m.proj, result, ips: job.m.ips, version: job.m.version });
+                } catch (e) { console.error('relay append parse failed:', e.message); }
+              });
+            }
           }
-        } catch (e) { console.error('relay append parse failed:', e.message); }
+        } catch (e) { console.error('relay append meta rejected:', e.message); }
       }
-      json(res, { ok: true, size, id, boot: BOOT_ID });
+      json(res, { ok: true, size, boot: BOOT_ID });
     });
     req.pipe(out);
     return;
@@ -4238,6 +4282,16 @@ async function runRelay(hub, machineName) {
   const fails = new Map();    // file -> consecutive failures
   let hubDelta = null;        // does the hub speak /v1/relay/append? null until probed
   let hubDownUntil = 0, hubDownFails = 0;
+  // Mirror-relative paths the delta path has ever written (rebuilt from the
+  // persisted offsets on restart). The --archive pass must never upload these:
+  // its tmp+rename would land mid-append and permanently duplicate a region.
+  const deltaOwned = new Set();
+  for (const [file, v] of sent) {
+    if (v && typeof v === 'object') {
+      deltaOwned.add('claude/' + String(file).split(path.sep).join('/'));
+      for (const rel of Object.keys(v.subs || {})) deltaOwned.add(rel);
+    }
+  }
   const sigOf = v => (v && typeof v === 'object') ? v.sig : v; // sent values: legacy plain sig, or {sig, off, subs}
   const noteFailure = (file, e) => {
     const n = (fails.get(file) || 0) + 1;
@@ -4247,6 +4301,20 @@ async function runRelay(hub, machineName) {
     console.error(`send failed for ${file}: ${e.message} — retry in ${Math.round(wait / 1000)}s`);
   };
 
+  // sha1 of the ≤64 bytes just before off — the hub compares against its own
+  // bytes there and refuses the append if the streams have diverged (a rewrite,
+  // or a duplicated region from a write that raced the archive path)
+  const anchorFor = (absPath, off) => {
+    if (off <= 0) return null;
+    const n = Math.min(64, off);
+    const buf = Buffer.alloc(n);
+    try {
+      const fd = fs.openSync(absPath, 'r');
+      try { fs.readSync(fd, buf, 0, n, off - n); } finally { fs.closeSync(fd); }
+    } catch { return null; }
+    return crypto.createHash('sha1').update(buf).digest('hex');
+  };
+
   // POST bytes [off..EOF] of absPath, streamed from disk in 64KB chunks.
   // Returns {ok, off, boot} | {retryAt} on offset disagreement | {gone}.
   const postAppend = async (relPath, absPath, off, extraHeaders) => {
@@ -4254,6 +4322,7 @@ async function runRelay(hub, machineName) {
     try { size = fs.statSync(absPath).size; } catch { return { gone: true }; }
     if (off > size) off = 0; // local file shrank/rotated: replace outright
     const empty = off === size;
+    const anchor = anchorFor(absPath, off);
     const r = await fetch(hub + '/v1/relay/append', {
       method: 'POST', ...(empty ? {} : { duplex: 'half' }),
       headers: {
@@ -4262,6 +4331,7 @@ async function runRelay(hub, machineName) {
         'x-relay-path': encodeURIComponent(relPath),
         'x-relay-offset': String(off),
         'x-relay-bytes': String(size - off),
+        ...(anchor ? { 'x-relay-anchor': anchor } : {}),
         ...(TOKEN ? { 'x-relay-token': TOKEN } : {}),
         ...(extraHeaders || {}),
       },
@@ -4271,15 +4341,23 @@ async function runRelay(hub, machineName) {
     });
     if (r.status === 404) { const e = new Error('hub has no /v1/relay/append'); e.fallback = true; throw e; }
     if (r.status === 413) { const e = new Error('file too large for hub'); e.tooBig = true; throw e; }
+    if (r.status === 400 || r.status === 431) {
+      // OUR request is malformed (oversized meta header, bad path) — deliver
+      // this session by the legacy route rather than retrying the same request
+      // into the ground, but do NOT write the hub off as delta-incapable
+      const e = new Error(`hub refused append (${r.status}) for ${relPath}`); e.fallbackOnce = true; throw e;
+    }
     if (r.status === 409) {
       const j = await r.json().catch(() => ({}));
       const hubSize = Number(j.size) || 0;
       // bytes already on the hub are a prefix of ours (append-only), so resume
-      // from ITS size; a hub holding MORE than we have means replace from 0
+      // from ITS size; a hub holding MORE than we have — or an anchor mismatch
+      // (size 0) — means replace from 0
       return { retryAt: hubSize > 0 && hubSize <= size ? hubSize : 0 };
     }
     if (!r.ok) throw new Error(`hub ${r.status} for ${relPath}: ${(await r.text().catch(() => '')).slice(0, 200)}`);
     const j = await r.json().catch(() => ({}));
+    deltaOwned.add(relPath); // the live path owns this mirror now — the archive pass must never rename over it
     return { ok: true, off: size, boot: j.boot };
   };
 
@@ -4287,24 +4365,29 @@ async function runRelay(hub, machineName) {
     const rec = (prev && typeof prev === 'object') ? prev : { sig: null, off: 0, subs: {} };
     if (!rec.subs) rec.subs = {};
     // subagent transcripts first; the main file's append carries the metadata
-    // and triggers the hub-side reparse of the whole set
+    // and triggers the hub-side reparse of the whole set. subs is keyed by the
+    // mirror-relative path so a restart can rebuild deltaOwned from it.
+    let allSubsOk = true;
     for (const sf of subagentFiles(mainPath)) {
       const rel = 'claude/' + path.relative(PROJECTS_DIR, sf.path).split(path.sep).join('/');
-      let off = rec.subs[sf.id] || 0;
+      let off = rec.subs[rel] || 0, ok = false;
       for (let attempt = 0; attempt < 2; attempt++) {
         const res = await postAppend(rel, sf.path, off);
-        if (res.gone) { off = null; break; }
-        if (res.ok) { off = res.off; break; }
+        if (res.gone) break; // vanished (or transiently unreadable): allSubsOk stays false → retried next tick
+        if (res.ok) { off = res.off; ok = true; break; }
         off = res.retryAt;
       }
-      if (off != null) rec.subs[sf.id] = off; // progress survives even if the main send below fails
+      if (ok) rec.subs[rel] = off; // only DELIVERED offsets are recorded — a 409 retryAt we never sent to must not be persisted as progress
+      else allSubsOk = false;
     }
-    // workflow names ride along (tiny): the hub's mirror has no workflows/*.json
+    // workflow names ride along (tiny): the hub's mirror has no workflows/*.json.
+    // The whole header must fit Node's 16KB header ceiling — drop wf first if not.
+    const proj = { slug: meta.project || null, cwd: (meta.project ? claudeProjectCwd(path.join(PROJECTS_DIR, meta.project)) : null) || null };
     const wf = {};
     let wfCount = 0;
-    for (const [k, v] of workflowNames(mainPath)) { if (++wfCount > 50) break; wf[k] = v; }
-    const proj = { slug: meta.project || null, cwd: (meta.project ? claudeProjectCwd(path.join(PROJECTS_DIR, meta.project)) : null) || null };
-    const metaHdr = encodeURIComponent(JSON.stringify({ file: meta.file, meta, proj, ips: localIPs(), version: APP_VERSION, wf }));
+    for (const [k, v] of workflowNames(mainPath)) { if (++wfCount > 50) break; wf[k] = String(v).slice(0, 80); }
+    let metaHdr = encodeURIComponent(JSON.stringify({ file: meta.file, meta, proj, ips: localIPs(), version: APP_VERSION, wf }));
+    if (metaHdr.length > 8000) metaHdr = encodeURIComponent(JSON.stringify({ file: meta.file, meta, proj, ips: localIPs(), version: APP_VERSION }));
     let off = rec.off || 0, res = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       const a = await postAppend('claude/' + String(meta.file).split(path.sep).join('/'), mainPath, off, { 'x-relay-meta': metaHdr });
@@ -4317,7 +4400,9 @@ async function runRelay(hub, machineName) {
     if (res.boot && hubBoot && res.boot !== hubBoot) sent.clear();
     if (res.boot) hubBoot = res.boot;
     const prevOff = (prev && typeof prev === 'object') ? prev.off || 0 : 0;
-    sent.set(meta.file, { sig, off: res.off, subs: rec.subs });
+    // an incomplete subagent set records sig:null — never a match, so the whole
+    // session is retried next tick instead of silently losing that tail forever
+    sent.set(meta.file, { sig: allSubsOk ? sig : null, off: res.off, subs: rec.subs });
     dirty = true;
     flush(false);
     console.log(`sent Δ ${meta.title || meta.session} (+${Math.max(0, res.off - prevOff)} bytes)`);
@@ -4405,7 +4490,12 @@ async function runRelay(hub, machineName) {
           try { ok = await sendDelta(meta, mainPath, sig, sent.get(meta.file)); }
           catch (e) {
             if (e.fallback) { hubDelta = false; console.log('hub predates delta sends — falling back to full session POSTs'); }
-            else if (e.tooBig) { if (!tooBig.has(meta.file)) { tooBig.add(meta.file); console.log(`skipping ${meta.file} — larger than the hub accepts`); } continue; }
+            else if (e.fallbackOnce) { console.error(e.message + ' — sending this one whole instead'); }
+            else if (e.tooBig) {
+              if (!tooBig.has(meta.file)) { tooBig.add(meta.file); console.log(`skipping ${meta.file} — larger than the hub accepts`); }
+              noteFailure(meta.file, e); // backoff too: no point knocking every 5 seconds on a permanent refusal
+              continue;
+            }
             else throw e;
           }
         }
@@ -4422,6 +4512,9 @@ async function runRelay(hub, machineName) {
         else nextAt.delete(meta.file);
       }
     }
+    // housekeeping: drop expired debounce stamps so months of come-and-go
+    // sessions can't grow the map without bound
+    if (nextAt.size > 2000) { const t = Date.now(); for (const [k, v] of nextAt) if (v < t && !fails.has(k)) nextAt.delete(k); }
     flush(true);
   };
   await tick();
@@ -4463,6 +4556,7 @@ async function runRelay(hub, machineName) {
           if (!skipped.includes(f.rel)) { skipped.push(f.rel); console.log(`archive: skipping ${f.rel} (${Math.round(f.size / 1048576)}MB) — larger than this hub can accept`); }
           continue;
         }
+        if (deltaOwned.has(f.rel)) continue; // the live delta path keeps this mirror byte-complete; a whole-file upload here would race an append and duplicate a region
         if ((failed.get(f.rel) || 0) >= FAIL_GIVE_UP) continue; // already refused twice; stop burning memory on it
         if (manifest[f.rel] === f.size) continue; // hub already has this exact file
         try {
