@@ -4527,7 +4527,16 @@ async function runRelay(hub, machineName) {
     const withCodex = process.argv.includes('--archive-codex');
     // base64 inflates by 4/3 and the JSON envelope adds a little; leave 15% headroom.
     // Anything above this CANNOT be accepted, so sending it is guaranteed waste.
-    const FILE_CAP = Math.floor((50e6 * 0.85) * 3 / 4);
+    // Two caps, because there are two transports. The legacy base64-JSON route
+    // really is bounded by the hub's body limit (~30MB after base64 inflation).
+    // The streaming route is bounded only by the hub's mirror cap (120MB) — but
+    // this skip check used the legacy number for BOTH, so 33-107MB transcripts
+    // were declined by a limit that stopped existing when uploads learned to
+    // stream. Found by the ERP field agent, not by a reviewer: the skip lines
+    // were still in the log after the streaming upgrade shipped.
+    const FILE_CAP_LEGACY = Math.floor((50e6 * 0.85) * 3 / 4);
+    const FILE_CAP_RAW = ARCHIVE_FILE_CAP;   // matches the hub's own mirror cap
+    let hubHasRaw = null;                    // learned from the first attempt
     const failed = new Map();          // relPath -> consecutive failures
     const FAIL_GIVE_UP = 2;            // stop after this many; never retry into the ground
     const skipped = [];
@@ -4552,7 +4561,10 @@ async function runRelay(hub, machineName) {
       catch { return; }
       let sent = 0;
       for (const f of collect()) {
-        if (f.size > FILE_CAP) {
+        // over the raw cap: no transport can take it. Between the caps: fine when
+        // the hub streams; skip only once we have LEARNED that it cannot.
+        const overCap = f.size > FILE_CAP_RAW || (f.size > FILE_CAP_LEGACY && hubHasRaw === false);
+        if (overCap) {
           if (!skipped.includes(f.rel)) { skipped.push(f.rel); console.log(`archive: skipping ${f.rel} (${Math.round(f.size / 1048576)}MB) — larger than this hub can accept`); }
           continue;
         }
@@ -4570,7 +4582,15 @@ async function runRelay(hub, machineName) {
               ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
             body: require('stream').Readable.toWeb(fs.createReadStream(f.full)),
           }).catch(() => null);
+          if (r && r.status !== 404) hubHasRaw = true;
           if (!r || r.status === 404) {
+            if (r && r.status === 404) hubHasRaw = false;
+            // a mid-size file cannot ride the legacy route; record the skip rather
+            // than base64 something the body cap will refuse anyway
+            if (f.size > FILE_CAP_LEGACY) {
+              if (!skipped.includes(f.rel)) { skipped.push(f.rel); console.log(`archive: skipping ${f.rel} (${Math.round(f.size / 1048576)}MB) — this hub is too old to stream it`); }
+              continue;
+            }
             const data = fs.readFileSync(f.full).toString('base64');
             r = await fetch(hub + '/v1/archive', {
               method: 'POST', headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
