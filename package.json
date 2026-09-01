@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "7.32.0",
+  "version": "7.33.0",
   "description": "Live dashboard visualizing Claude Code agent sessions — orchestrator, subagents, and workflow fleets from JSONL transcripts",
   "bin": {
     "agent-mission-control": "./server.js"
@@ -11,7 +11,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test tests/accounting.test.mjs"
+    "test": "node --test tests/accounting.test.mjs tests/relay-soak.test.mjs"
   },
   "engines": {
     "node": ">=18"

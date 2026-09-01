@@ -284,6 +284,16 @@ npx github:evanchakrin/agent-mission-control --relay http://<hub-ip>:4173 --toke
 
 Relayed sessions appear in the hub's Fleet labeled `⇄ <machine> · <project>` — the relay sends the project each session actually ran in (`proj: {slug, cwd}` on the POST body), and the machine stays in front of it so two machines with a folder of the same name never merge into one project. A relay too old to send that field falls back to `⇄ <machine>`, exactly as before. The token guards both `/v1/relay` and `/v1/traces`; open TCP port 4173 on the hub's firewall for remote machines. **Relays are outbound-only by design** — the hub never opens a connection back to a relay, so a relayed machine exposes no inbound surface.
 
+### Delta sends and relay memory (7.33+)
+
+The live relay path sends **deltas**: after a session's first send, only the bytes appended since the last successful send travel to the hub (`/v1/relay/append`), streamed straight from disk — the relay never parses or buffers a whole transcript for the live view. Files over 1MB are debounced to one send per ~20s, failed sends back off exponentially with nothing held in memory between attempts, and an unreachable hub parks the whole pass instead of rebuilding payloads every tick. Against an old hub without the append endpoint, the relay falls back to full-session POSTs automatically. This keeps a relay stable inside `--max-old-space-size=1024` no matter how chatty a session gets.
+
+Restarting the trifecta-erp relay after an update:
+
+```bash
+node --max-old-space-size=1024 server.js --relay http://100.102.85.46:4173 --token <token> --name trifecta-erp --archive
+```
+
 ### Full-transcript archive (optional)
 
 Add `--archive` to a relay and it also uploads the raw `.jsonl` transcripts themselves, not just live events — so the hub keeps a durable, browsable history of every session a machine has run, even after the machine is offline. Uploads are manifest-based (deduped by path + size), capped at 120 MB per file and 6 GB total, and land under `~/.claude/mission-control/archive/<machine>/`. Add `--archive-codex` to include Codex rollouts. Browse them from each machine's card in the **Machines** view.

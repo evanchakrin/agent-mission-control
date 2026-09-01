@@ -718,7 +718,7 @@ function readTail(p, size, cap) {
     return text.slice(text.indexOf('\n') + 1); // drop the partial leading record
   } finally { fs.closeSync(fd); }
 }
-function readSession(sessionPath) {
+function readSession(sessionPath, wfNames) {
   const sig = sessionSignature(sessionPath);
   const hit = cache.get(sessionPath);
   // Refresh recency on a hit. Map iterates in INSERTION order and set() on an
@@ -740,7 +740,9 @@ function readSession(sessionPath) {
     try { t = readTail(sf.path, fs.statSync(sf.path).size, SESSION_READ_CAP); } catch { /* ignore */ }
     return { id: sf.id, lines: t.split('\n'), group: sf.group };
   });
-  const result = normalize(text.split('\n'), subs, workflowNames(sessionPath));
+  // wfNames override: relayed raw mirrors carry no workflows/*.json (only .jsonl
+  // is mirrored), so the relay ships the runId→name map in its metadata instead.
+  const result = normalize(text.split('\n'), subs, wfNames || workflowNames(sessionPath));
   // Say so rather than presenting a partial read as a whole session. A number that
   // looks complete and is not is the worst thing this tool can produce.
   if (truncated) result.truncated = { readBytes: SESSION_READ_CAP, totalBytes: size };
@@ -920,6 +922,14 @@ function archiveDirSize(dir) {
   function walk(d) { let en = []; try { en = fs.readdirSync(d, { withFileTypes: true }); } catch { return; } for (const e of en) { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else { try { total += fs.statSync(f).size; } catch { /* skip */ } } } }
   walk(dir);
   return total;
+}
+// Total-size check for the live append path. archiveDirSize walks the whole
+// tree; doing that on EVERY 20-second delta from every relay would be pure
+// waste, so the answer is cached for a minute — plenty tight against a 6GB cap.
+let archSizeCache = { at: 0, total: 0 };
+function archiveTotalSize() {
+  if (Date.now() - archSizeCache.at > 60000) archSizeCache = { at: Date.now(), total: archiveDirSize(ARCHIVE_DIR()) };
+  return archSizeCache.total;
 }
 function storeArchiveFile(machine, relPath, buf) {
   const base = path.resolve(archiveMachineDir(machine));
@@ -1129,7 +1139,7 @@ function agentKindOf(file) {
 // Bound to a stableKey that survives relay re-sends and hub restarts, NEVER the
 // volatile source-prefixed file id. Mutations are loopback + origin + CSRF gated.
 const crypto = require('crypto');
-const STATE_DIR = path.join(os.homedir(), '.claude', 'mission-control');
+const STATE_DIR = process.env.AMC_STATE_DIR || path.join(os.homedir(), '.claude', 'mission-control');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const META_CSRF = crypto.randomUUID();
 const LIM = { note: 2000, tagsPerSession: 24, projects: 200, tags: 200, sessions: 5000, bulk: 500, name: 120 };
@@ -3397,6 +3407,69 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Live DELTA ingestion — a relay streams only the bytes APPENDED to a
+  // transcript since its last send; the hub mirrors the raw file in the archive
+  // store and parses it here. WHY: the old live path re-POSTed the whole parsed
+  // session on every append — a chatty 14MB session cost the relay a full parse
+  // plus a 14MB JSON body several times a minute, which took the trifecta-erp
+  // relay to heap OOM three times in one day (relay.err.log.oom-20260831).
+  // Offsets are the protocol: transcripts are append-only, so bytes already
+  // here are immutable — any disagreement is answered with OUR size (409) and
+  // the relay resumes from there; offset 0 replaces the file outright.
+  if (url.pathname === '/v1/relay/append' && req.method === 'POST') {
+    if (!authorized) return json(res, { error: 'bad or missing x-relay-token' }, 401);
+    const machine = String(req.headers['x-relay-machine'] || '');
+    let relPath = '';
+    try { relPath = decodeURIComponent(String(req.headers['x-relay-path'] || '')); } catch { /* refused below */ }
+    const offset = Number(req.headers['x-relay-offset']);
+    const declared = Number(req.headers['x-relay-bytes']);
+    if (!machine || !relPath || !Number.isInteger(offset) || offset < 0 || !Number.isInteger(declared) || declared < 0) {
+      req.resume(); return json(res, { error: 'need x-relay-machine, x-relay-path, x-relay-offset, x-relay-bytes' }, 400);
+    }
+    const base = path.resolve(archiveMachineDir(machine));
+    const dest = path.resolve(base, relPath.replace(/\\/g, '/'));
+    if (!dest.startsWith(base + path.sep) || !/\.jsonl$/.test(dest)) { req.resume(); return json(res, { error: 'bad path' }, 400); }
+    let cur = 0;
+    try { cur = fs.statSync(dest).size; } catch { /* new file */ }
+    if (offset !== cur && offset !== 0) { req.resume(); return json(res, { error: 'offset mismatch', size: cur }, 409); }
+    if (offset + declared > ARCHIVE_FILE_CAP) { req.resume(); return json(res, { error: 'file too large' }, 413); }
+    if (declared > 0 && archiveTotalSize() + declared > ARCHIVE_TOTAL_CAP) { req.resume(); return json(res, { error: 'archive full' }, 507); }
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    // Stream straight to disk, 'a' for a true append. A request that dies
+    // mid-body leaves a longer file than the relay's offset — the NEXT attempt
+    // gets a 409 with our size and resumes from there, so no cleanup is needed.
+    const out = fs.createWriteStream(dest, { flags: offset === 0 ? 'w' : 'a' });
+    let got = 0, killed = false;
+    req.on('data', c => {
+      got += c.length;
+      if (got > declared + 1024 && !killed) { killed = true; out.destroy(); req.destroy(); } // liar guard: declared size is a promise
+    });
+    req.on('error', () => { try { out.destroy(); } catch { /* already gone */ } });
+    out.on('error', e => { if (!res.headersSent) json(res, { error: e.message }, 500); });
+    out.on('finish', () => {
+      let size = 0;
+      try { size = fs.statSync(dest).size; } catch { /* vanished */ }
+      let id;
+      // The MAIN transcript's append carries the session metadata and triggers
+      // the reparse; subagent-file appends arrive bare first, so the hub never
+      // parses a half-updated set.
+      const metaHdr = req.headers['x-relay-meta'];
+      if (metaHdr) {
+        try {
+          const m = JSON.parse(decodeURIComponent(String(metaHdr)));
+          if (m && m.file) {
+            const wf = new Map(Object.entries(m.wf || {}));
+            const result = readSession(dest, wf);
+            id = ingestRelay({ machine, file: m.file, meta: m.meta || {}, proj: m.proj, result, ips: m.ips, version: m.version });
+          }
+        } catch (e) { console.error('relay append parse failed:', e.message); }
+      }
+      json(res, { ok: true, size, id, boot: BOOT_ID });
+    });
+    req.pipe(out);
+    return;
+  }
+
   // full-transcript archive: manifest (what the hub already has) + upload
   if (url.pathname === '/v1/archive/manifest' && req.method === 'GET') {
     if (!authorized) return json(res, { error: 'bad token' }, 401);
@@ -4149,75 +4222,204 @@ async function runRelay(hub, machineName) {
   let hubBoot = restored.boot; // remembered, so a hub restart while we were down is still caught
   console.log(`Relaying local sessions → ${hub}/v1/relay as "${machineName}"`);
   console.log(`Watching transcripts in ${PROJECTS_DIR}`);
-  const tick = async () => {
-    // detect hub restart up front, before any skip logic — a wiped hub gets a
-    // full resend even when no local session changed
-    try {
-      const b = await fetch(hub + '/v1/boot', { headers: { 'x-relay-machine': machineName, 'x-relay-version': APP_VERSION, ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) } }).then(r => r.json()).catch(() => null);
-      if (b && b.boot) {
-        if (hubBoot && b.boot !== hubBoot) { sent.clear(); dirty = true; console.log('hub restarted — resending all sessions'); }
-        if (b.boot !== hubBoot) dirty = true;
-        hubBoot = b.boot;
+  // ----- OOM discipline (three heap deaths on one production relay, 2026-08-31) -----
+  // 1. DELTAS: after the first send of a file, only the appended tail travels —
+  //    streamed from disk, never buffered. The old path re-parsed and re-POSTed
+  //    the whole session on every append (14MB several times a minute).
+  // 2. DEBOUNCE: a file over 1MB sends at most once per DELTA_DEBOUNCE_MS.
+  // 3. BACKOFF, NOTHING HELD: a failed send keeps NO body or parse in memory —
+  //    the file is re-read from disk at the next attempt, which exponential
+  //    backoff pushes out to at most 5 minutes. A dead hub parks the whole
+  //    tick (checked up front) instead of burning a full build per session.
+  const DELTA_DEBOUNCE_MS = Number(process.env.AMC_RELAY_DEBOUNCE_MS || 20000);
+  const DEBOUNCE_MIN_SIZE = 1024 * 1024;
+  const BACKOFF_BASE_MS = 5000, BACKOFF_CAP_MS = 300000;
+  const nextAt = new Map();   // file -> earliest next attempt (debounce and backoff share it)
+  const fails = new Map();    // file -> consecutive failures
+  let hubDelta = null;        // does the hub speak /v1/relay/append? null until probed
+  let hubDownUntil = 0, hubDownFails = 0;
+  const sigOf = v => (v && typeof v === 'object') ? v.sig : v; // sent values: legacy plain sig, or {sig, off, subs}
+  const noteFailure = (file, e) => {
+    const n = (fails.get(file) || 0) + 1;
+    fails.set(file, n);
+    const wait = Math.min(BACKOFF_BASE_MS * 2 ** Math.min(n, 6), BACKOFF_CAP_MS);
+    nextAt.set(file, Date.now() + wait);
+    console.error(`send failed for ${file}: ${e.message} — retry in ${Math.round(wait / 1000)}s`);
+  };
+
+  // POST bytes [off..EOF] of absPath, streamed from disk in 64KB chunks.
+  // Returns {ok, off, boot} | {retryAt} on offset disagreement | {gone}.
+  const postAppend = async (relPath, absPath, off, extraHeaders) => {
+    let size = 0;
+    try { size = fs.statSync(absPath).size; } catch { return { gone: true }; }
+    if (off > size) off = 0; // local file shrank/rotated: replace outright
+    const empty = off === size;
+    const r = await fetch(hub + '/v1/relay/append', {
+      method: 'POST', ...(empty ? {} : { duplex: 'half' }),
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'x-relay-machine': machineName,
+        'x-relay-path': encodeURIComponent(relPath),
+        'x-relay-offset': String(off),
+        'x-relay-bytes': String(size - off),
+        ...(TOKEN ? { 'x-relay-token': TOKEN } : {}),
+        ...(extraHeaders || {}),
+      },
+      // end is pinned to the stat size: a file growing mid-send can't stretch the
+      // stream past what the offset bookkeeping will record as delivered
+      body: empty ? undefined : require('stream').Readable.toWeb(fs.createReadStream(absPath, { start: off, end: size - 1 })),
+    });
+    if (r.status === 404) { const e = new Error('hub has no /v1/relay/append'); e.fallback = true; throw e; }
+    if (r.status === 413) { const e = new Error('file too large for hub'); e.tooBig = true; throw e; }
+    if (r.status === 409) {
+      const j = await r.json().catch(() => ({}));
+      const hubSize = Number(j.size) || 0;
+      // bytes already on the hub are a prefix of ours (append-only), so resume
+      // from ITS size; a hub holding MORE than we have means replace from 0
+      return { retryAt: hubSize > 0 && hubSize <= size ? hubSize : 0 };
+    }
+    if (!r.ok) throw new Error(`hub ${r.status} for ${relPath}: ${(await r.text().catch(() => '')).slice(0, 200)}`);
+    const j = await r.json().catch(() => ({}));
+    return { ok: true, off: size, boot: j.boot };
+  };
+
+  const sendDelta = async (meta, mainPath, sig, prev) => {
+    const rec = (prev && typeof prev === 'object') ? prev : { sig: null, off: 0, subs: {} };
+    if (!rec.subs) rec.subs = {};
+    // subagent transcripts first; the main file's append carries the metadata
+    // and triggers the hub-side reparse of the whole set
+    for (const sf of subagentFiles(mainPath)) {
+      const rel = 'claude/' + path.relative(PROJECTS_DIR, sf.path).split(path.sep).join('/');
+      let off = rec.subs[sf.id] || 0;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const res = await postAppend(rel, sf.path, off);
+        if (res.gone) { off = null; break; }
+        if (res.ok) { off = res.off; break; }
+        off = res.retryAt;
       }
-    } catch { /* hub down; sends below will fail and retry */ }
-    // WHY: the hub cannot work out which project a relayed session belongs to —
-    // it only ever sees what arrives here, which is why every remote session
-    // used to be labelled with this machine's name instead. Only THIS side knows
-    // the answer, so send it: the project-directory slug, plus the true working
-    // directory when it can be resolved (claudeProjectCwd / Codex session_meta).
-    // Two short strings per session; the parsed result dwarfs them.
+      if (off != null) rec.subs[sf.id] = off; // progress survives even if the main send below fails
+    }
+    // workflow names ride along (tiny): the hub's mirror has no workflows/*.json
+    const wf = {};
+    let wfCount = 0;
+    for (const [k, v] of workflowNames(mainPath)) { if (++wfCount > 50) break; wf[k] = v; }
+    const proj = { slug: meta.project || null, cwd: (meta.project ? claudeProjectCwd(path.join(PROJECTS_DIR, meta.project)) : null) || null };
+    const metaHdr = encodeURIComponent(JSON.stringify({ file: meta.file, meta, proj, ips: localIPs(), version: APP_VERSION, wf }));
+    let off = rec.off || 0, res = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const a = await postAppend('claude/' + String(meta.file).split(path.sep).join('/'), mainPath, off, { 'x-relay-meta': metaHdr });
+      if (a.gone) return true; // session vanished mid-send; nothing left to deliver
+      if (a.ok) { res = a; break; }
+      off = a.retryAt;
+    }
+    if (!res) throw new Error('offset never agreed for ' + meta.file);
+    hubDelta = true;
+    if (res.boot && hubBoot && res.boot !== hubBoot) sent.clear();
+    if (res.boot) hubBoot = res.boot;
+    const prevOff = (prev && typeof prev === 'object') ? prev.off || 0 : 0;
+    sent.set(meta.file, { sig, off: res.off, subs: rec.subs });
+    dirty = true;
+    flush(false);
+    console.log(`sent Δ ${meta.title || meta.session} (+${Math.max(0, res.off - prevOff)} bytes)`);
+    return true;
+  };
+
+  // Legacy whole-parsed-session POST: Codex sessions, and hubs too old for the
+  // delta endpoint. Everything transient — nothing survives past the attempt.
+  const sendFull = async (meta, isCodex, sig, codexCwdOf) => {
+    if (!isCodex) {
+      let sz = 0;
+      try { sz = fs.statSync(resolveSessionPath(meta.file)).size; } catch { /* gone; parse fails below */ }
+      if (sz > RELAY_PARSE_CAP) {
+        if (!tooBig.has(meta.file)) {
+          tooBig.add(meta.file);
+          console.log(`skipping ${meta.file} (${Math.round(sz / 1048576)}MB) — too large to parse safely`);
+        }
+        return false;
+      }
+    }
+    let result;
+    try { result = getResult(meta.file); } catch (e) { console.error(`parse failed ${meta.file}: ${e.message}`); return false; }
+    if (!result) return false;
+    const proj = {
+      slug: meta.project || null,
+      cwd: (isCodex ? codexCwdOf(meta.file.slice(6))
+        : meta.project ? claudeProjectCwd(path.join(PROJECTS_DIR, meta.project)) : null) || null,
+    };
+    // keep POSTs under the hub's body cap — trim oldest events if needed
+    const ips = localIPs();
+    let body = JSON.stringify({ machine: machineName, file: meta.file, meta, proj, result, ips, version: APP_VERSION });
+    while (body.length > 35e6 && result.events.length > 500) {
+      result = { ...result, events: result.events.slice(Math.ceil(result.events.length / 2)) };
+      body = JSON.stringify({ machine: machineName, file: meta.file, meta, proj, result, ips, version: APP_VERSION });
+    }
+    const r = await fetch(hub + '/v1/relay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
+      body,
+    });
+    if (!r.ok) throw new Error(`hub rejected: ${r.status} ${(await r.text().catch(() => '')).slice(0, 200)}`);
+    sent.set(meta.file, sig);
+    dirty = true;
+    flush(false);   // debounced; keeps a long first pass durable
+    const info = await r.json().catch(() => ({}));
+    if (info.boot && hubBoot && info.boot !== hubBoot) { sent.clear(); sent.set(meta.file, sig); }
+    if (info.boot) hubBoot = info.boot;
+    console.log(`sent ${meta.title || meta.session} (${Math.round(body.length / 1024)}KB)`);
+    return true;
+  };
+
+  const tick = async () => {
+    // Hub reachability first: when it's down, park the WHOLE pass on backoff.
+    // The first OOM crash spent its final minutes rebuilding a 14MB body every
+    // 5 seconds just to watch fetch fail ("send failed ... will retry" spam).
+    if (Date.now() < hubDownUntil) return;
+    const b = await fetch(hub + '/v1/boot', { headers: { 'x-relay-machine': machineName, 'x-relay-version': APP_VERSION, ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) } }).then(r => r.json()).catch(() => null);
+    if (!b || !b.boot) {
+      hubDownFails++;
+      hubDownUntil = Date.now() + Math.min(BACKOFF_BASE_MS * 2 ** Math.min(hubDownFails, 4), 60000);
+      return;
+    }
+    hubDownFails = 0;
+    // a wiped hub gets a full resend even when no local session changed
+    if (hubBoot && b.boot !== hubBoot) { sent.clear(); dirty = true; hubDelta = null; console.log('hub restarted — resending all sessions'); }
+    if (b.boot !== hubBoot) dirty = true;
+    hubBoot = b.boot;
+    // WHY proj travels at all: the hub cannot work out which project a relayed
+    // session belongs to — only THIS side knows. Slug + resolved cwd, two short
+    // strings per session.
     let codexCwds = null; // built once per tick, and only if a Codex session actually changed
+    const codexCwdOf = uuid => {
+      if (!codexCwds) codexCwds = new Map(codexFiles().map(f => [f.uuid, codexMeta(f).cwd || null]));
+      return codexCwds.get(uuid);
+    };
     for (const meta of [...listSessions(), ...codexList()]) {
       const isCodex = meta.file.startsWith('codex:');
-      const sig = isCodex ? codexSignature(meta.file.slice(6)) : sessionSignature(resolveSessionPath(meta.file));
-      if (!sig || sent.get(meta.file) === sig) continue;
-      if (!isCodex) {
-        let sz = 0;
-        try { sz = fs.statSync(resolveSessionPath(meta.file)).size; } catch { /* gone; skip below */ }
-        if (sz > RELAY_PARSE_CAP) {
-          if (!tooBig.has(meta.file)) {
-            tooBig.add(meta.file);
-            console.log(`skipping ${meta.file} (${Math.round(sz / 1048576)}MB) — too large to parse safely`);
-          }
-          continue;
-        }
-      }
-      let result;
-      try { result = getResult(meta.file); } catch (e) { console.error(`parse failed ${meta.file}: ${e.message}`); continue; }
-      if (!result) continue;
-      if (isCodex && !codexCwds) codexCwds = new Map(codexFiles().map(f => [f.uuid, codexMeta(f).cwd || null]));
-      const proj = {
-        slug: meta.project || null,
-        cwd: (isCodex ? codexCwds.get(meta.file.slice(6))
-          : meta.project ? claudeProjectCwd(path.join(PROJECTS_DIR, meta.project)) : null) || null,
-      };
-      // keep POSTs under the hub's body cap — trim oldest events if needed
-      const ips = localIPs();
-      let body = JSON.stringify({ machine: machineName, file: meta.file, meta, proj, result, ips, version: APP_VERSION });
-      while (body.length > 35e6 && result.events.length > 500) {
-        result = { ...result, events: result.events.slice(Math.ceil(result.events.length / 2)) };
-        body = JSON.stringify({ machine: machineName, file: meta.file, meta, proj, result, ips, version: APP_VERSION });
-      }
+      const mainPath = isCodex ? null : resolveSessionPath(meta.file);
+      const sig = isCodex ? codexSignature(meta.file.slice(6)) : sessionSignature(mainPath);
+      if (!sig || sigOf(sent.get(meta.file)) === sig) continue;
+      if (Date.now() < (nextAt.get(meta.file) || 0)) continue; // debounced or backing off
+      let ok = false;
       try {
-        const r = await fetch(hub + '/v1/relay', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-relay-token': TOKEN } : {}) },
-          body,
-        });
-        if (r.ok) {
-          sent.set(meta.file, sig);
-          dirty = true;
-          flush(false);   // debounced; keeps a long first pass durable
-          const info = await r.json().catch(() => ({}));
-          if (info.boot && hubBoot && info.boot !== hubBoot) { sent.clear(); sent.set(meta.file, sig); }
-          if (info.boot) hubBoot = info.boot;
-          console.log(`sent ${meta.title || meta.session} (${Math.round(body.length / 1024)}KB)`);
-        } else {
-          console.error(`hub rejected ${meta.file}: ${r.status} ${await r.text()}`);
+        if (!isCodex && hubDelta !== false) {
+          try { ok = await sendDelta(meta, mainPath, sig, sent.get(meta.file)); }
+          catch (e) {
+            if (e.fallback) { hubDelta = false; console.log('hub predates delta sends — falling back to full session POSTs'); }
+            else if (e.tooBig) { if (!tooBig.has(meta.file)) { tooBig.add(meta.file); console.log(`skipping ${meta.file} — larger than the hub accepts`); } continue; }
+            else throw e;
+          }
         }
+        if (!ok) ok = await sendFull(meta, isCodex, sig, codexCwdOf);
       } catch (e) {
-        console.error(`send failed for ${meta.file}: ${e.message} — will retry`);
-        // keep going: one bad session must not block the rest
+        noteFailure(meta.file, e);
+        continue; // one bad session must not block the rest — and nothing is kept for the retry
+      }
+      if (ok) {
+        fails.delete(meta.file);
+        let size = 0;
+        if (!isCodex) { try { size = fs.statSync(mainPath).size; } catch { /* gone */ } }
+        if (size > DEBOUNCE_MIN_SIZE) nextAt.set(meta.file, Date.now() + DELTA_DEBOUNCE_MS);
+        else nextAt.delete(meta.file);
       }
     }
     flush(true);
