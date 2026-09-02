@@ -4815,7 +4815,9 @@ async function runRelay(hub, machineName) {
 function installPaths() {
   return {
     dest: path.join(process.env.LOCALAPPDATA, 'AgentMissionControl'),
-    startupVbs: path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'AgentMissionControl.vbs'),
+    startupVbs: path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'AgentMissionControl.vbs'), // legacy, removed on install
+    startupExe: path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'AgentMissionControl.exe'),
+    startupCmd: path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'AgentMissionControl.cmd'), // no-compiler fallback
     desktopUrl: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.url'), // legacy, removed on install
     desktopLnk: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.lnk'),   // legacy, removed on install
     desktopExe: path.join(os.homedir(), 'Desktop', 'Agent Mission Control.exe'),
@@ -4827,7 +4829,7 @@ function installWindows() {
     console.log('--install is Windows-only for now. On Mac/Linux, add "node server.js" to launchd/systemd.');
     process.exit(1);
   }
-  const { dest, startupVbs, desktopUrl, desktopLnk, desktopExe } = installPaths();
+  const { dest, startupVbs, startupExe, startupCmd, desktopUrl, desktopLnk, desktopExe } = installPaths();
   const CRLF = String.fromCharCode(13) + String.fromCharCode(10);
   let builtExe = false;
   fs.mkdirSync(dest, { recursive: true });
@@ -4841,10 +4843,38 @@ function installWindows() {
     if (v) extra.push(f, v);
   }
   for (const flag of ['--archive', '--archive-codex', '--no-auto-update']) if (process.argv.includes(flag)) extra.push(flag);
-  const inner = ['node', `"${path.join(dest, 'server.js')}"`, ...extra.map(x => x.startsWith('--') ? x : `"${x}"`)].join(' ');
-  const vbs = `CreateObject("Wscript.Shell").Run "${inner.replace(/"/g, '""')}", 0\r\n`;
-  fs.writeFileSync(path.join(dest, 'start.vbs'), vbs);
-  fs.writeFileSync(startupVbs, vbs);
+  // Windows 11 24H2 ships without VBScript, so a .vbs in the Startup folder opens
+  // in Notepad at logon instead of starting anything (the ERP server, 2026-09-01).
+  // The startup entry is now a real windowless program built with the C# compiler
+  // every Windows carries; it reads start.cfg and starts node hidden, output to a
+  // log. A relay gets a 1GB heap cap here, on purpose: a runaway relay should die
+  // loudly and restart, not eat the machine it is supposed to be watching.
+  const nodeExe = process.execPath;
+  const nodeFlags = RELAY_TO ? ['--max-old-space-size=1024'] : [];
+  const logFile = path.join(dest, RELAY_TO ? 'relay.log' : 'hub.log');
+  const inner = [`"${nodeExe}"`, ...nodeFlags, `"${path.join(dest, 'server.js')}"`, ...extra.map(x => x.startsWith('--') ? x : `"${x}"`)].join(' ');
+  const command = `"${inner} >> "${logFile}" 2>&1"`;   // cmd /c "..." keeps the quotes intact
+  fs.writeFileSync(path.join(dest, 'start.cfg'), [
+    '# Agent Mission Control startup settings. AgentMissionControl.exe in the Startup folder reads this.',
+    'command=' + command,
+    'cwd=' + dest,
+    RELAY_TO ? '' : 'health=http://localhost:' + PORT + '/api/meta',
+  ].filter(Boolean).join('\r\n') + '\r\n');
+  // start.cmd: the same thing for a human at a prompt
+  fs.writeFileSync(path.join(dest, 'start.cmd'), '@echo off\r\ncd /d "' + dest + '"\r\n' + inner + ' >> "' + logFile + '" 2>&1\r\n');
+  for (const stale of [startupVbs, startupCmd, path.join(dest, 'start.vbs')]) { try { fs.unlinkSync(stale); } catch { /* absent */ } }
+  let startupKind = 'exe';
+  try {
+    require('child_process').execFileSync(process.execPath,
+      [path.join(__dirname, 'tools', 'make-launcher.js'), '--mode', 'start', '--out', dest, '--name', 'AgentMissionControl.exe'],
+      { windowsHide: true, timeout: 60000, stdio: 'pipe' });
+    fs.copyFileSync(path.join(dest, 'AgentMissionControl.exe'), startupExe);
+  } catch {
+    // no C# compiler: a minimized console is the best a plain .cmd can do
+    startupKind = 'cmd';
+    try { fs.unlinkSync(startupExe); } catch { /* absent */ }
+    fs.writeFileSync(startupCmd, '@echo off\r\nstart "" /min cmd /d /c ' + command + '\r\n');
+  }
 
   if (!RELAY_TO) {
     // The old shortcut was a plain .url: it opened the browser but never STARTED
@@ -4870,7 +4900,7 @@ function installWindows() {
       '  On Error GoTo 0',
       'End Function',
       'If Not IsUp() Then',
-      '  sh.Run ' + Q + 'wscript ' + Q + Q + Q + ' & here & ' + Q + '\start.vbs' + Q + Q + Q + ', 0, False',
+      '  sh.Run ' + Q + 'cmd /d /c ' + Q + Q + Q + ' & here & ' + Q + '\start.cmd' + Q + Q + Q + ', 0, False',
       '  For i = 1 To 20',
       '    WScript.Sleep 500',
       '    If IsUp() Then Exit For',
@@ -4934,7 +4964,7 @@ function installWindows() {
     }
   }
 
-  require('child_process').spawn('wscript', [path.join(dest, 'start.vbs')], { detached: true, stdio: 'ignore' }).unref();
+  require('child_process').spawn('cmd.exe', ['/d', '/c', startupKind === 'exe' ? `"${startupExe}"` : `"${startupCmd}"`], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   console.log(`Installed. Runs now and at every login (${RELAY_TO ? 'relay → ' + RELAY_TO : 'dashboard at http://localhost:' + PORT}).`);
   if (!RELAY_TO) console.log(builtExe
     ? 'Desktop program created: "Agent Mission Control".'
@@ -4944,9 +4974,9 @@ function installWindows() {
 }
 
 function uninstallWindows() {
-  const { dest, startupVbs, desktopUrl, desktopLnk } = installPaths();
+  const { dest, startupVbs, startupExe, startupCmd, desktopUrl, desktopLnk } = installPaths();
   // both shortcut kinds: the current .lnk and any legacy .url left by an old install
-  for (const p of [startupVbs, desktopUrl, desktopLnk]) { try { fs.unlinkSync(p); } catch { /* absent */ } }
+  for (const p of [startupVbs, startupExe, startupCmd, desktopUrl, desktopLnk]) { try { fs.unlinkSync(p); } catch { /* absent */ } }
   try { fs.rmSync(dest, { recursive: true, force: true }); } catch { /* absent */ }
   console.log('Uninstalled (a running instance keeps going until logoff/reboot or you end node.exe in Task Manager).');
   process.exit(0);

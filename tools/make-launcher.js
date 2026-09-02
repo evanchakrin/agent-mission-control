@@ -35,6 +35,11 @@ const icon = path.resolve(arg('icon', path.join(REPO, 'public', 'amc.ico')));
 const port = arg('port', '4173');
 const token = arg('token', '');
 const exeName = arg('name', 'Agent Mission Control.exe');
+// --mode start builds the STARTUP launcher instead: a windowless program that
+// starts the service hidden at logon. It replaced a .vbs in the Startup folder
+// the day Windows 11 24H2 shipped without VBScript and the .vbs opened in
+// Notepad at every boot of the ERP server (2026-09-01).
+const mode = arg('mode', 'launch');
 
 function findCsc() {
   const win = process.env.SystemRoot || 'C:\\Windows';
@@ -180,10 +185,65 @@ const CS_TEMPLATE = [
   '}',
 ].join('\n');
 
-const cs = CS_TEMPLATE
-  .replace(/__PORT__/g, port)
-  .replace(/__SERVER__/g, server.replace(/"/g, '""'))     // verbatim string: "" escapes a quote
-  .replace(/__TOKEN__/g, token.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
+// The startup launcher: no window, no message boxes (nobody is watching at
+// logon), everything it needs in start.cfg beside it so a reinstall or a moved
+// Node never needs a rebuild. Output goes to a log via cmd's redirection, which
+// keeps a parent alive for node's stdio without this program hanging around.
+const CS_START_TEMPLATE = [
+  'using System;',
+  'using System.Diagnostics;',
+  'using System.IO;',
+  'using System.Net;',
+  '',
+  'static class Starter {',
+  '    static string Setting(string key) {',
+  '        try {',
+  '            string cfg = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "start.cfg");',
+  '            if (!File.Exists(cfg)) cfg = Setting2(key);',
+  '            if (cfg != null && File.Exists(cfg)) {',
+  '                foreach (string raw in File.ReadAllLines(cfg)) {',
+  '                    string line = raw.Trim();',
+  '                    if (line.StartsWith(key + "=")) return line.Substring(key.Length + 1).Trim();',
+  '                }',
+  '            }',
+  '        } catch { }',
+  '        return null;',
+  '    }',
+  '    // A copy of this exe in the Startup folder finds its cfg in the install dir.',
+  '    static string Setting2(string key) {',
+  '        try { return Path.Combine(@"__DEST__", "start.cfg"); } catch { return null; }',
+  '    }',
+  '    static bool IsUp(string url) {',
+  '        try {',
+  '            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);',
+  '            req.Timeout = 1500; req.ReadWriteTimeout = 1500; req.Method = "GET";',
+  '            using (HttpWebResponse r = (HttpWebResponse)req.GetResponse()) { return true; }',
+  '        } catch (WebException we) { return we.Response != null; } catch { return false; }',
+  '    }',
+  '    static void Main() {',
+  '        string command = Setting("command");',
+  '        if (command == null || command.Length == 0) return;',
+  '        string health = Setting("health");',
+  '        if (health != null && health.Length > 0 && IsUp(health)) return;   // already running: do not start a second one',
+  '        try {',
+  '            ProcessStartInfo psi = new ProcessStartInfo("cmd.exe", "/d /c " + command);',
+  '            psi.UseShellExecute = false;',
+  '            psi.CreateNoWindow = true;',
+  '            psi.WindowStyle = ProcessWindowStyle.Hidden;',
+  '            string wd = Setting("cwd");',
+  '            if (wd != null && wd.Length > 0) psi.WorkingDirectory = wd;',
+  '            Process.Start(psi);',
+  '        } catch { }',
+  '    }',
+  '}',
+].join('\n');
+
+const cs = mode === 'start'
+  ? CS_START_TEMPLATE.replace(/__DEST__/g, outDir.replace(/"/g, '""'))
+  : CS_TEMPLATE
+    .replace(/__PORT__/g, port)
+    .replace(/__SERVER__/g, server.replace(/"/g, '""'))     // verbatim string: "" escapes a quote
+    .replace(/__TOKEN__/g, token.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
 
 const csc = findCsc();
 if (!csc) {
@@ -212,11 +272,13 @@ try {
   try { fs.unlinkSync(tmp); } catch { /* ignore */ }
 }
 
+if (mode !== 'start') {
 fs.writeFileSync(path.join(outDir, 'launcher.cfg'),
   '# Agent Mission Control launcher settings.\n' +
   '# server = full path to the server.js this button should run.\n' +
   'server=' + server + '\n' +
   (token ? 'token=' + token + '\n' : ''), 'utf8');
+}
 
 console.log('built ' + exePath + '  (' + fs.statSync(exePath).size + ' bytes)');
 console.log('  runs  : ' + server);
