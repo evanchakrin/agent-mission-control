@@ -129,6 +129,32 @@ test('a second append to a mirror mid-upload is refused, not interleaved', async
   assert.ok(!after.subarray(before.length).includes(B), 'the refused append wrote nothing');
 });
 
+test('a mirror the delta path maintains refuses whole-file archive uploads', async () => {
+  // deliver metadata with the append so the hub ingests the session and marks the mirror delta-maintained
+  const cur = mirror().length;
+  const meta = encodeURIComponent(JSON.stringify({ file: 'testproj/x.jsonl', meta: { session: 'x', mtime: Date.now() }, proj: null }));
+  const r = await append(cur, A, A.length, { 'x-relay-anchor': anchorOf(mirror(), cur), 'x-relay-meta': meta });
+  assert.equal(r.status, 200);
+  // the parse runs after the ack; give it a moment, then the session must be in the fleet
+  let row = null;
+  for (let i = 0; i < 40 && !row; i++) {
+    await settle(100);
+    row = (await (await fetch(BASE + '/api/fleet')).json()).find(s => s.file === 'relay:testbox:testproj/x.jsonl');
+  }
+  assert.ok(row, 'the relayed session was ingested from the mirror');
+  const raw = await fetch(BASE + '/v1/archive/raw', {
+    method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'x-archive-machine': 'testbox', 'x-archive-path': encodeURIComponent('claude/testproj/x.jsonl') },
+    body: B,
+  });
+  assert.equal(raw.status, 409, 'the archive path may not overwrite a delta-maintained mirror');
+  assert.ok(mirror().length >= cur + A.length, 'the mirror kept what the delta path wrote');
+  const sub = await fetch(BASE + '/v1/archive/raw', {
+    method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'x-archive-machine': 'testbox', 'x-archive-path': encodeURIComponent('claude/testproj/x/agent-abc.jsonl') },
+    body: B,
+  });
+  assert.equal(sub.status, 409, 'nor a subagent file inside that session');
+});
+
 test('an anchor mismatch discards the mirror so the next offset-0 upload really replaces it', async () => {
   const cur = mirror().length;
   const r = await append(cur, B, B.length, { 'x-relay-anchor': sha1(Buffer.from('not the bytes we hold')) });

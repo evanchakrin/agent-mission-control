@@ -12,6 +12,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
 // One crafted request or one stray sync throw in a handler must not take the
 // whole dashboard (or a relay) down — log loudly, keep serving. State writes
@@ -683,15 +684,23 @@ const codexCache = new Map(); // uuid -> {sig, result, at}
 // CPU profiler. A parse younger than this is served even when the file has grown:
 // the tail lands on the first refresh after the window instead of on every one.
 const CODEX_REPARSE_MIN_MS = 20000;
+function codexStore(uuid, sig, result) {
+  codexCache.delete(uuid);
+  codexCache.set(uuid, { sig, result, at: Date.now() });
+  if (codexCache.size > 6) codexCache.delete(codexCache.keys().next().value);
+}
 function readCodexCached(uuid) {
   const sig = codexSignature(uuid);
   const hit = codexCache.get(uuid);
   if (hit && (hit.sig === sig || Date.now() - hit.at < CODEX_REPARSE_MIN_MS)) return hit.result;
-  const result = readCodexSession(uuid);
-  if (result) {
-    codexCache.set(uuid, { sig, result, at: Date.now() });
-    if (codexCache.size > 6) codexCache.delete(codexCache.keys().next().value);
+  if (hit && !PARSE_INLINE_ALWAYS && Number(sig) > PARSE_INLINE_MAX) {
+    // stale-while-revalidate, as for Claude transcripts; sig is the file size
+    hit.at = Date.now(); // one refresh per window even while the worker is busy
+    refreshInWorker('codex:' + uuid, sig, { kind: 'codex', uuid }, (s, r) => codexStore(uuid, s, r));
+    return hit.result;
   }
+  const result = readCodexSession(uuid);
+  if (result) codexStore(uuid, sig, result);
   return result;
 }
 
@@ -730,14 +739,10 @@ function readTail(p, size, cap) {
     return text.slice(text.indexOf('\n') + 1); // drop the partial leading record
   } finally { fs.closeSync(fd); }
 }
-function readSession(sessionPath, wfNames) {
-  const sig = sessionSignature(sessionPath);
-  const hit = cache.get(sessionPath);
-  // Refresh recency on a hit. Map iterates in INSERTION order and set() on an
-  // existing key does not reorder it, so without this the eviction below is FIFO:
-  // walking a session list longer than the cap evicts each entry just before it is
-  // needed again — a 0% hit rate rather than a degraded one.
-  if (hit && hit.sig === sig) { cache.delete(sessionPath); cache.set(sessionPath, hit); return hit.result; }
+// The parse itself — pure: reads the transcript (+ subagent files), returns the
+// normalized result. Runs on the main thread for small or never-seen files and
+// in the parser worker for everything else (see parseInWorker).
+function parseSessionFile(sessionPath, wfNames) {
   let size = 0;
   try { size = fs.statSync(sessionPath).size; } catch { /* fall through to the read */ }
   const truncated = size > SESSION_READ_CAP;
@@ -758,8 +763,96 @@ function readSession(sessionPath, wfNames) {
   // Say so rather than presenting a partial read as a whole session. A number that
   // looks complete and is not is the worst thing this tool can produce.
   if (truncated) result.truncated = { readBytes: SESSION_READ_CAP, totalBytes: size };
+  return result;
+}
+
+// ---------- the parser worker ----------
+// Every stall the hub ever showed was a parse on its only thread: a 64MB tail
+// re-read and JSON.parsed because one live transcript grew, while every HTTP
+// request and every relay upload waited behind it (6-9s each, measured under
+// the CPU profiler on 2026-09-01). The parse now runs in a worker that executes
+// this same file in a parser role. The cache is stale-while-revalidate: a
+// changed file answers with its last parse at once and the fresh one lands
+// when the worker is done. Only a file never seen before, or one small enough
+// not to matter, parses inline. The worker's heap is capped separately from
+// the process — a parse that blows up kills the worker, never the hub.
+const PARSE_INLINE_MAX = 4 * 1024 * 1024;
+const PARSE_INLINE_ALWAYS = !!process.env.AMC_PARSE_INLINE;   // escape hatch
+let parser = null, parseSeq = 0;
+const parseJobs = new Map();       // id -> {resolve, reject}
+const parseInflight = new Map();   // cache key -> promise, so one change is one parse
+function parserWorker() {
+  if (parser) return parser;
+  parser = new Worker(__filename, {
+    workerData: { role: 'parser' }, argv: process.argv.slice(2),
+    resourceLimits: { maxOldGenerationSizeMb: RELAY_TO ? 512 : 2048 },
+  });
+  parser.on('message', m => {
+    const j = parseJobs.get(m.id);
+    parseJobs.delete(m.id);
+    if (!j) return;
+    if (m.error) j.reject(new Error(m.error)); else j.resolve(m.result);
+  });
+  const gone = why => {
+    console.error('parser worker ' + why + ' — restarting it on the next parse');
+    for (const j of parseJobs.values()) j.reject(new Error('parser worker ' + why));
+    parseJobs.clear();
+    parser = null;
+  };
+  parser.on('error', e => gone('died: ' + (e && e.message || e)));
+  parser.on('exit', code => { if (parser) gone('exited (' + code + ')'); });
+  return parser;
+}
+function parseInWorker(job) {
+  return new Promise((resolve, reject) => {
+    const id = ++parseSeq;
+    parseJobs.set(id, { resolve, reject });
+    try { parserWorker().postMessage({ ...job, id }); }
+    catch (e) { parseJobs.delete(id); reject(e); }
+  });
+}
+// Refresh a stale cache entry off-thread. Coalesced per key; the sig is the one
+// observed at dispatch, so a file that changes again mid-parse refreshes again.
+function refreshInWorker(key, sig, job, store) {
+  if (parseInflight.has(key)) return parseInflight.get(key);
+  const p = parseInWorker(job)
+    .then(result => { if (result) store(sig, result); })
+    .catch(e => console.error('background parse failed for ' + path.basename(key) + ': ' + e.message))
+    .finally(() => parseInflight.delete(key));
+  parseInflight.set(key, p);
+  return p;
+}
+function cacheStore(sessionPath, sig, result) {
+  cache.delete(sessionPath);
   cache.set(sessionPath, { sig, result });
   if (cache.size > SESSION_CACHE_MAX) cache.delete(cache.keys().next().value);
+}
+// Async parse for callers that must have the FRESH result (relay ingest): never
+// on the main thread past the inline size.
+function readSessionFresh(sessionPath, wfNames) {
+  let size = 0;
+  try { size = fs.statSync(sessionPath).size; } catch { /* parse reports */ }
+  if (PARSE_INLINE_ALWAYS || size <= PARSE_INLINE_MAX) return Promise.resolve(parseSessionFile(sessionPath, wfNames));
+  return parseInWorker({ kind: 'claude', path: sessionPath, wf: wfNames ? Object.fromEntries(wfNames) : null });
+}
+function readSession(sessionPath, wfNames) {
+  const sig = sessionSignature(sessionPath);
+  const hit = cache.get(sessionPath);
+  // Refresh recency on a hit. Map iterates in INSERTION order and set() on an
+  // existing key does not reorder it, so without this the eviction below is FIFO:
+  // walking a session list longer than the cap evicts each entry just before it is
+  // needed again — a 0% hit rate rather than a degraded one.
+  if (hit && hit.sig === sig) { cache.delete(sessionPath); cache.set(sessionPath, hit); return hit.result; }
+  let size = 0;
+  try { size = fs.statSync(sessionPath).size; } catch { /* fall through */ }
+  if (hit && !PARSE_INLINE_ALWAYS && size > PARSE_INLINE_MAX) {
+    // stale-while-revalidate: answer now with what we had, refresh off-thread
+    refreshInWorker(sessionPath, sig, { kind: 'claude', path: sessionPath, wf: wfNames ? Object.fromEntries(wfNames) : null },
+      (s, r) => cacheStore(sessionPath, s, r));
+    return hit.result;
+  }
+  const result = parseSessionFile(sessionPath, wfNames);
+  cacheStore(sessionPath, sig, result);
   return result;
 }
 
@@ -889,10 +982,10 @@ function persistRelay(rec) {
   try {
     fs.mkdirSync(RELAY_DIR(), { recursive: true });
     let events = rec.result.events.length > RELAY_EVENT_CAP ? rec.result.events.slice(-RELAY_EVENT_CAP) : rec.result.events;
-    let payload = JSON.stringify({ id: rec.id, machine: rec.machine, meta: rec.meta, proj: rec.proj, ips: rec.ips, at: rec.at, result: { ...rec.result, events } });
+    let payload = JSON.stringify({ id: rec.id, machine: rec.machine, meta: rec.meta, proj: rec.proj, ips: rec.ips, at: rec.at, mirrorSize: rec.mirrorSize || null, result: { ...rec.result, events } });
     while (payload.length > RELAY_MAX_BYTES && events.length > 200) { // keep the disk cache bounded
       events = events.slice(Math.ceil(events.length / 2));
-      payload = JSON.stringify({ id: rec.id, machine: rec.machine, meta: rec.meta, proj: rec.proj, ips: rec.ips, at: rec.at, result: { ...rec.result, events } });
+      payload = JSON.stringify({ id: rec.id, machine: rec.machine, meta: rec.meta, proj: rec.proj, ips: rec.ips, at: rec.at, mirrorSize: rec.mirrorSize || null, result: { ...rec.result, events } });
     }
     const tmp = relayFileFor(rec.id) + '.tmp';
     fs.writeFileSync(tmp, payload);
@@ -916,6 +1009,21 @@ const ARCHIVE_FILE_CAP = 120 * 1024 * 1024;   // skip any single file bigger tha
 const ARCHIVE_TOTAL_CAP = 6 * 1024 * 1024 * 1024; // ~6GB total budget
 function safeMachine(m) { return String(m || '').replace(/[^\w.-]+/g, '_').slice(0, 60); }
 function archiveMachineDir(machine) { return path.join(ARCHIVE_DIR(), safeMachine(machine)); }
+// Is this mirror (or the session a subagent file belongs to) kept by /v1/relay/append?
+function deltaMaintained(machine, relPath) {
+  const rel = relPath.replace(/\\/g, '/');
+  // layout: claude/<proj>/<session>.jsonl, and claude/<proj>/<session>/agent-*.jsonl beneath it
+  const parts = rel.split("/");
+  if (parts[0] !== "claude" || parts.length < 3) return false;
+  const main = parts.length === 3 ? parts[1] + "/" + parts[2] : parts[1] + "/" + parts[2] + ".jsonl";
+  for (const s of relaySessions.values()) {
+    if (s.machine !== machine || !s.mirrorSize) continue;
+    const file = String(s.id.split(':').slice(2).join(':')).replace(/\\/g, '/');
+    if (file === main) return true;
+  }
+  return false;
+}
+
 function archiveManifest(machine) {
   const base = archiveMachineDir(machine);
   const out = {};
@@ -981,7 +1089,7 @@ function loadRelayCache() {
       if (!r.id || !r.result) continue;
       // r.proj is absent in every file written before the project field existed —
       // null is correct there, and relayProjLabel() falls back on its own.
-      relaySessions.set(r.id, { id: r.id, machine: r.machine, meta: r.meta || {}, proj: sanitizeProj(r.proj), version: 1, result: r.result, ips: r.ips, at: r.at });
+      relaySessions.set(r.id, { id: r.id, machine: r.machine, meta: r.meta || {}, proj: sanitizeProj(r.proj), version: 1, result: r.result, ips: r.ips, at: r.at, mirrorSize: r.mirrorSize || null });
       if (r.machine) {
         // max(), not last-wins: readdir order is arbitrary, and this value now drives
         // both the quiet verdict and the number shown to the owner
@@ -1905,7 +2013,7 @@ function econSnapshot(reason) {
 }
 // Daily, off the request path. The first run waits for the parse cache to warm —
 // a cold snapshot would block startup re-reading every transcript at once.
-setTimeout(() => {
+if (isMainThread) setTimeout(() => {
   try { econSnapshot('timer'); } catch (e) { console.error('econ snapshot failed: ' + e.message); }
   setInterval(() => {
     try { econSnapshot('timer'); } catch (e) { console.error('econ snapshot failed: ' + e.message); }
@@ -3543,11 +3651,14 @@ const server = http.createServer((req, res) => {
                 const job = relayParseQueue.get(dest);
                 relayParseQueue.delete(dest);
                 if (!job) return;
-                try {
-                  const wf = new Map(Object.entries(job.m.wf || {}));
-                  const result = readSession(dest, wf);
-                  ingestRelay({ machine: job.machine, file: job.m.file, meta: job.m.meta || {}, proj: job.m.proj, result, ips: job.m.ips, version: job.m.version, mirrorSize: size });
-                } catch (e) { console.error('relay append parse failed:', e.message); }
+                const wf = new Map(Object.entries(job.m.wf || {}));
+                const sig = sessionSignature(dest);
+                readSessionFresh(dest, wf)
+                  .then(result => {
+                    cacheStore(dest, sig, result);
+                    ingestRelay({ machine: job.machine, file: job.m.file, meta: job.m.meta || {}, proj: job.m.proj, result, ips: job.m.ips, version: job.m.version, mirrorSize: size });
+                  })
+                  .catch(e => console.error('relay append parse failed: ' + e.message));
               });
             }
           }
@@ -3575,6 +3686,10 @@ const server = http.createServer((req, res) => {
     let relPath = '';
     try { relPath = decodeURIComponent(String(req.headers['x-archive-path'] || '')); } catch { /* refused below */ }
     if (!machine || !relPath) return json(res, { error: 'need x-archive-machine and x-archive-path' }, 400);
+    // A mirror the delta path maintains has exactly one writer. Tonight's anchor
+    // mismatch was this endpoint landing a whole-file snapshot 2,311 bytes past
+    // the offset the delta path had just recorded for the same file.
+    if (deltaMaintained(machine, relPath)) { req.resume(); return json(res, { error: 'delta-owned: the live path keeps this mirror' }, 409); }
     const tmp = path.join(os.tmpdir(), 'mc-arch-' + crypto.randomBytes(8).toString('hex') + '.tmp');
     const out = fs.createWriteStream(tmp);
     let got = 0, over = false;
@@ -4635,7 +4750,11 @@ async function runRelay(hub, machineName) {
           if (!skipped.includes(f.rel)) { skipped.push(f.rel); console.log(`archive: skipping ${f.rel} (${Math.round(f.size / 1048576)}MB) — larger than this hub can accept`); }
           continue;
         }
-        if (deltaOwned.has(f.rel)) continue; // the live delta path keeps this mirror byte-complete; a whole-file upload here would race an append and duplicate a region
+        // The live delta path keeps Claude mirrors byte-complete and resumable; a
+        // whole-file upload here races an append and lands a different snapshot of
+        // the same file. Once deltas are proven on this hub, Claude transcripts are
+        // simply not this pass's job any more.
+        if (deltaOwned.has(f.rel) || (hubDelta === true && f.rel.startsWith('claude/'))) continue;
         if ((failed.get(f.rel) || 0) >= FAIL_GIVE_UP) continue; // already refused twice; stop burning memory on it
         if (manifest[f.rel] === f.size) continue; // hub already has this exact file
         try {
@@ -4833,7 +4952,20 @@ function uninstallWindows() {
   process.exit(0);
 }
 
-if (process.argv.includes('--install')) {
+if (!isMainThread) {
+  // parser role: parse what the main thread sends, answer, hold nothing
+  if (workerData && workerData.role === 'parser') {
+    parentPort.on('message', job => {
+      let result = null, error = null;
+      try {
+        result = job.kind === 'codex'
+          ? readCodexSession(job.uuid)
+          : parseSessionFile(job.path, job.wf ? new Map(Object.entries(job.wf)) : undefined);
+      } catch (e) { error = e && e.message || String(e); }
+      parentPort.postMessage({ id: job.id, result, error });
+    });
+  }
+} else if (process.argv.includes('--install')) {
   installWindows();
 } else if (process.argv.includes('--uninstall')) {
   uninstallWindows();
