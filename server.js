@@ -676,14 +676,20 @@ function codexSignature(uuid) {
   return file ? String(file.size) : '';
 }
 
-const codexCache = new Map(); // uuid -> {sig, result}
+const codexCache = new Map(); // uuid -> {sig, result, at}
+// A live rollout grows every few seconds and its cache key is its size, so every
+// dashboard poll after a write re-read and re-parsed a 24MB tail on the server's
+// only thread — 6-9s of stall per write on a 308MB session, measured under the
+// CPU profiler. A parse younger than this is served even when the file has grown:
+// the tail lands on the first refresh after the window instead of on every one.
+const CODEX_REPARSE_MIN_MS = 20000;
 function readCodexCached(uuid) {
   const sig = codexSignature(uuid);
   const hit = codexCache.get(uuid);
-  if (hit && hit.sig === sig) return hit.result;
+  if (hit && (hit.sig === sig || Date.now() - hit.at < CODEX_REPARSE_MIN_MS)) return hit.result;
   const result = readCodexSession(uuid);
   if (result) {
-    codexCache.set(uuid, { sig, result });
+    codexCache.set(uuid, { sig, result, at: Date.now() });
     if (codexCache.size > 6) codexCache.delete(codexCache.keys().next().value);
   }
   return result;
