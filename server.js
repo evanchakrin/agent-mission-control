@@ -1013,7 +1013,7 @@ function ingestRelay(body) {
   const rec = {
     id, machine: body.machine, meta: body.meta || {}, proj: sanitizeProj(body.proj),
     version: (prev ? prev.version : 0) + 1, result: body.result,
-    ips: Array.isArray(body.ips) ? body.ips : [], at: Date.now(),
+    ips: Array.isArray(body.ips) ? body.ips : [], at: Date.now(), mirrorSize: body.mirrorSize || null,
   };
   relaySessions.set(id, rec);
   // lastData is the ONLY signal the quiet detector may use. lastSeen is liveness
@@ -3387,6 +3387,10 @@ function json(res, obj, code = 200) {
   res.end(JSON.stringify(obj));
 }
 
+// One writer per mirror. The relay's tick can overlap itself behind a slow
+// upload, and two appends interleaving into one file would corrupt it in a way
+// no offset check could see afterwards.
+const relayAppendInflight = new Set();
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
@@ -3445,9 +3449,13 @@ const server = http.createServer((req, res) => {
     // null bytes ride through path.resolve untouched and then throw INSIDE fs —
     // which, unguarded, killed the whole hub with one crafted request
     if (relPath.includes('\0') || !dest.startsWith(base + path.sep) || !/\.jsonl$/.test(dest)) { req.resume(); return json(res, { error: 'bad path' }, 400); }
+    // One line per append, every outcome: the storm of 2026-09-01 was diagnosed
+    // blind because the hub said nothing about what relays were sending it.
+    const note = what => console.log(`append ${machine} ${path.basename(dest)} @${offset}+${declared}: ${what}`);
+    if (relayAppendInflight.has(dest)) { note('busy'); req.resume(); return json(res, { error: 'another append to this file is in flight' }, 503); }
     let cur = 0;
     try { cur = fs.statSync(dest).size; } catch { /* new file */ }
-    if (offset !== cur && offset !== 0) { req.resume(); return json(res, { error: 'offset mismatch', size: cur }, 409); }
+    if (offset !== cur && offset !== 0) { note('offset mismatch, have ' + cur); req.resume(); return json(res, { error: 'offset mismatch', size: cur }, 409); }
     // A relay that forgot its offsets (its own hub-restart handling, a fresh
     // relay-sent.json) starts every file over from byte 0 — after ONE hub restart
     // that was 229 whole transcripts over Tailscale, each a 'w' rewrite of a mirror
@@ -3456,7 +3464,7 @@ const server = http.createServer((req, res) => {
     // our size with an anchor and the storm collapses into 229 tiny appends. A real
     // rewrite fails that anchor, which discards the mirror, and the next offset-0
     // request replaces it.
-    if (offset === 0 && cur > 0 && cur <= declared) { req.resume(); return json(res, { error: 'have prefix', size: cur }, 409); }
+    if (offset === 0 && cur > 0 && cur <= declared) { note('have prefix ' + cur + ', resume there'); req.resume(); return json(res, { error: 'have prefix', size: cur }, 409); }
     // Content anchor: the relay sends a hex digest of the ≤64 bytes just before
     // its offset. If OUR bytes there differ, the streams have diverged (rewrite,
     // duplicated region, junk from an aborted lying request) — answer 409 size:0
@@ -3473,11 +3481,11 @@ const server = http.createServer((req, res) => {
         // our bytes there are wrong, so the whole mirror is suspect — drop it now, or
         // the prefix rule above would bounce the relay's replacement forever
         try { fs.unlinkSync(dest); } catch { /* already gone */ }
-        req.resume(); return json(res, { error: 'anchor mismatch', size: 0 }, 409);
+        note('anchor mismatch, mirror discarded'); req.resume(); return json(res, { error: 'anchor mismatch', size: 0 }, 409);
       }
     }
-    if (offset + declared > ARCHIVE_FILE_CAP) { req.resume(); return json(res, { error: 'file too large' }, 413); }
-    if (declared > 0 && archiveTotalSize() + declared > ARCHIVE_TOTAL_CAP) { req.resume(); return json(res, { error: 'archive full' }, 507); }
+    if (offset + declared > ARCHIVE_FILE_CAP) { note('over file cap'); req.resume(); return json(res, { error: 'file too large' }, 413); }
+    if (declared > 0 && archiveTotalSize() + declared > ARCHIVE_TOTAL_CAP) { note('archive full'); req.resume(); return json(res, { error: 'archive full' }, 507); }
     archSizeCache.total += declared; // count admitted bytes NOW: N requests inside one cache window must not each pass against the same stale total
     let out, renamed = false;
     // A replace lands beside dest and renames on completion. A 'w' straight onto
@@ -3491,12 +3499,14 @@ const server = http.createServer((req, res) => {
       // gets a 409 with our size and resumes from there, so no cleanup is needed.
       out = fs.createWriteStream(tmp || dest, { flags: tmp ? 'w' : 'a' });
     } catch (e) { req.resume(); return json(res, { error: e.message }, 400); }
+    relayAppendInflight.add(dest);
+    out.on('close', () => relayAppendInflight.delete(dest));
     let got = 0, killed = false;
     req.on('data', c => {
       got += c.length;
-      if (got > declared && !killed) { killed = true; out.destroy(); req.destroy(); } // liar guard: declared size is a promise, and the anchor check catches any junk that already landed
+      if (got > declared && !killed) { killed = true; note('sent more than declared, dropped'); out.destroy(); req.destroy(); } // liar guard: declared size is a promise, and the anchor check catches any junk that already landed
     });
-    req.on('error', () => { try { out.destroy(); } catch { /* already gone */ } });
+    req.on('error', () => { note('connection lost after ' + got + ' bytes'); try { out.destroy(); } catch { /* already gone */ } });
     if (tmp) out.on('close', () => { if (!renamed) fs.unlink(tmp, () => { /* best effort */ }); });
     out.on('error', e => { if (!res.headersSent) json(res, { error: e.message }, 500); });
     out.on('finish', () => {
@@ -3511,6 +3521,7 @@ const server = http.createServer((req, res) => {
       // parses a knowingly half-updated set. The parse itself runs AFTER the
       // response, coalesced per file — acking a delta must not wait multi-hundred
       // ms behind readSession, and back-to-back appends parse once, not twice.
+      let reannounce = false;
       const metaHdr = req.headers['x-relay-meta'];
       if (metaHdr) {
         try {
@@ -3521,7 +3532,8 @@ const server = http.createServer((req, res) => {
           // an empty append is a relay re-announcing a file we already hold — its
           // hub-restart handling — so there is nothing new to parse; a full reparse of
           // a 64MB tail per re-announce is what stalled the hub for 10s at a time
-          const reannounce = declared === 0 && relaySessions.has('relay:' + machine + ':' + String(m && m.file));
+          const known = relaySessions.get('relay:' + machine + ':' + String(m && m.file));
+          reannounce = declared === 0 && !!known && known.mirrorSize === size;
           if (m && m.file && !reannounce && claimed === relPath.replace(/\\/g, '/')) {
             relayParseQueue.set(dest, { machine, m });
             if (!relayParseScheduled.has(dest)) {
@@ -3534,13 +3546,14 @@ const server = http.createServer((req, res) => {
                 try {
                   const wf = new Map(Object.entries(job.m.wf || {}));
                   const result = readSession(dest, wf);
-                  ingestRelay({ machine: job.machine, file: job.m.file, meta: job.m.meta || {}, proj: job.m.proj, result, ips: job.m.ips, version: job.m.version });
+                  ingestRelay({ machine: job.machine, file: job.m.file, meta: job.m.meta || {}, proj: job.m.proj, result, ips: job.m.ips, version: job.m.version, mirrorSize: size });
                 } catch (e) { console.error('relay append parse failed:', e.message); }
               });
             }
           }
         } catch (e) { console.error('relay append meta rejected:', e.message); }
       }
+      note('ok, mirror now ' + size + (reannounce ? ' (unchanged, no reparse)' : ''));
       json(res, { ok: true, size, boot: BOOT_ID });
     });
     req.pipe(out);
@@ -4499,7 +4512,7 @@ async function runRelay(hub, machineName) {
     return true;
   };
 
-  const tick = async () => {
+  const tickBody = async () => {
     // Hub reachability first: when it's down, park the WHOLE pass on backoff.
     // The first OOM crash spent its final minutes rebuilding a 14MB body every
     // 5 seconds just to watch fetch fail ("send failed ... will retry" spam).
@@ -4561,6 +4574,15 @@ async function runRelay(hub, machineName) {
     // sessions can't grow the map without bound
     if (nextAt.size > 2000) { const t = Date.now(); for (const [k, v] of nextAt) if (v < t && !fails.has(k)) nextAt.delete(k); }
     flush(true);
+  };
+  // setInterval does not wait for the previous tick. Behind one slow upload the
+  // ticks stacked up, each starting its own copy of the same append — eight
+  // connections open to the hub and a file nobody could finish.
+  let ticking = false;
+  const tick = async () => {
+    if (ticking) return;
+    ticking = true;
+    try { await tickBody(); } finally { ticking = false; }
   };
   await tick();
   setInterval(tick, 5000);

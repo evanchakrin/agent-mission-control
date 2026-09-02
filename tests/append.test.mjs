@@ -100,6 +100,35 @@ test('a replace that dies mid-body leaves the existing mirror intact', async () 
   assert.ok(!fs.existsSync(MIRROR + '.mc-replace'), 'the half-written sibling is cleaned up');
 });
 
+test('a second append to a mirror mid-upload is refused, not interleaved', async () => {
+  const cur = mirror().length;
+  const before = mirror();
+  const slow = await new Promise((resolve, reject) => {
+    const s = net.connect(PORT, '127.0.0.1', () => {
+      s.write([
+        'POST /v1/relay/append HTTP/1.1', `Host: 127.0.0.1:${PORT}`,
+        'Content-Type: application/octet-stream', 'x-relay-machine: testbox',
+        'x-relay-path: ' + encodeURIComponent('claude/testproj/x.jsonl'),
+        `x-relay-offset: ${cur}`, 'x-relay-bytes: 4000', 'Content-Length: 4000', '', '',
+      ].join('\r\n'));
+      s.write(Buffer.alloc(64, 0x7a)); // the upload has started and is now stalled
+      setTimeout(() => resolve(s), 200);
+    });
+    s.on('error', reject);
+  });
+  const r = await append(cur, B, B.length, { 'x-relay-anchor': anchorOf(before, cur) });
+  assert.equal(r.status, 503, 'the overlapping append is turned away');
+  slow.destroy();
+  await settle(400);
+  // an append (not a replace) lands bytes as they arrive — by design, since a
+  // true prefix of the relay's tail is resumable — so the only thing the refused
+  // request may not have done is put ITS bytes anywhere
+  const after = mirror();
+  assert.deepEqual(after.subarray(0, before.length), before, 'the existing mirror is untouched');
+  assert.ok(after.length <= before.length + 64, 'only the stalled upload\'s own bytes landed');
+  assert.ok(!after.subarray(before.length).includes(B), 'the refused append wrote nothing');
+});
+
 test('an anchor mismatch discards the mirror so the next offset-0 upload really replaces it', async () => {
   const cur = mirror().length;
   const r = await append(cur, B, B.length, { 'x-relay-anchor': sha1(Buffer.from('not the bytes we hold')) });
