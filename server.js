@@ -3442,6 +3442,15 @@ const server = http.createServer((req, res) => {
     let cur = 0;
     try { cur = fs.statSync(dest).size; } catch { /* new file */ }
     if (offset !== cur && offset !== 0) { req.resume(); return json(res, { error: 'offset mismatch', size: cur }, 409); }
+    // A relay that forgot its offsets (its own hub-restart handling, a fresh
+    // relay-sent.json) starts every file over from byte 0 — after ONE hub restart
+    // that was 229 whole transcripts over Tailscale, each a 'w' rewrite of a mirror
+    // that was already byte-complete. When our mirror could be a prefix of the
+    // relay's file, answer as a plain offset disagreement: the relay resumes from
+    // our size with an anchor and the storm collapses into 229 tiny appends. A real
+    // rewrite fails that anchor, which discards the mirror, and the next offset-0
+    // request replaces it.
+    if (offset === 0 && cur > 0 && cur <= declared) { req.resume(); return json(res, { error: 'have prefix', size: cur }, 409); }
     // Content anchor: the relay sends a hex digest of the ≤64 bytes just before
     // its offset. If OUR bytes there differ, the streams have diverged (rewrite,
     // duplicated region, junk from an aborted lying request) — answer 409 size:0
@@ -3454,18 +3463,27 @@ const server = http.createServer((req, res) => {
         const fd = fs.openSync(dest, 'r');
         try { fs.readSync(fd, buf, 0, n, offset - n); } finally { fs.closeSync(fd); }
       } catch { /* unreadable: fall through to mismatch */ }
-      if (crypto.createHash('sha1').update(buf).digest('hex') !== anchor) { req.resume(); return json(res, { error: 'anchor mismatch', size: 0 }, 409); }
+      if (crypto.createHash('sha1').update(buf).digest('hex') !== anchor) {
+        // our bytes there are wrong, so the whole mirror is suspect — drop it now, or
+        // the prefix rule above would bounce the relay's replacement forever
+        try { fs.unlinkSync(dest); } catch { /* already gone */ }
+        req.resume(); return json(res, { error: 'anchor mismatch', size: 0 }, 409);
+      }
     }
     if (offset + declared > ARCHIVE_FILE_CAP) { req.resume(); return json(res, { error: 'file too large' }, 413); }
     if (declared > 0 && archiveTotalSize() + declared > ARCHIVE_TOTAL_CAP) { req.resume(); return json(res, { error: 'archive full' }, 507); }
     archSizeCache.total += declared; // count admitted bytes NOW: N requests inside one cache window must not each pass against the same stale total
-    let out;
+    let out, renamed = false;
+    // A replace lands beside dest and renames on completion. A 'w' straight onto
+    // dest turned every upload that died mid-body into a mirror truncated to wherever
+    // it died — 77MB of live transcript cut to 6.5MB at Node's five-minute mark.
+    const tmp = offset === 0 ? dest + '.mc-replace' : null;
     try {
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       // Stream straight to disk, 'a' for a true append. A request that dies
       // mid-body leaves a longer file than the relay's offset — the NEXT attempt
       // gets a 409 with our size and resumes from there, so no cleanup is needed.
-      out = fs.createWriteStream(dest, { flags: offset === 0 ? 'w' : 'a' });
+      out = fs.createWriteStream(tmp || dest, { flags: tmp ? 'w' : 'a' });
     } catch (e) { req.resume(); return json(res, { error: e.message }, 400); }
     let got = 0, killed = false;
     req.on('data', c => {
@@ -3473,8 +3491,13 @@ const server = http.createServer((req, res) => {
       if (got > declared && !killed) { killed = true; out.destroy(); req.destroy(); } // liar guard: declared size is a promise, and the anchor check catches any junk that already landed
     });
     req.on('error', () => { try { out.destroy(); } catch { /* already gone */ } });
+    if (tmp) out.on('close', () => { if (!renamed) fs.unlink(tmp, () => { /* best effort */ }); });
     out.on('error', e => { if (!res.headersSent) json(res, { error: e.message }, 500); });
     out.on('finish', () => {
+      if (tmp) {
+        try { fs.renameSync(tmp, dest); renamed = true; }
+        catch (e) { return json(res, { error: 'replace failed: ' + e.message }, 500); }
+      }
       let size = 0;
       try { size = fs.statSync(dest).size; } catch { /* vanished */ }
       // The MAIN transcript's append carries the session metadata and triggers
@@ -3489,7 +3512,11 @@ const server = http.createServer((req, res) => {
           // the metadata must describe the file it rode in on — a relay may not
           // ingest session B built from file A's bytes
           const claimed = 'claude/' + String(m && m.file || '').replace(/\\/g, '/');
-          if (m && m.file && claimed === relPath.replace(/\\/g, '/')) {
+          // an empty append is a relay re-announcing a file we already hold — its
+          // hub-restart handling — so there is nothing new to parse; a full reparse of
+          // a 64MB tail per re-announce is what stalled the hub for 10s at a time
+          const reannounce = declared === 0 && relaySessions.has('relay:' + machine + ':' + String(m && m.file));
+          if (m && m.file && !reannounce && claimed === relPath.replace(/\\/g, '/')) {
             relayParseQueue.set(dest, { machine, m });
             if (!relayParseScheduled.has(dest)) {
               relayParseScheduled.add(dest);
@@ -4264,6 +4291,18 @@ async function runRelay(hub, machineName) {
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { flush(true); process.exit(0); });
   if (sent.size) console.log(`Resuming: ${sent.size} sessions already delivered to this hub — only changes will be sent`);
   let hubBoot = restored.boot; // remembered, so a hub restart while we were down is still caught
+  // A hub restart used to wipe every delivery offset and re-upload every transcript
+  // from byte 0 — the storm that OOM'd this relay in August, and on the delta path
+  // the thing that left truncated mirrors when a re-upload died mid-body. The hub's
+  // mirrors live on ITS disk and outlive its process; the offset+anchor handshake
+  // already catches a mirror that really is gone. So forget only what a restart
+  // loses: the sigs. A null sig re-announces each session with an empty append.
+  const forgetHub = () => {
+    for (const [file, v] of sent) {
+      if (v && typeof v === 'object') sent.set(file, { ...v, sig: null });
+      else sent.delete(file); // legacy whole-session records: the hub really did lose those
+    }
+  };
   console.log(`Relaying local sessions → ${hub}/v1/relay as "${machineName}"`);
   console.log(`Watching transcripts in ${PROJECTS_DIR}`);
   // ----- OOM discipline (three heap deaths on one production relay, 2026-08-31) -----
@@ -4397,7 +4436,7 @@ async function runRelay(hub, machineName) {
     }
     if (!res) throw new Error('offset never agreed for ' + meta.file);
     hubDelta = true;
-    if (res.boot && hubBoot && res.boot !== hubBoot) sent.clear();
+    if (res.boot && hubBoot && res.boot !== hubBoot) forgetHub();
     if (res.boot) hubBoot = res.boot;
     const prevOff = (prev && typeof prev === 'object') ? prev.off || 0 : 0;
     // an incomplete subagent set records sig:null — never a match, so the whole
@@ -4448,7 +4487,7 @@ async function runRelay(hub, machineName) {
     dirty = true;
     flush(false);   // debounced; keeps a long first pass durable
     const info = await r.json().catch(() => ({}));
-    if (info.boot && hubBoot && info.boot !== hubBoot) { sent.clear(); sent.set(meta.file, sig); }
+    if (info.boot && hubBoot && info.boot !== hubBoot) { forgetHub(); sent.set(meta.file, sig); }
     if (info.boot) hubBoot = info.boot;
     console.log(`sent ${meta.title || meta.session} (${Math.round(body.length / 1024)}KB)`);
     return true;
@@ -4467,7 +4506,7 @@ async function runRelay(hub, machineName) {
     }
     hubDownFails = 0;
     // a wiped hub gets a full resend even when no local session changed
-    if (hubBoot && b.boot !== hubBoot) { sent.clear(); dirty = true; hubDelta = null; console.log('hub restarted — resending all sessions'); }
+    if (hubBoot && b.boot !== hubBoot) { forgetHub(); dirty = true; hubDelta = null; console.log('hub restarted — re-announcing all sessions (delivery offsets kept)'); }
     if (b.boot !== hubBoot) dirty = true;
     hubBoot = b.boot;
     // WHY proj travels at all: the hub cannot work out which project a relayed
@@ -4775,6 +4814,10 @@ if (process.argv.includes('--install')) {
 } else {
   loadState();
   loadRelayCache(); // restore relayed sessions from disk so a restart keeps them
+  // Node ends any request still receiving after 300s by default. A relay streaming
+  // a 77MB transcript over Tailscale into a hub busy parsing other appends needs
+  // longer than that — and the stub it left behind was a mirror cut mid-line.
+  server.requestTimeout = 2 * 3600e3;
   server.listen(PORT, () => {
     console.log(`Agent Mission Control → http://localhost:${PORT}`);
     console.log(`Watching transcripts in ${PROJECTS_DIR}`);
