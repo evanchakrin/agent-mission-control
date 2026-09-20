@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src __AMC_REPLAY_HASHES__; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>AMC offline indexed replay</title>
+<style>body{font:16px system-ui;max-width:1000px;margin:2rem auto;padding:0 1rem;background:#14171d;color:#e8edf5}button,input{font:inherit;margin:.4rem;padding:.5rem}pre{white-space:pre-wrap;overflow-wrap:anywhere}article{border-bottom:1px solid #59616f;padding:1rem 0}button:disabled{opacity:.5}#status{min-height:2em}</style></head>
+<body><style>article[aria-current="true"]{outline:2px solid #8fc7ff;background:#202a38}</style><h1>Offline indexed replay</h1>
+<p>Select an AMC indexed-history JSONL export. This viewer makes no network requests and does not modify or upload your file. Save this HTML alongside your exports to use it offline.</p>
+<p>Indexed text may be abbreviated. Keep the separate complete source download. Validation checks export structure and completion, not authenticity or billing accuracy.</p>
+<label>Indexed export file <input id="file" type="file" accept=".jsonl,.ndjson,application/x-ndjson"></label>
+<button id="cancel" disabled>Cancel current read</button><p id="status" role="status" aria-live="polite">No file selected.</p>
+<h2 id="title">History</h2><p id="summary"></p>
+<label>Display <select id="view" disabled><option value="conversation">Readable conversation</option><option value="raw">Raw records</option></select></label>
+<p>Conversation mode preserves export order and every record, including usage and completion records. It does not reconstruct missing text or infer agent relationships.</p>
+<nav aria-label="History pages"><button id="first" disabled>First page</button><button id="previous" disabled>Previous page</button><button id="next" disabled>Next page</button><button id="play" disabled>Play records</button><button id="pause" disabled>Pause replay</button><label>Replay interval <select id="speed"><option value="1000">1 second</option><option value="500">0.5 seconds</option><option value="100">0.1 seconds</option></select></label></nav>
+<p>Pages hold at most 100 records and normally 4 MiB. Previous keeps the most recent 20 page positions; First page always returns to the beginning. No historical records are discarded from the file.</p>
+<main id="history"></main>
+<script>__AMC_REPLAY_READER__</script><script>__AMC_REPLAY_UI__</script>
+</body></html>

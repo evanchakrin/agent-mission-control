@@ -3,6 +3,8 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 const BAKED = window.__BAKED__ || null; // standalone replay export mode
+const V2_PREVIEW = document.documentElement?.dataset?.amcBackend === 'v2';
+let v2Dashboard = null;
 
 // agent-type identity: color + label, used across cards, table, and constellation
 const AGENT_KIND = {
@@ -204,10 +206,15 @@ let metaCsrf = null;
 let metaVersion = -1;
 let metaReadOnly = false;
 let metaMachineNames = {}; // real machine name -> friendly display name
+const pendingSessionPatches = new Map();
 async function loadMeta() {
   try {
-    const m = await (await fetch('/api/meta')).json();
+    const response = await fetch('/api/meta');
+    if (!response.ok) throw new Error('metadata unavailable');
+    const m = await response.json();
+    if (m.csrf === metaCsrf && m.metaVersion < metaVersion) return;
     metaMap = m.sessions || {}; metaProjects = m.projects || []; metaTags = m.tags || [];
+    for (const [key, patch] of pendingSessionPatches) metaMap[key] = { ...(metaMap[key] || {}), ...patch };
     metaCsrf = m.csrf; metaVersion = m.metaVersion; metaReadOnly = !!m.readOnly;
     metaMachineNames = m.machineNames || {};
   } catch { /* first load may race boot */ }
@@ -237,7 +244,61 @@ function refreshOverview() {
   else if (state.view === 'table') renderTable();
   else if (state.view === 'projects') renderProjects();
 }
-async function setSessionMeta(stableKey, patch) { if (stableKey) return metaPost('/api/meta/session', { stableKey, patch }); }
+// Session organization is a direct-manipulation interaction: archiving a row
+// should feel like removing a row, not like submitting a form. Apply the patch
+// locally before the first await, then reconcile with the record returned by
+// the write endpoint. Unlike the generic metadata routes, /api/meta/session
+// returns both the committed session and metaVersion, so a follow-up GET only
+// added latency and a full second redraw. Per-key sequence numbers keep an older
+// response (or failure) from undoing a newer click on the same session.
+const sessionMetaWriteSeq = new Map();
+async function setSessionMeta(stableKey, patch) {
+  if (!stableKey) return null;
+  if (metaReadOnly) { alert('Metadata is read-only (recovered from a corrupt state file).'); return null; }
+
+  const seq = (sessionMetaWriteSeq.get(stableKey) || 0) + 1;
+  sessionMetaWriteSeq.set(stableKey, seq);
+  const hadPrevious = Object.prototype.hasOwnProperty.call(metaMap, stableKey);
+  const previous = hadPrevious ? { ...metaMap[stableKey] } : null;
+  metaMap[stableKey] = { ...(previous || {}), ...patch };
+  pendingSessionPatches.set(stableKey, { ...(pendingSessionPatches.get(stableKey) || {}), ...patch });
+  refreshOverview();
+
+  try {
+    const send = () => fetch('/api/meta/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-MC-CSRF': metaCsrf },
+      body: JSON.stringify({ baseVersion: metaVersion, stableKey, patch }),
+    });
+    let r = await send();
+    if (r.status === 403) {
+      const error = await r.clone().json().catch(() => ({}));
+      if (error.error === 'bad csrf') {
+        await loadMeta();
+        r = await send();
+      }
+    }
+    if (!r.ok) throw new Error(`metadata write failed (${r.status})`);
+    const result = await r.json();
+    if (Number.isFinite(result.metaVersion)) metaVersion = Math.max(metaVersion, result.metaVersion);
+    if (sessionMetaWriteSeq.get(stableKey) === seq && result.session) {
+      pendingSessionPatches.delete(stableKey);
+      metaMap[stableKey] = result.session;
+      refreshOverview();
+    }
+    return result;
+  } catch (error) {
+    console.warn('meta write failed', '/api/meta/session', error);
+    if (sessionMetaWriteSeq.get(stableKey) === seq) {
+      pendingSessionPatches.delete(stableKey);
+      if (hadPrevious) metaMap[stableKey] = previous;
+      else delete metaMap[stableKey];
+      refreshOverview();
+      alert('The session change could not be saved. Check that the local hub is running, then try again.');
+    }
+    return null;
+  }
+}
 
 // ---------- deep search (full-text across every transcript) ----------
 function openSearch() { $('searchOverlay').classList.add('open'); $('soInput').focus(); }
@@ -289,11 +350,87 @@ function openSessionAt(file, seq) {
 function loadAppVersion() {
   const el = $('appVersion');
   if (!el) return;
-  fetch('/api/update-check').then(r => r.json()).then(v => {
+  getUpdateCheck().then(v => {
     el.textContent = 'v' + v.current;
     el.title = v.updateAvailable ? `v${v.current} installed — v${v.latest} is available` : `v${v.current} — up to date`;
     el.classList.toggle('update-avail', !!v.updateAvailable);
   }).catch(() => { /* offline at boot — leave it blank rather than guess */ });
+}
+
+// A view change, the notification poll, and boot can all ask for the same
+// expensive fleet snapshot at once. Keep one request in flight and let view
+// loads reuse a just-finished snapshot for a very short coherence window.
+const API_COHERENCE_MS = 2000;
+const MACHINE_POLL_CACHE_MS = 60000;
+// A stopped or overloaded local hub must not pin the single-flight promise
+// forever. This is deliberately long enough for a cold, full-cache snapshot;
+// it only turns a genuinely hung request into a recoverable next poll.
+const API_REQUEST_TIMEOUT_MS = 45000;
+let fleetCache = null, fleetRequest = null, fleetFetchedAt = 0;
+let fleetMutationSeq = 0, fleetRequestMutationSeq = 0;
+let machinesCache = null, machinesRequest = null, machinesFetchedAt = 0;
+let updateCheckCache = null, updateCheckRequest = null;
+function fetchApiJson(path, label, timeoutMs = API_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(path, { signal: controller.signal })
+    .then(r => {
+      if (!r.ok) throw new Error(`${label} ${r.status}`);
+      return r.json();
+    })
+    .catch(error => {
+      if (controller.signal.aborted) throw new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`);
+      throw error;
+    })
+    .finally(() => clearTimeout(timeout));
+}
+function getFleet(maxAgeMs = 0, freshAfterMutation = 0) {
+  if (fleetRequest) {
+    // A post-mutation refresh must not reuse a snapshot whose request started
+    // before the mutation. Wait for that single-flight request, then begin a
+    // new one; a request that began after the barrier is already fresh enough.
+    if (freshAfterMutation && fleetRequestMutationSeq < freshAfterMutation) {
+      return fleetRequest.then(
+        () => getFleet(0, freshAfterMutation),
+        () => getFleet(0, freshAfterMutation),
+      );
+    }
+    return fleetRequest;
+  }
+  const mustRefresh = freshAfterMutation && fleetRequestMutationSeq < freshAfterMutation;
+  if (!mustRefresh && maxAgeMs > 0 && fleetCache && Date.now() - fleetFetchedAt < maxAgeMs) return Promise.resolve(fleetCache);
+  fleetRequestMutationSeq = fleetMutationSeq;
+  fleetRequest = fetchApiJson('/api/fleet', 'fleet')
+    .then(data => {
+      fleetCache = data;
+      fleetFetchedAt = Date.now();
+      return data;
+    })
+    .finally(() => { fleetRequest = null; });
+  return fleetRequest;
+}
+function getMachines(maxAgeMs = 0) {
+  if (machinesRequest) return machinesRequest;
+  if (maxAgeMs > 0 && machinesCache && Date.now() - machinesFetchedAt < maxAgeMs) return Promise.resolve(machinesCache);
+  machinesRequest = fetchApiJson('/api/machines', 'machines')
+    .then(data => {
+      machinesCache = data;
+      machinesFetchedAt = Date.now();
+      return data;
+    })
+    .finally(() => { machinesRequest = null; });
+  return machinesRequest;
+}
+function getUpdateCheck() {
+  if (updateCheckRequest) return updateCheckRequest;
+  if (updateCheckCache) return Promise.resolve(updateCheckCache);
+  updateCheckRequest = fetchApiJson('/api/update-check', 'update check')
+    .then(data => {
+      updateCheckCache = data;
+      return data;
+    })
+    .finally(() => { updateCheckRequest = null; });
+  return updateCheckRequest;
 }
 
 // ---------- notifications ----------
@@ -301,23 +438,49 @@ function loadAppVersion() {
 // finished (were active, now idle > N min). Fires desktop notifications + a bell.
 const notifs = [];
 const notifSeen = new Map(); // file -> {errors, lastMtime, wasActive}
-let notifTimer = null;
-function startNotifications() {
-  if (notifTimer || BAKED) return;
-  // seed baseline silently so we don't alert on the whole backlog at startup
-  fetch('/api/fleet').then(r => r.json()).then(fleet => {
-    for (const s of fleet) notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: Date.now() - s.mtime < 6e5 });
-    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
-    notifTimer = setInterval(pollNotifications, 15000);
-  });
+const NOTIF_ACTIVE_MS = 15000;
+const NOTIF_IDLE_MS = 60000;
+const NOTIF_HIDDEN_ACTIVE_MS = 30000;
+const NOTIF_HIDDEN_IDLE_MS = 120000;
+let notifTimer = null, notifStarted = false;
+function nextNotifDelay() {
+  const now = Date.now();
+  const active = (fleetCache || []).some(s => s.stalled || s.liveAgentCount > 0 || now - s.mtime < 6e5);
+  if (document.hidden) return active ? NOTIF_HIDDEN_ACTIVE_MS : NOTIF_HIDDEN_IDLE_MS;
+  return active ? NOTIF_ACTIVE_MS : NOTIF_IDLE_MS;
 }
+function scheduleNotifPoll(delay = nextNotifDelay()) {
+  clearTimeout(notifTimer);
+  notifTimer = setTimeout(async () => {
+    notifTimer = null;
+    try { await pollNotifications(); } catch { /* retry on the next cycle */ }
+    scheduleNotifPoll();
+  }, delay);
+}
+async function startNotifications() {
+  if (notifStarted || BAKED) return;
+  notifStarted = true;
+  // Seed baseline silently so we don't alert on the whole backlog at startup.
+  // A failed cold read no longer disables notifications for the whole page load.
+  try {
+    const fleet = await getFleet(API_COHERENCE_MS);
+    for (const s of fleet) notifSeen.set(s.file, { errors: s.errors, mtime: s.mtime, active: Date.now() - s.mtime < 6e5, stalled: s.stalled });
+    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+  } catch { /* the scheduled poll retries */ }
+  scheduleNotifPoll();
+}
+document.addEventListener('visibilitychange', () => {
+  if (!notifStarted || !notifTimer) return;
+  const delay = nextNotifDelay();
+  scheduleNotifPoll(Math.max(0, delay - (Date.now() - fleetFetchedAt)));
+});
 const machineSeen = new Map(); // name -> wasQuiet (learned-rhythm silence, not a flat timeout)
-let updateNotified = false, budgetNotifiedDay = null;
+let updateChecked = false, budgetNotifiedDay = null;
 async function pollNotifications() {
   let fleet;
-  try { fleet = await (await fetch('/api/fleet')).json(); } catch { return; }
-  // This poll runs every 15s regardless of which overview tab is open — piggyback
-  // on it to keep the "at work now" strip current without a fetch of its own.
+  try { fleet = await getFleet(); } catch { return; }
+  // Piggyback on the adaptive notification poll to keep the "at work now" strip
+  // current without a second fleet fetch of its own.
   fleetCache = fleet;
   renderLiveNowStrip();
   for (const s of fleet) {
@@ -341,8 +504,10 @@ async function pollNotifications() {
   // transition into quiet; the persistent banner (renderMachineWarnBar) stays
   // up the whole time it's true, so seeing it never depends on the tab being
   // open at the exact moment the line was crossed.
+  let machines = null;
   try {
-    const ms = await (await fetch('/api/machines')).json();
+    machines = await getMachines(MACHINE_POLL_CACHE_MS);
+    const ms = machines;
     renderMachineWarnBar(ms);
     for (const m of ms.filter(x => x.remote)) {
       const isQuiet = !!(m.quiet && m.quiet.quiet);
@@ -352,10 +517,10 @@ async function pollNotifications() {
     }
   } catch { /* ignore */ }
   // update available (once per page load) — name each stale instance + action
-  if (!updateNotified) {
+  if (!updateChecked && machines) {
     try {
-      const u = await (await fetch('/api/update-check')).json();
-      const ms = await (await fetch('/api/machines')).json().catch(() => []);
+      const u = await getUpdateCheck();
+      const ms = machines;
       const stale = [];
       if (u.updateAvailable) stale.push(`this dashboard (v${u.current} → ask Claude to redeploy)`);
       for (const m of ms.filter(x => x.remote && x.version && u.latest && x.version !== u.latest && x.version !== u.current)) {
@@ -366,7 +531,10 @@ async function pollNotifications() {
       for (const m of ms.filter(x => x.remote && !x.version && Date.now() - x.lastSeen < 10 * 60e3)) {
         stale.push(`${m.name} (version unknown — too old to say; send it the update paste)`);
       }
-      if (stale.length) { updateNotified = true; pushNotif('done', `v${u.latest || u.current} is latest — behind: ${stale.join('; ')}`, { title: 'Version check', file: '', machine: '', kind: 'claude', session: 'update' }); }
+      // A clean first snapshot is not completion: a stale relay can appear on
+      // the next cached machine refresh. Keep checking until stale is seen.
+      updateChecked = stale.length > 0;
+      if (stale.length) pushNotif('done', `v${u.latest || u.current} is latest — behind: ${stale.join('; ')}`, { title: 'Version check', file: '', machine: '', kind: 'claude', session: 'update' });
     } catch { /* ignore */ }
   }
   // daily cost budget (set in Usage view; stored locally)
@@ -381,7 +549,7 @@ async function pollNotifications() {
   }
 }
 function pushNotif(type, msg, s) {
-  const n = { type, msg, title: s.title || s.session.slice(0, 8), file: s.file, machine: s.machine, kind: s.kind, at: Date.now() };
+  const n = { type, msg, title: s.title || s.session.slice(0, 8), file: s.file, v2SessionId:s.v2SessionId, machine: s.machine, kind: s.kind, at: Date.now() };
   notifs.unshift(n);
   if (notifs.length > 40) notifs.pop();
   renderBell();
@@ -395,18 +563,16 @@ function renderBell() {
   bc.style.display = unread ? '' : 'none'; bc.textContent = unread;
   $('bell').classList.toggle('has', unread > 0);
   $('notifList').innerHTML = notifs.length ? notifs.map(n => `
-    <div class="notif ${n.type}" data-file="${esc(n.file)}">
+    <div class="notif ${n.type}" data-file="${esc(n.file)}" data-v2-session="${esc(n.v2SessionId||'')}">
       <span class="ni">${n.type === 'error' ? '⚠️' : '✅'}</span>
       <div><div class="nt">${esc(n.title)}</div><div class="nm">${esc(n.msg)} · ${esc(machineLabel(n.machine))}</div></div>
       <span class="ndot" style="background:${kindColor(n.kind)}"></span>
     </div>`).join('') : '<div class="notif-empty">No alerts yet. Errors and finished long runs show here.</div>';
-  $('notifList').querySelectorAll('.notif[data-file]').forEach(el => el.onclick = () => { $('notifPanel').classList.remove('open'); if (el.dataset.file) openSession(el.dataset.file); });
+  $('notifList').querySelectorAll('.notif[data-file]').forEach(el => el.onclick = () => { $('notifPanel').classList.remove('open'); if(V2_PREVIEW&&el.dataset.v2Session)v2Dashboard?.openSession(el.dataset.v2Session);else if (el.dataset.file) openSession(el.dataset.file); });
 }
 $('bell').onclick = () => { $('notifPanel').classList.toggle('open'); notifs.forEach(n => n.read = true); renderBell(); };
 $('notifClear').onclick = (e) => { e.stopPropagation(); notifs.length = 0; renderBell(); };
 document.addEventListener('click', e => { if (!$('notifPanel').contains(e.target) && e.target !== $('bell') && !$('bell').contains(e.target)) $('notifPanel').classList.remove('open'); });
-
-let fleetCache = null;
 
 // ---------- "at work now" strip ----------
 // A one-line pulse of the fleet: who is actually working right now, across every
@@ -443,7 +609,7 @@ function renderLiveNowStrip() {
 
 async function loadFleet() {
   if (!fleetCache) $('fleet').innerHTML = '<div class="fleet-loading">Scanning sessions…</div>';
-  fleetCache = await (await fetch('/api/fleet')).json();
+  fleetCache = await getFleet(API_COHERENCE_MS);
   renderFleet();
   renderLiveNowStrip();
 }
@@ -453,7 +619,7 @@ function renderFleet() {
   const fleet = fleetCache || [];
   const shown = filteredFleet();
   const totCost = shown.reduce((n, s) => n + s.cost, 0);
-  const totAgents = shown.reduce((n, s) => n + s.agents, 0);
+  const totAgents = agentRollup(shown);
   $('fleet').innerHTML =
     fleetControls(shown.length, fleet.length, totAgents, totCost) +
     `<div class="fleet-grid">` + shown.map(s => {
@@ -513,12 +679,28 @@ function filteredFleet() {
     return true;
   }).sort((a, b) => (metaOf(b).pinned ? 1 : 0) - (metaOf(a).pinned ? 1 : 0)); // pinned first
 }
+function agentRollup(rows) {
+  let parsed = 0, discovered = 0, active = 0;
+  for (const s of rows || []) {
+    if (s.agentsProvisional) discovered += s.discoveredAgents || s.agents || 0;
+    else parsed += s.agents || 0;
+    active += s.liveAgentCount || 0;
+  }
+  return { parsed, discovered, active };
+}
+function agentRollupHTML(stats) {
+  const s = typeof stats === 'number' ? { parsed: stats, discovered: 0, active: 0 } : stats;
+  const history = s.discovered
+    ? `<b>${s.parsed}</b> parsed + <b>${s.discovered}</b> discovered agent runs`
+    : `<b>${s.parsed}</b> historical agent runs`;
+  return `${history}${s.active ? ` · <b>${s.active}</b> active now` : ''}`;
+}
 function fleetControls(shownN, totalN, agents, cost) {
   const machinesInFleet = [...new Set((fleetCache || []).map(s => s.machine).filter(Boolean))];
   const kinds = ['all', 'claude', 'codex', 'otel'];
   const arch = [['hide', 'Active'], ['only', 'Archived'], ['all', 'All']];
   return `<div class="fleet-head">
-    <h2>${shownN}${shownN !== totalN ? '/' + totalN : ''} sessions · ${agents} agents · ~${fmtUsd(cost)}</h2>
+    <h2>${shownN}${shownN !== totalN ? '/' + totalN : ''} sessions · ${agentRollupHTML(agents)} · ~${fmtUsd(cost)}</h2>
     <input id="fleetSearch" type="text" placeholder="search… title, machine, note" value="${esc(fleetFilter)}">
     <div class="seg" id="kindSeg">${kinds.map(k => `<button data-k="${k}" class="${fleetKind === k ? 'on' : ''}" ${k !== 'all' ? `style="--c:${kindColor(k)}"` : ''}>${k === 'all' ? 'All' : AGENT_KIND[k].label}</button>`).join('')}</div>
     <div class="seg" id="archSeg">${arch.map(([v, l]) => `<button data-a="${v}" class="${fleetArchived === v ? 'on' : ''}">${l}</button>`).join('')}</div>
@@ -574,13 +756,15 @@ function cardBadges(s) {
   return (m.pinned ? '<span class="mini-badge pin">★</span>' : '') +
     (p ? `<span class="mini-badge" style="background:${p.color}22;color:${p.color}">${esc(p.name)}</span>` : '') +
     (m.archived ? '<span class="mini-badge arch">archived</span>' : '') +
+    (s.indexing ? '<span class="mini-badge">indexing…</span>' : '') +
+    (s.parseDeferred ? '<span class="mini-badge" title="This transcript exceeds the safe live-parse budget; its last compact summary is retained.">large transcript</span>' : '') +
     (m.note ? `<span class="mini-badge note" title="${esc(m.note)}">✎</span>` : '');
 }
 
 // ---------- TABLE view ----------
 let tableSort = { col: 'mtime', dir: -1 };
 async function loadTable() {
-  if (!fleetCache) { $('tableView').innerHTML = '<div class="fleet-loading">Scanning…</div>'; fleetCache = await (await fetch('/api/fleet')).json(); }
+  if (!fleetCache) { $('tableView').innerHTML = '<div class="fleet-loading">Scanning…</div>'; fleetCache = await getFleet(); }
   renderTable();
   renderLiveNowStrip();
 }
@@ -611,7 +795,7 @@ function renderTable() {
     if (typeof av === 'number') return (av - bv) * dir;
     return String(av || '').localeCompare(String(bv || '')) * dir;
   });
-  const totCost = rows.reduce((n, s) => n + s.cost, 0), totAgents = rows.reduce((n, s) => n + s.agents, 0);
+  const totCost = rows.reduce((n, s) => n + s.cost, 0), totAgents = agentRollup(rows);
   $('tableView').innerHTML =
     fleetControls(rows.length, (fleetCache || []).length, totAgents, totCost) +
     `<div class="table-wrap"><table class="ftable"><thead><tr>` +
@@ -624,7 +808,7 @@ function renderTable() {
       const spend = s.tierMix ? TIERS.reduce((a, t) => a + (s.tierMix[t] || 0), 0) : 0;
       const tts = spend < 0.01 ? null : s.topTierShare;
       return `<tr data-file="${esc(s.file)}"${m.archived ? ' class="row-archived"' : ''}>
-        <td class="tsess" data-sk="${esc(s.stableKey || '')}" title="${s.renamed ? 'renamed — was: ' + esc(s.autoTitle || '') : 'double-click to rename'}"><span class="tsess-t">${esc(s.title || s.session.slice(0, 8))}</span>${s.stableKey ? '<button class="row-rename" title="rename">✎</button>' : ''}</td>
+        <td class="tsess" data-sk="${esc(s.stableKey || '')}" title="${s.renamed ? 'renamed — was: ' + esc(s.autoTitle || '') : 'double-click to rename'}"><span class="tsess-t">${esc(s.title || s.session.slice(0, 8))}</span>${s.indexing ? '<span class="mini-badge">indexing…</span>' : ''}${s.parseDeferred ? '<span class="mini-badge" title="last safe compact summary retained">large transcript</span>' : ''}${s.stableKey ? '<button class="row-rename" title="rename">✎</button>' : ''}</td>
         <td><span class="kind-badge" style="background:${c}22;color:${c}">${(AGENT_KIND[s.kind] || AGENT_KIND.claude).label}</span></td>
         <td${machineTitle(s.machine) ? ` title="${esc(machineTitle(s.machine))}"` : ''}>${esc(machineLabel(s.machine))}</td>
         <td class="tmodels">${modelChips(s, { max: 3 }) || '<span class="dim">—</span>'}</td>
@@ -692,7 +876,10 @@ function beginRename(cell, s, redraw) {
     if (save && val !== (s.renamed ? s.title : '')) {
       // metaPost already reports its own failures and refreshes the overview.
       await setSessionMeta(s.stableKey, { name: val || null });
-      fleetCache = await (await fetch('/api/fleet')).json();
+      // Force a fleet request newer than every request that was already in
+      // flight when the metadata mutation completed.
+      const freshAfter = ++fleetMutationSeq;
+      fleetCache = await getFleet(0, freshAfter);
     }
     redraw();
   };
@@ -704,7 +891,7 @@ function beginRename(cell, s, redraw) {
 // ---------- PROJECTS view (drag sessions into colored columns) ----------
 async function loadProjects() {
   await loadMeta();
-  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  if (!fleetCache) fleetCache = await getFleet();
   renderProjects();
 }
 function renderProjects() {
@@ -760,7 +947,7 @@ const PROJ_COLORS = ['#fb7185', '#60a5fa', '#c084fc', '#34d399', '#fbbf24', '#f4
 // ---------- USAGE view (tokens / agents / cost over time) ----------
 let usageGran = 'month', usageMetric = 'cost';
 async function loadUsage() {
-  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  if (!fleetCache) fleetCache = await getFleet();
   renderUsage();
 }
 function bucketKey(ts, gran) {
@@ -865,14 +1052,19 @@ function renderUsage() {
 // Nobody else has cross-machine multi-session data: this aggregates EVERY
 // session's top tool usage and control shape into one behavioral picture.
 let flowsCache = null;
+const FLOW_SAMPLE_CAP = 40;
+const DETAIL_FETCH_BATCH = 4;
 async function loadFlows() {
-  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  if (!fleetCache) fleetCache = await getFleet();
   if (!flowsCache) {
     $('flows').innerHTML = '<div class="fleet-loading">Analyzing fleet behavior across all sessions…</div>';
-    // sample up to 60 most recent sessions' full event streams
-    const picks = filteredFleet().slice(0, 60);
+    // Full remote details are disk-backed and parsed lazily by the hub. Keep the
+    // sample and concurrency deliberately small so opening this view cannot queue
+    // dozens of synchronous cache parses behind an otherwise-idle dashboard.
+    const picks = filteredFleet().slice(0, FLOW_SAMPLE_CAP);
     const results = [];
-    for (const chunk of [picks.slice(0, 20), picks.slice(20, 40), picks.slice(40, 60)]) {
+    for (let i = 0; i < picks.length; i += DETAIL_FETCH_BATCH) {
+      const chunk = picks.slice(i, i + DETAIL_FETCH_BATCH);
       const part = await Promise.all(chunk.map(s =>
         fetch('/api/session?file=' + encodeURIComponent(s.file)).then(r => r.json()).then(d => ({ s, d })).catch(() => null)));
       results.push(...part.filter(Boolean));
@@ -1004,13 +1196,13 @@ function renderFlows() {
 let fpCache = new Map();  // file -> {buckets[24], errB[24], kind, cost, dur, title, file, errors}
 let fpSize = 'medium';
 let fpLoading = false;
-const FP_CAP = 400;       // cap on sessions whose full event stream gets fetched at once
+const FP_CAP = 120;       // enough recent shapes to be useful without rehydrating the whole remote cache
 const FP_DIMS = { small: { w: 54, h: 22 }, medium: { w: 92, h: 36 }, large: { w: 148, h: 54 } };
 
 async function loadFingerprints() {
   // refetch every time: any of these can be the home screen, and a home screen
   // that never updates is worse than no home screen at all
-  try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
+  try { fleetCache = await getFleet(API_COHERENCE_MS); } catch { fleetCache = fleetCache || []; }
   renderFingerprints();
   renderLiveNowStrip();
   fetchMissingGlyphs();
@@ -1036,8 +1228,9 @@ async function fetchMissingGlyphs() {
   const missing = filteredFleet().slice(0, FP_CAP).filter(s => !fpCache.has(s.file));
   if (!missing.length) return;
   fpLoading = true;
-  for (let i = 0; i < missing.length; i += 15) {
-    const chunk = missing.slice(i, i + 15);
+  for (let i = 0; i < missing.length; i += DETAIL_FETCH_BATCH) {
+    if (state.view !== 'fingerprints') break; // stop background disk churn after navigation
+    const chunk = missing.slice(i, i + DETAIL_FETCH_BATCH);
     await Promise.all(chunk.map(s =>
       fetch('/api/session?file=' + encodeURIComponent(s.file)).then(r => r.json())
         .then(d => fpCache.set(s.file, computeGlyph(s, d)))
@@ -1082,7 +1275,7 @@ function renderFingerprints() {
   const list = filteredFleet();
   const shown = list.slice(0, FP_CAP);
   const overflow = list.length - shown.length;
-  const totCost = shown.reduce((n, s) => n + s.cost, 0), totAgents = shown.reduce((n, s) => n + s.agents, 0);
+  const totCost = shown.reduce((n, s) => n + s.cost, 0), totAgents = agentRollup(shown);
   const dims = FP_DIMS[fpSize];
   $('fingerprints').innerHTML =
     fleetControls(shown.length, all.length, totAgents, totCost) +
@@ -1121,7 +1314,7 @@ const CAL_METRIC_LABEL = { sessions: 'Sessions', cost: 'Cost', errors: 'Errors',
 async function loadCalendar() {
   // refetch every time: any of these can be the home screen, and a home screen
   // that never updates is worse than no home screen at all
-  try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
+  try { fleetCache = await getFleet(API_COHERENCE_MS); } catch { fleetCache = fleetCache || []; }
   renderCalendar();
   renderLiveNowStrip();
 }
@@ -1293,7 +1486,7 @@ const RING_WEEK_MS = 6048e5; // 7 days
 async function loadRings() {
   // refetch every time: any of these can be the home screen, and a home screen
   // that never updates is worse than no home screen at all
-  try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
+  try { fleetCache = await getFleet(API_COHERENCE_MS); } catch { fleetCache = fleetCache || []; }
   renderRings();
   renderLiveNowStrip();
 }
@@ -1437,7 +1630,7 @@ const RHY_WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 async function loadRhythm() {
   // refetch every time: any of these can be the home screen, and a home screen
   // that never updates is worse than no home screen at all
-  try { fleetCache = await (await fetch('/api/fleet')).json(); } catch { fleetCache = fleetCache || []; }
+  try { fleetCache = await getFleet(API_COHERENCE_MS); } catch { fleetCache = fleetCache || []; }
   renderRhythm();
   renderLiveNowStrip();
 }
@@ -1913,7 +2106,7 @@ function renderGraveyard() {
 // you paste them to an agent yourself. It never executes anything.
 let triageState = {}, triageFilter = 'open';
 async function loadPlaybooks() {
-  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  if (!fleetCache) fleetCache = await getFleet();
   if (!flowsCache) { $('playbooks').innerHTML = '<div class="fleet-loading">Studying your fleet’s track record…</div>'; await loadFlows.fetchOnly(); }
   await loadPlaybookLib();
   try { triageState = (await (await fetch('/api/triage')).json()).triage || {}; } catch { triageState = {}; }
@@ -2478,7 +2671,7 @@ function openDirectiveComposer(pre) {
     try {
       if (!flowsCache) {
         rrOut.innerHTML = '<div class="dim">Reading your recent sessions…</div>';
-        if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+        if (!fleetCache) fleetCache = await getFleet();
         await loadFlows.fetchOnly();
       }
       rrDraw();
@@ -2543,10 +2736,12 @@ function openDirectiveComposer(pre) {
 }
 
 loadFlows.fetchOnly = async function () {
-  // study the whole track record, archived included — history is the teacher
-  const picks = (fleetCache || []).slice(0, 60);
+  // Study a bounded recent sample, archived included — enough history to teach
+  // without rehydrating every disk-backed remote session.
+  const picks = (fleetCache || []).slice(0, FLOW_SAMPLE_CAP);
   const results = [];
-  for (const chunk of [picks.slice(0, 20), picks.slice(20, 40), picks.slice(40, 60)]) {
+  for (let i = 0; i < picks.length; i += DETAIL_FETCH_BATCH) {
+    const chunk = picks.slice(i, i + DETAIL_FETCH_BATCH);
     const part = await Promise.all(chunk.map(s =>
       fetch('/api/session?file=' + encodeURIComponent(s.file)).then(r => r.json()).then(d => ({ s, d })).catch(() => null)));
     results.push(...part.filter(Boolean));
@@ -3694,17 +3889,25 @@ const AUDIT_ICON = { 'brain-write': '✍️', launch: '🚀', 'launch-end': '�
 // fallback if an older hub response ever omits `needed`.
 const MACHINE_RHYTHM_MIN_SESSIONS = 5;
 async function loadMachines() {
-  const [machinesData, fleet] = await Promise.all([
-    fetch('/api/machines').then(r => r.json()),
-    fleetCache ? Promise.resolve(fleetCache) : fetch('/api/fleet').then(r => r.json()),
+  const [cachedMachines, fleet] = await Promise.all([
+    getMachines(API_COHERENCE_MS),
+    fleetCache ? Promise.resolve(fleetCache) : getFleet(),
   ]);
+  // /api/machines is shared with the warning poll. Synthetic fleet-only
+  // entries belong only to this render, never in that shared cache.
+  const machinesData = [...cachedMachines];
   fleetCache = fleet;
   renderMachineWarnBar(machinesData);
   const byMachine = {};
   for (const s of fleet) {
     const m = s.machine || 'unknown';
-    (byMachine[m] = byMachine[m] || { sessions: 0, agents: 0, cost: 0, kinds: {}, lastMs: 0 });
-    byMachine[m].sessions++; byMachine[m].agents += s.agents; byMachine[m].cost += s.cost;
+    (byMachine[m] = byMachine[m] || { sessions: 0, parsed: 0, discovered: 0, active: 0, cost: 0, pricedSessions: 0, kinds: {}, lastMs: 0 });
+    byMachine[m].sessions++;
+    if (s.agentsProvisional) byMachine[m].discovered += s.discoveredAgents || s.agents || 0;
+    else byMachine[m].parsed += s.agents || 0;
+    byMachine[m].active += s.liveAgentCount || 0;
+    byMachine[m].cost += s.cost || 0;
+    if ((s.agentsPriced || 0) > 0) byMachine[m].pricedSessions++;
     byMachine[m].kinds[s.kind] = (byMachine[m].kinds[s.kind] || 0) + 1;
     byMachine[m].lastMs = Math.max(byMachine[m].lastMs, s.mtime);
   }
@@ -3717,7 +3920,7 @@ async function loadMachines() {
   $('machines').innerHTML =
     `<div class="fleet-head"><h2>Machines — ${machinesData.length}</h2></div>` +
     `<div class="machine-grid">` + machinesData.map(m => {
-      const st = byMachine[m.name] || { sessions: 0, agents: 0, cost: 0, kinds: {} };
+      const st = byMachine[m.name] || { sessions: 0, parsed: 0, discovered: 0, active: 0, cost: 0, pricedSessions: 0, kinds: {} };
       const q = m.quiet || { enoughHistory: false, quiet: false };
       const fresh = Date.now() - m.lastSeen < 120000;
       const kindDots = Object.entries(st.kinds).map(([k, n]) => `<span class="mkind" style="color:${kindColor(k)}">● ${(AGENT_KIND[k] || AGENT_KIND.claude).label} ${n}</span>`).join('');
@@ -3742,9 +3945,9 @@ async function loadMachines() {
               // for weeks: null wore an OK costume.
               ? `<span class="mver drift" title="this relay is too old to even say its version — update it">version unknown ⚠</span>`
               : ''}
-          <span class="mstatus ${statusClass}">${statusLabel}</span></h3>
+          <span class="mstatus ${statusClass}" title="Machine check-in status; this does not mean historical agents are still running.">${statusLabel}</span></h3>
         <div class="mips">${(m.ips || []).map(ip => `<span class="ip">${esc(ip)}</span>`).join('') || '<span class="ip dim">no IPs reported</span>'}</div>
-        <div class="mstats"><span><b>${st.sessions}</b> sessions</span><span><b>${st.agents}</b> agents</span><span class="fcost"><b>~${fmtUsd(st.cost)}</b></span></div>
+        <div class="mstats"><span><b>${st.sessions}</b> historical sessions</span><span>${agentRollupHTML(st)}</span><span class="fcost" title="Estimated only from sessions whose model and token telemetry can be priced."><b>~${fmtUsd(st.cost)}</b> estimated · ${st.pricedSessions}/${st.sessions} sessions priced</span></div>
         <div class="mkinds">${kindDots}</div>
         ${machineQuietBlockHTML(m, q)}
         ${arch && arch.files ? `<button class="mini-btn arch-browse" data-machine="${esc(arch.machine)}">📚 ${arch.files} archived transcripts · ${fmtBytes(arch.bytes)} — browse</button>` : ''}
@@ -3825,7 +4028,7 @@ function stopConstellation() {
   if (cv && state.view !== 'constellation') { const c = cv.getContext('2d'); if (c) c.clearRect(0, 0, cv.width, cv.height); }
 }
 async function loadConstellation() {
-  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  if (!fleetCache) fleetCache = await getFleet();
   const cv = $('constCanvas'), wrap = $('constellation');
   const DPR = window.devicePixelRatio || 1;
   const W = wrap.clientWidth, H = wrap.clientHeight;
@@ -4357,7 +4560,7 @@ async function loadDejaVu() {
   // A failed fetch used to leave the spinner up forever with an unhandled rejection
   // behind it — a pane that never resolves looks identical to one still working.
   try {
-    if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+    if (!fleetCache) fleetCache = await getFleet();
     if (!flowsCache) { $('dejavu').innerHTML = '<div class="fleet-loading">Indexing delegated tasks across your fleet…</div>'; await loadFlows.fetchOnly(); }
     buildDejaIndex();
     renderDejaVu();
@@ -4459,7 +4662,7 @@ async function loadHookProps() {
   const pane = $('hookprops');
   pane.innerHTML = '<div class="fleet-loading">Checking which hooks your own numbers would actually justify…</div>';
   try {
-    if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+    if (!fleetCache) fleetCache = await getFleet();
     if (!flowsCache) await loadFlows.fetchOnly();
   } catch (e) {
     pane.innerHTML = `<div class="fleet-head"><h2>Suggested hooks</h2></div><div class="uw-note">Couldn’t read your fleet history just now, so there is no evidence to base a suggestion on — and a hook suggested without evidence is exactly what this panel refuses to do. ${esc(String(e && e.message || ''))}</div>`;
@@ -4585,38 +4788,30 @@ function hookProposals() {
     });
   }
 
-  // 4. Every subagent must name its model -----------------------------------
-  // This is the one the fleet's headline number LOOKS like it justifies and does
-  // not, which is exactly why it is worth printing.
-  let agents = 0, noModel = 0, cost = 0, top = 0;
+  // 4. Optional explicit-model policy; missing attribution is not spawn evidence.
+  let agents = 0, noModel = 0;
   for (const s of fleet) {
     agents += s.agents || 0;
     noModel += s.agentsNoModel || 0;
-    cost += s.cost || 0;
-    const mix = s.tierMix || {};
-    top += (mix.flagship || 0) + (mix.premium || 0);
   }
   const share = agents ? noModel / agents : 0;
-  const topPct = cost >= HP_MIN_FLEET_COST ? Math.round(top / cost * 100) : null;
   if (noModel >= HP_MIN_NOMODEL && share >= HP_NOMODEL_SHARE) {
     props.push({
       id: 'model-guard', event: 'PreToolUse', matcher: 'Task', blocking: true,
-      title: 'Refuse a subagent that never says which model to run',
-      why: `<b>${noModel} of your ${agents}</b> recorded agents ran with no model in the transcript at all${topPct === null ? '' : `, while ${topPct}% of ~${fmtUsd(cost)} went to the top two tiers`}. An unnamed model inherits the orchestrator's, and inheriting is where the money leaks.`,
+      title: 'Require an explicit model on future subagent calls',
+      why: `<b>${noModel} of ${agents}</b> recorded agents lack model attribution in this legacy summary. This does not prove a model was omitted from a spawn, inherited, or expensive. Treat this as an optional future policy, not a historical diagnosis or savings estimate.`,
       caught: [], caughtLabel: '',
       plain: [
-        'Runs before a subagent is started and reads the call’s settings.',
-        'If no model is named, the spawn does not happen and the agent is told to pick one.',
+        'For matching Claude Task calls, checks for a nonempty top-level model string; it does not validate the model name.',
+        'This optional Node command is not a security boundary and does not guard Codex or differently named tools.',
       ],
-      escape: 'Put  amc-ok  in the subagent’s prompt when inheriting really is what you want.',
-      command: "node -e \"let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let i={};try{i=JSON.parse(s).tool_input||{}}catch(e){}const t=JSON.stringify(i);if(/\\\"model\\\"/.test(t)||t.indexOf('amc-ok')>=0)process.exit(0);console.error('Stopped: this subagent names no model, so it inherits the orchestrator one. Name a model, or put  amc-ok  in the prompt.');process.exit(2)})\"",
+      escape: 'Put amc-ok anywhere in the subagent prompt to allow an implicit choice. Copying does not install the hook.',
+      command: "node -e \"let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{let i={};try{i=JSON.parse(s).tool_input||{}}catch(e){}if((typeof i.model==='string'&&i.model.trim())||(typeof i.prompt==='string'&&i.prompt.indexOf('amc-ok')>=0))process.exit(0);console.error('Stopped: name a nonempty model or put amc-ok in the prompt to allow an implicit choice.');process.exit(2)})\"",
     });
   } else {
     refused.push({
-      title: 'Refuse a subagent that never says which model to run',
-      why: `Your transcripts record a model for <b>${agents - noModel} of ${agents}</b> agents, so this hook would have stopped ${noModel} ${noModel === 1 ? 'spawn' : 'spawns'} in your whole recorded history.`
-        + (topPct === null ? '' : ` Your top-tier spend is real — <b>${topPct}% of ~${fmtUsd(cost)}</b> — but it is not coming from models nobody set. It is coming from models that were named, and were expensive.`)
-        + ' A hook cannot fix that; it is a judgement about which work deserves which tier, which is what the tiering standing order is for.',
+      title: 'Require an explicit model on future subagent calls',
+      why: `<b>${noModel} of ${agents}</b> recorded agents lack model attribution in this legacy summary. That is below the suggestion threshold (10 agents and 2%). Missing attribution does not prove which spawn calls omitted a model, and recorded model names do not prove they were explicitly requested. No historical blocking count or savings can be inferred.`,
     });
   }
 
@@ -4697,7 +4892,7 @@ const ECON_MIN_AGENTS = 5;      // per-bucket floor before a cost/turn is shown 
 const ECON_MIN_SPEND = 1;       // dollars, before percentages of spend mean anything
 
 async function loadEconomics() {
-  if (!fleetCache) fleetCache = await (await fetch('/api/fleet')).json();
+  if (!fleetCache) fleetCache = await getFleet();
   renderEconomics();
 }
 
@@ -4896,7 +5091,7 @@ function renderEconomics() {
       } catch (e) { out.textContent = 'failed: ' + e.message; }
     };
   })();
-  $('econRefresh').onclick = async () => { fleetCache = await (await fetch('/api/fleet')).json(); renderEconomics(); };
+  $('econRefresh').onclick = async () => { fleetCache = await getFleet(); renderEconomics(); };
   wireHomeButton($('economics'), 'economics', renderEconomics);
 }
 
@@ -4953,6 +5148,7 @@ document.addEventListener('click', closeNavMenus);
 // ---------- render ----------
 // (OVERVIEW/NAV_MENUS/VIEW_META are declared near `state` above)
 function setTabs() {
+  if (V2_PREVIEW) { v2Dashboard?.show(state.view); return; }
   updateNavHome();
   $('navHome')?.classList.toggle('on', state.view === ($('navHome').dataset.view || 'fleet'));
   for (const m of NAV_MENUS) {
@@ -4979,6 +5175,7 @@ function setTabs() {
 }
 
 function render() {
+  if (V2_PREVIEW) return;
   if (OVERVIEW.includes(state.view)) return;
   renderStatbar();
   renderStickbar();
@@ -5543,7 +5740,12 @@ let resizeT = null;
 window.onresize = () => { clearTimeout(resizeT); resizeT = setTimeout(() => { if (state.view === 'usage') renderUsage(); else if (!OVERVIEW.includes(state.view)) render(); }, 120); };
 
 // ---------- boot ----------
-if (BAKED) {
+if (V2_PREVIEW) {
+  const requestedHome=getHomeView();
+  // getHomeView already validates against the shared overview registry.
+  state.view = requestedHome || 'table';
+  v2Dashboard = window.AMCV2Dashboard.boot({ panes: [...OVERVIEW.map(v => VIEW_META[v].pane), ...SESSION_PANES], initialView:state.view, notify:(type,message,machine)=>pushNotif(type,message,{title:machine.name,v2SessionId:machine.sessionId,file:'',machine:machine.id,kind:'codex',session:machine.id}), home:{markup:homeButton,wire:wireHomeButton} });
+} else if (BAKED) {
   // standalone replay: no server, no live mode
   state.data = BAKED.data;
   state.scrub = state.data.events.length;
@@ -5559,5 +5761,5 @@ if (BAKED) {
   loadMeta().then(() => setTabs());
   startNotifications();
   loadAppVersion();
-  fetch('/api/machines').then(r => r.json()).then(renderMachineWarnBar).catch(() => { /* offline at boot */ });
+  getMachines(API_COHERENCE_MS).then(renderMachineWarnBar).catch(() => { /* offline at boot */ });
 }
