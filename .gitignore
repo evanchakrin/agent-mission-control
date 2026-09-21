@@ -1,4 +1,8 @@
 node_modules/
+.tools/
+build/
+.amc-v2/
+artifacts/
 # personal local icons — never publish (real-person photo); repo ships a neutral default
 public/mullet.png
 public/mullet.ico
